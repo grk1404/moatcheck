@@ -1,7 +1,38 @@
 from __future__ import annotations
-
-import pandas as pd
 import streamlit as st
+
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import json
+import warnings
+
+from trade_manager import (
+    compute_target_shares,
+    compute_rebalance,
+    log_trade,
+    load_trades,
+    clear_trades,
+)
+warnings.filterwarnings('ignore')
+# Import the technical indicator analyzer
+from technical_indicators import TechnicalIndicatorAnalyzer
+
+
+
+def clear_analyzer_cache():
+    """Clear all cached data and reset analyzer state."""
+    st.cache_data.clear()
+    if "last_ticker" in st.session_state:
+        st.session_state["last_ticker"] = None
+    if "valuation_ticker" in st.session_state:
+        st.session_state["valuation_ticker"] = None
+    if "valuation_growth_result" in st.session_state:
+        st.session_state["valuation_growth_result"] = None
+    if "analyzing" in st.session_state:
+        st.session_state["analyzing"] = False
 
 from moatcheck import (
     Big5Result,
@@ -62,16 +93,23 @@ def _fmt_pct(v: float | None) -> str:
         return "n/a"
     return f"{v * 100:.1f}%"
 
+def get_currency_symbol(exchange: str, ticker: str = "") -> str:
+    """Determine currency symbol based on exchange and ticker."""
+    # Indian exchanges
+    if exchange and exchange.upper() in ("NSE", "BSE"):
+        return "₹"
+    # If ticker ends with .NS or .BO, it's Indian
+    if ticker and (ticker.endswith(".NS") or ticker.endswith(".BO")):
+        return "₹"
+    # Everything else is USD by default
+    return "$"
 
-def _fmt_money(v: float | None, exchange: str = "") -> str:
+def _fmt_money(v: float | None, exchange: str = "", ticker: str = "") -> str:
     if v is None:
         return "n/a"
 
-    # Determine currency symbol
-    if exchange in ("NSE", "BSE"):
-        currency = "₹ "
-    else:
-        currency = "$ "
+    currency = get_currency_symbol(exchange, ticker)
+    
     if abs(v) >= 1e9:
         return f"{currency}{v / 1e9:.2f}B"
     if abs(v) >= 1e6:
@@ -212,11 +250,27 @@ def _big5_eps_growth(big5: Big5Result) -> float | None:
         n = len(stable)
         # median (with even-count average)
         if n % 2:
-            return stable[n // 2]
-        return (stable[n // 2 - 1] + stable[n // 2]) / 2
+            growth = stable[n // 2]
+        else:
+            growth = (stable[n // 2 - 1] + stable[n // 2]) / 2
+        
+        # --- FIX: Cap growth at 30% and ensure minimum 2% ---
+        if growth > 0.30:
+            growth = 0.30
+        if growth < 0.02:
+            growth = 0.02
+        return growth
+    
     # Fallback: 1yr only when nothing longer is computable
     one = windows.get(1)
-    return one if one is not None else None
+    if one is not None:
+        # --- FIX: Cap fallback growth at 30% and ensure minimum 2% ---
+        if one > 0.30:
+            one = 0.30
+        if one < 0.02:
+            one = 0.02
+        return one
+    return None
 
 
 st.markdown(
@@ -472,8 +526,20 @@ def render_analyzer() -> None:
             else:
                 submitted = st.form_submit_button("Analyze", use_container_width=True)
 
+    with st.sidebar:
+        if st.button("🔄 Reset Analyzer", help="Clear cache and reset for new ticker"):
+            clear_analyzer_cache()
+            st.rerun()
+
     if submitted:
         st.session_state["analyzing"] = True
+        # Check if this is a new ticker
+        if st.session_state.get("last_ticker") != ticker:
+            # Clear old cached data for previous ticker
+            st.cache_data.clear()
+            st.session_state["valuation_ticker"] = None
+            st.session_state["valuation_growth_result"] = None
+
         st.session_state["last_ticker"] = ticker
         suggestion = _suggest_ticker(ticker)
         if suggestion and suggestion != ticker:
@@ -497,7 +563,15 @@ def render_analyzer() -> None:
 
     with st.spinner(f"Fetching 10-year financials for {symbol}..."):
         try:
+            # Clear cache for this specific ticker if it's new
+            if st.session_state.get("valuation_ticker") != symbol:
+                st.cache_data.clear()
+                st.session_state["valuation_ticker"] = symbol
             fin = _cached_fetch(symbol)
+
+            # Reset analyzing state after successful fetch
+            st.session_state["analyzing"] = False
+
         except FetchError as e:
             st.error(str(e))
             return
@@ -513,12 +587,12 @@ def render_analyzer() -> None:
         st.caption(f"US Listed on {fin.exchange}  ($ USD)")
     _eps_ttm = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
     top1, top2, top3, top4, top5, top6, top7 = st.columns(7)
-    top1.metric("Current Price", _fmt_money(fin.current_price, fin.exchange))
-    top2.metric("Market Cap", _fmt_money(fin.market_cap,fin.exchange))
-    top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange))
+    top1.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
+    top2.metric("Market Cap", _fmt_money(fin.market_cap, fin.exchange, fin.ticker))
+    top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange or "USD"))
     top4.metric("TTM P/E", f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "n/a")
     top5.metric("Div Yield", _fmt_pct(fin.dividend_yield))
-    top6.metric("BVPS", _fmt_money(fin.book_value_per_share, fin.exchange))
+    top6.metric("BVPS", _fmt_money(fin.book_value_per_share, fin.exchange, fin.ticker))
     top7.metric("Years of data", str(fin.years_available))
 
     # Data-source note is shown in the footer only — not up top. Split-artifact
@@ -631,11 +705,9 @@ def render_analyzer() -> None:
     big5_eps_g = _big5_eps_growth(big5)
 
     def _moat_conservative_growth() -> float | None:
-        candidates = [g for g in (big5_eps_g, fin.analyst_5yr_growth) if g is not None and g > 0]
-        if not candidates:
-            return None
-        growth = min(candidates)
-        return min(growth, 0.15)
+        """Return a conservative 15% growth rate for Buffett-style valuation."""
+        # Always return 15% - this is Buffett's standard conservative rate
+        return 0.15
 
 
     def _valuation_growth_rate_label(mode: str) -> str:
@@ -648,6 +720,7 @@ def render_analyzer() -> None:
             return f"Analyst 5Y growth: {_fmt_pct(fin.analyst_5yr_growth) if fin.analyst_5yr_growth is not None else 'n/a'}"
         if mode == "Custom":
             return "Custom"
+            
         return mode
 
 
@@ -692,15 +765,16 @@ def render_analyzer() -> None:
             )
 
         if mode == "Value conservative":
-            use_big5_growth = big5_eps_g is not None
-            use_analyst_growth = fin.analyst_5yr_growth is not None
-            if not (use_big5_growth or use_analyst_growth):
+            # --- FIX: Use the conservative growth function (returns 15%) ---
+            conservative_growth = _moat_conservative_growth()
+            if conservative_growth is None:
                 return None
             return value_price(
                 current_eps=current_eps,
-                big5_eps_growth=big5_eps_g if use_big5_growth else None,
-                analyst_growth=fin.analyst_5yr_growth if use_analyst_growth else None,
+                big5_eps_growth=None,           # Ignore Big5 growth
+                analyst_growth=None,            # Ignore analyst growth
                 historical_pe=fin.pe_ratio_ttm,
+                custom_growth=conservative_growth,  # Force 15%
             )
 
         if mode == "Big 5 EPS growth":
@@ -888,36 +962,47 @@ def render_analyzer() -> None:
     else:
         v_verdict, v_detail, v_color = _verdict_price(fin.current_price, val.mos_price, val.value_price)
         v1, v2, v3, v4, v5 = st.columns(5)
-        v1.metric("Value Price / Intrinsic Value", _fmt_money(val.value_price, fin.exchange))
-        v2.metric("Margin of Safety (MOS) Buy Price", _fmt_money(val.mos_price, fin.exchange))
-        v3.metric("Current Price", _fmt_money(fin.current_price, fin.exchange))
+        v1.metric("Value Price / Intrinsic Value", _fmt_money(val.value_price, fin.exchange, fin.ticker))
+        v2.metric("Margin of Safety (MOS) Buy Price", _fmt_money(val.mos_price, fin.exchange, fin.ticker))
+        v3.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
         _render_verdict_cell(v4, v_verdict, v_detail, v_color)
         _render_analyst_cell(v5, fin)
 
-        growth_group_col, button_col = st.columns([8.2, 1.8])
+        # --- FIX: Everything in one row with proper sizing ---
+        growth_group_col, button_col = st.columns([4, 1])
+        
         with growth_group_col:
+            # --- FIX: Custom input right next to "Custom" radio button ---
+                
             st.markdown(
                 "<div style='font-size: 0.875rem; margin-bottom: 0.25rem;'>Growth source</div>",
                 unsafe_allow_html=True,
             )
-            radio_col, custom_col = st.columns([6.5, 1.7])
-            #with radio_col:
-            #    st.markdown("<div style='height: 0.65rem;'></div>", unsafe_allow_html=True)
-            # RADIO BUTTONS
-            selected_growth_mode = st.radio(
-                "Growth source",
-                options=mode_options,
-                horizontal=True,
-                format_func=_valuation_growth_rate_label,
-                key="valuation_growth_mode",
-                label_visibility="collapsed",
-            )
-            custom_col, button_col, spacer_col = st.columns([1.7, 1.8, 6.5])
-            with custom_col:
+
+            col_radio, col_input, col_pct, col_btn, col_spacer = st.columns([2.1, 1.1, 0.2, 1.0, 1.8])
+
+            with col_radio:
+                selected_growth_mode = st.radio(
+                    "Growth source",
+                    options=mode_options,
+                    horizontal=True,
+                    format_func=_valuation_growth_rate_label,
+                    key="valuation_growth_mode",
+                    label_visibility="collapsed",
+                )
+
+            with col_input:
                 st.markdown(
-                    "<div style='font-size: 0.75rem; color: #9aa0a6; margin-bottom: 0.15rem;'>Custom %</div>",
+                    """
+                    <style>
+                    [data-testid="stNumberInput"] {
+                        width: 100% !important;
+                    }
+                    </style>
+                    """,
                     unsafe_allow_html=True,
                 )
+                st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
                 st.number_input(
                     "Custom %",
                     key="custom_growth_rate",
@@ -927,11 +1012,21 @@ def render_analyzer() -> None:
                     format="%d",
                     disabled=(selected_growth_mode != "Custom"),
                     label_visibility="collapsed",
-                    help="Select the 'Custom' radio option, then set this to force that whole-number growth rate.",
                 )
-        with button_col:
-            st.markdown("<div style='height: 1.9rem;'></div>", unsafe_allow_html=True)
-            revalue_button = st.button("RE-VALUATE", use_container_width=True)
+
+            with col_pct:
+                st.markdown(
+                    "<div style='height: 44px;'></div><div style='font-size: 0.875rem; color: #9aa0a6;'>%</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with col_btn:
+                st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
+                revalue_button = st.button(
+                    "RE-VALUATE", 
+                    key="revaluate_btn",
+                    help="Recalculate with selected growth rate"
+                )
 
         st.caption(f"DEBUG — mode: {selected_growth_mode} | custom box: {st.session_state.get('custom_growth_rate')}")
 
@@ -967,15 +1062,15 @@ def render_analyzer() -> None:
     **Step 4 — Future stock price**
     - Future EPS × Future P/E
     - = {val.future_eps:.2f} × {val.future_pe:.2f}
-    - = **{_fmt_money(val.future_price, fin.exchange)}**
+    - = **{_fmt_money(val.future_price, fin.exchange, fin.ticker)}**
 
     **Step 5 — Discount back to today at {_fmt_pct(val.discount_rate)} (Buffett's required return)**
     - Future price ÷ (1 + {val.discount_rate:.2f})^{val.horizon_years}
-    - = **{_fmt_money(val.value_price, fin.exchange)}**  ← *Value Price*
+    - = **{_fmt_money(val.value_price, fin.exchange, fin.ticker)}**  ← *Value Price*
 
     **Step 6 — Apply {_mos_pct_int}% Margin of Safety**
     - value × {1 - _mos_pct_int/100:.2f}
-    - = **{_fmt_money(val.mos_price, fin.exchange)}**  ← *MOS Buy Price*
+    - = **{_fmt_money(val.mos_price, fin.exchange, fin.ticker)}**  ← *MOS Buy Price*
     """.strip()
             )
 
@@ -1075,8 +1170,8 @@ def render_analyzer() -> None:
         def _row(m: MethodResult) -> dict:
             return {
                 "Method": m.name,
-                "Fair Value": _fmt_money(m.fair_value, fin.exchange),
-                "MOS Buy": _fmt_money(m.mos_price, fin.exchange),
+                "Fair Value": _fmt_money(m.fair_value, fin.exchange, fin.ticker),
+                "MOS Buy": _fmt_money(m.mos_price, fin.exchange, fin.ticker),
                 "Upside vs Current": _fmt_pct(m.upside_pct),
                 "Verdict": _verdict_with_pct(m),
             }
@@ -1180,52 +1275,775 @@ def render_analyzer() -> None:
         unsafe_allow_html=True,
     )
 
+def render_technical_analysis():
+    """Technical Analysis tab - Trading signals based on technical indicators"""
+    st.header("📊 Technical Analysis - Trading Signals")
+    st.caption("Technical indicators for identifying potential entry and exit points")
+    
+    # Input section
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        tech_ticker = st.text_input("Enter Stock Ticker for Technical Analysis:", "AAPL").upper()
+    with col2:
+        tech_period = st.selectbox("Analysis Period:", ["1mo", "3mo", "6mo", "1y", "2y"], index=3)
+    with col3:
+        tech_analyze = st.button("📊 Analyze Technicals", type="primary", key="tech_analyze")
+    
+    if tech_analyze or tech_ticker:
+        with st.spinner(f"Analyzing {tech_ticker} technical indicators..."):
+            analyzer = TechnicalIndicatorAnalyzer(tech_ticker, tech_period)
+            
+            if not analyzer.fetch_data():
+                st.error(f"Could not fetch data for {tech_ticker}. Please check the ticker symbol.")
+                return
+            
+            analyzer.calculate_all_indicators()
+            analyzer.get_trading_signals()
+            summary = analyzer.get_summary_dict()
+            
+            # Get verdict data
+            verdict_data = analyzer.get_verdict()
 
-st.markdown(
-    """
-    <style>
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 0.75rem;
-        background-color: transparent;
-        border-bottom: none;
-        padding-bottom: 0.25rem;
-    }
-    .stTabs [data-baseweb="tab-border"] { display: none; }
-    .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"],
-    .stTabs [data-baseweb="tab-list"] button[role="tab"] {
-        height: auto;
-        min-height: 2.75rem;
-        background-color: rgba(255, 255, 255, 0.05);
-        border: 1.5px solid rgba(255, 255, 255, 0.14);
-        border-radius: 10px;
-        padding: 0.65rem 1.5rem;
-        color: #9aa0a6;
-        font-weight: 600;
-        font-size: 0.95rem;
-    }
-    .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"]:hover,
-    .stTabs [data-baseweb="tab-list"] button[role="tab"]:hover {
-        background-color: rgba(255, 255, 255, 0.09);
-        border-color: rgba(76, 175, 80, 0.5);
-        color: #e8eaed;
-    }
-    .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"],
-    .stTabs [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] {
-        background-color: rgba(76, 175, 80, 0.2);
-        border-color: #4CAF50;
-        color: #b6f0b6;
-        box-shadow: 0 0 0 1px rgba(76, 175, 80, 0.3);
-    }
-    .stTabs [data-baseweb="tab-panel"] { padding-top: 1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+            # Define volume_metrics early so it's available throughout the render
+            volume_metrics = verdict_data.get('volume_metrics', {})
+            
+            # --- Display Key Indicators Table FIRST ---
+            st.markdown("### Key Indicators")
+            
+            key_indicators = verdict_data['key_indicators']
+            ind = analyzer.indicators
+            price = verdict_data['current_price']
+            
+            # Display as a styled dataframe
+            indicator_data = {
+                'Indicator': ['RSI', 'MACD', 'Stochastic %K', 'Stochastic %D',
+                              'SMA 50', 'SMA 200', 'Bollinger Bands', 'Volume'],
+                'Value': [
+                    f"{key_indicators['rsi']:.1f}",
+                    f"{key_indicators['macd']:.4f}",
+                    f"{key_indicators['stoch_k']:.1f}",
+                    f"{key_indicators['stoch_d']:.1f}",
+                    f"${key_indicators['sma_50']:.2f}" if key_indicators['sma_50'] else "N/A",
+                    f"${key_indicators['sma_200']:.2f}" if key_indicators['sma_200'] else "N/A",
+                    f"${ind['BB_Lower']:.2f} - ${ind['BB_Upper']:.2f}" if ind['BB_Lower'] and ind['BB_Upper'] else "N/A",
+                    f"{volume_metrics.get('volume_ratio', 0):.2f}× avg" if volume_metrics else "N/A",
+                ],
+                'Status': []
+            }
+            
+            # 1. RSI Status
+            rsi = key_indicators['rsi']
+            if rsi < 30:
+                indicator_data['Status'].append('🟢 Oversold (Bullish)')
+            elif rsi > 70:
+                indicator_data['Status'].append('🔴 Overbought (Bearish)')
+            elif 30 <= rsi <= 40:
+                indicator_data['Status'].append('🟡 Approaching Oversold')
+            elif 60 <= rsi <= 70:
+                indicator_data['Status'].append('🟡 Approaching Overbought')
+            else:
+                indicator_data['Status'].append('🟡 Neutral')
+            
+            # 2. MACD Status
+            macd = key_indicators['macd']
+            macd_hist = ind['MACD_Histogram']
+            if macd > 0 and macd_hist > 0:
+                indicator_data['Status'].append('📈 Bullish (Increasing Momentum)')
+            elif macd > 0 and macd_hist < 0:
+                indicator_data['Status'].append('🟡 Bullish (Weakening)')
+            elif macd < 0 and macd_hist < 0:
+                indicator_data['Status'].append('📉 Bearish (Increasing Momentum)')
+            elif macd < 0 and macd_hist > 0:
+                indicator_data['Status'].append('🟡 Bearish (Weakening)')
+            else:
+                indicator_data['Status'].append('🟡 Neutral')
+            
+            # 3. Stochastic %K Status
+            stoch_k = key_indicators['stoch_k']
+            stoch_d = key_indicators['stoch_d']
+            if stoch_k < 20 and stoch_d < 20:
+                if stoch_k > stoch_d:
+                    indicator_data['Status'].append('🟢 Oversold (Crossover Up)')
+                else:
+                    indicator_data['Status'].append('🟢 Oversold')
+            elif stoch_k > 80 and stoch_d > 80:
+                if stoch_k < stoch_d:
+                    indicator_data['Status'].append('🔴 Overbought (Crossover Down)')
+                else:
+                    indicator_data['Status'].append('🔴 Overbought')
+            else:
+                indicator_data['Status'].append('🟡 Neutral')
+            
+            # 4. Stochastic %D Status
+            if stoch_d < 20:
+                indicator_data['Status'].append('🟢 Oversold')
+            elif stoch_d > 80:
+                indicator_data['Status'].append('🔴 Overbought')
+            else:
+                indicator_data['Status'].append('🟡 Neutral')
+            
+            # 5. SMA 50 Status
+            sma_50 = key_indicators['sma_50']
+            sma_200 = key_indicators['sma_200']
+            if sma_50 and sma_200:
+                if sma_50 > sma_200:
+                    if price > sma_50:
+                        indicator_data['Status'].append('📈 Above 200 (Golden Cross)')
+                    else:
+                        indicator_data['Status'].append('📈 Above 200 (Pullback)')
+                else:
+                    if price < sma_50:
+                        indicator_data['Status'].append('📉 Below 200 (Death Cross)')
+                    else:
+                        indicator_data['Status'].append('📉 Below 200 (Bounce)')
+            else:
+                indicator_data['Status'].append('N/A')
+            
+            # 6. SMA 200 Status
+            if sma_200:
+                if price > sma_200:
+                    percent_above = ((price - sma_200) / sma_200) * 100
+                    if percent_above > 20:
+                        indicator_data['Status'].append(f'📈 Above (+{percent_above:.0f}%)')
+                    else:
+                        indicator_data['Status'].append(f'📈 Above ({percent_above:.0f}%)')
+                else:
+                    percent_below = ((sma_200 - price) / sma_200) * 100
+                    if percent_below > 20:
+                        indicator_data['Status'].append(f'📉 Below (-{percent_below:.0f}%)')
+                    else:
+                        indicator_data['Status'].append(f'📉 Below ({percent_below:.0f}%)')
+            else:
+                indicator_data['Status'].append('N/A')
+            
+            # 7. Bollinger Bands Status
+            if ind['BB_Lower'] and ind['BB_Upper'] and ind['current_price']:
+                bb_pos = ((ind['current_price'] - ind['BB_Lower']) / (ind['BB_Upper'] - ind['BB_Lower'])) * 100
+                bb_width = ind['BB_Upper'] - ind['BB_Lower']
+                
+                if bb_pos < 10:
+                    indicator_data['Status'].append('🟢 Extreme Lower (Strong Oversold)')
+                elif bb_pos < 20:
+                    indicator_data['Status'].append('🟢 Near Lower (Oversold)')
+                elif bb_pos > 90:
+                    indicator_data['Status'].append('🔴 Extreme Upper (Strong Overbought)')
+                elif bb_pos > 80:
+                    indicator_data['Status'].append('🔴 Near Upper (Overbought)')
+                elif 40 <= bb_pos <= 60:
+                    indicator_data['Status'].append('🟡 Middle (Neutral)')
+                else:
+                    indicator_data['Status'].append('🟡 Mid-Range')
+                
+                # Add bandwidth info if available
+                if bb_width and bb_width > 0:
+                    avg_price = (ind['BB_Upper'] + ind['BB_Lower']) / 2
+                    bandwidth_pct = (bb_width / avg_price) * 100
+                    if bandwidth_pct > 20:
+                        indicator_data['Status'][-1] += ' 🔸 Wide Volatility'
+                    elif bandwidth_pct < 10:
+                        indicator_data['Status'][-1] += ' 🔹 Narrow (Squeeze)'
+            else:
+                indicator_data['Status'].append('N/A')
 
-tab_analyzer, tab_screener = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener"])
+            # Volume status
+            if volume_metrics:
+                sev = volume_metrics.get('severity', 'normal')
+                direction = volume_metrics.get('price_direction', 'FLAT')
+                if sev in ('spike', 'extreme'):
+                    if direction == 'UP':
+                        indicator_data['Status'].append('🔵 Spike + Price Up (Bullish)')
+                    elif direction == 'DOWN':
+                        indicator_data['Status'].append('🔴 Spike + Price Down (Bearish)')
+                    else:
+                        indicator_data['Status'].append('🟠 Spike, Flat Price (Indecision)')
+                elif sev == 'elevated':
+                    indicator_data['Status'].append('🟢 Elevated Volume')
+                elif sev in ('low', 'very_low'):
+                    indicator_data['Status'].append('⚪ Low Volume (Weak Conviction)')
+                else:
+                    indicator_data['Status'].append('🟡 Normal')
+            else:
+                indicator_data['Status'].append('N/A')
+                        
+            # Create DataFrame and style it
+            df_indicators = pd.DataFrame(indicator_data)
+            
+            # Style the dataframe to match Stock Analyzer theme
+            st.dataframe(
+                df_indicators.style.set_properties(**{
+                    'background-color': 'rgba(255,255,255,0.05)',
+                    'border-color': 'rgba(255,255,255,0.1)',
+                    'color': '#e8eaed'
+                }).set_table_styles([
+                    {'selector': 'thead th', 'props': [('background-color', '#1e1e1e'), ('color', '#b6f0b6')]}
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # --- Display Verdict (moved below Key Indicators table) ---
+            st.markdown("### Verdict")
+            
+            # Create verdict display with color matching Stock Analyzer
+            verdict_color = verdict_data['color']
+            verdict_icon = verdict_data['icon']
+            verdict_text = verdict_data['verdict']
+            confidence = verdict_data['confidence']
+            
+            # Color mapping to match Stock Analyzer
+            color_map = {
+                'bargain': {'bg': '#1e4620', 'text': '#b6f0b6', 'border': '#00E676'},
+                'green': {'bg': '#1e4620', 'text': '#b6f0b6', 'border': '#4CAF50'},
+                'orange': {'bg': '#4a3a1e', 'text': '#f0d8a6', 'border': '#FFA726'},
+                'red': {'bg': '#4b1e1e', 'text': '#f0b6b6', 'border': '#EF5350'},
+                'gray': {'bg': '#2a2a2a', 'text': '#9aa0a6', 'border': '#9AA0A6'}
+            }
+            
+            colors = color_map.get(verdict_color, color_map['gray'])
+            
+            # Get contributing signals
+            contributing_signals = verdict_data.get('contributing_signals', [])
+            buy_signals = verdict_data.get('buy_signals', [])
+            sell_signals = verdict_data.get('sell_signals', [])
+            
+            # Create verdict card matching Stock Analyzer style
+            st.markdown(f"""
+            <div style="
+                background-color: {colors['bg']};
+                border: 2px solid {colors['border']};
+                border-radius: 10px;
+                padding: 1.5rem;
+                margin: 1rem 0;
+            ">
+                <div style="display: flex; align-items: flex-start; gap: 1rem;">
+                    <div style="font-size: 3rem;">{verdict_icon}</div>
+                    <div style="flex: 1;">
+                        <div style="font-size: 2rem; font-weight: 700; color: {colors['text']};">
+                            {verdict_text}
+                            <span style="font-size: 1rem; font-weight: 400; color: #9aa0a6;">
+                                (Confidence: {confidence:.0f}%)
+                            </span>
+                        </div>
+                        <div style="color: #9aa0a6; font-size: 0.9rem; margin-top: 0.25rem;">
+                            {verdict_data['detail']}
+                        </div>
+            """, unsafe_allow_html=True)
+            
+            # Add contributing signals
+            if contributing_signals:
+                st.markdown(f"""
+                        <div style="margin-top: 0.75rem;">
+                            <div style="color: #9aa0a6; font-size: 0.8rem; margin-bottom: 0.25rem;">
+                                <strong>Key contributing indicators:</strong>
+                            </div>
+                            <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                """, unsafe_allow_html=True)
+                
+                # Display each contributing signal as a badge
+                for signal in contributing_signals:
+                    # Determine badge color based on signal type
+                    if "bullish" in signal.lower() or "above" in signal.lower() or "oversold" in signal.lower():
+                        badge_color = "#4CAF50"  # Green for bullish
+                    elif "bearish" in signal.lower() or "below" in signal.lower() or "overbought" in signal.lower():
+                        badge_color = "#EF5350"  # Red for bearish
+                    else:
+                        badge_color = "#FFA726"  # Orange for neutral/wait
+                    
+                    # Shorten long signals for display
+                    display_signal = signal
+                    if len(signal) > 60:
+                        display_signal = signal[:57] + "..."
+                    
+                    st.markdown(f"""
+                        <span style="
+                            background-color: rgba(255,255,255,0.08);
+                            border-left: 3px solid {badge_color};
+                            padding: 0.3rem 0.6rem;
+                            border-radius: 4px;
+                            font-size: 0.75rem;
+                            color: #e8eaed;
+                            display: inline-block;
+                            margin: 2px 0;
+                        ">
+                            {display_signal}
+                        </span>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("""
+                            </div>
+                        </div>
+                """, unsafe_allow_html=True)
+            
+            # Close the div
+            st.markdown("""
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # --- Add expandable section for all signals ---
+            with st.expander("📋 See all signals that contributed to this verdict"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**🟢 Buy Signals**")
+                    if buy_signals:
+                        for signal in buy_signals:
+                            st.markdown(f"<span style='color: #b6f0b6;'>✅ {signal}</span>", unsafe_allow_html=True)
+                    else:
+                        st.info("No buy signals detected")
+                
+                with col2:
+                    st.markdown("**🔴 Sell Signals**")
+                    if sell_signals:
+                        for signal in sell_signals:
+                            st.markdown(f"<span style='color: #f0b6b6;'>❌ {signal}</span>", unsafe_allow_html=True)
+                    else:
+                        st.info("No sell signals detected")
+                
+                # Show neutral signals if any
+                neutral_signals = verdict_data.get('neutral_signals', [])
+                if neutral_signals:
+                    st.markdown("**⏳ Neutral / Wait Signals**")
+                    for signal in neutral_signals[:5]:  # Show first 5 to keep it clean
+                        st.markdown(f"<span style='color: #f0d8a6;'>⏳ {signal}</span>", unsafe_allow_html=True)
+                    if len(neutral_signals) > 5:
+                        st.caption(f"... and {len(neutral_signals) - 5} more neutral signals")
+
+            # ============================================================
+            # VOLUME ANALYSIS (Levels 1-4)
+            # ============================================================
+            #volume_metrics = verdict_data.get('volume_metrics', {})
+
+            if volume_metrics:
+                st.markdown("### 📊 Volume Analysis")
+
+                vm = volume_metrics
+                severity = vm.get('severity', 'normal')
+                interpretation = vm.get('interpretation', '')
+                statistically_significant = vm.get('statistically_significant', False)
+
+                # Color mapping
+                if severity in ('spike', 'extreme'):
+                    sev_color, sev_bg = '#FFA726', '#4a3a1e'
+                elif severity == 'elevated':
+                    sev_color, sev_bg = '#8BC34A', '#2a3d1e'
+                elif severity in ('low', 'very_low'):
+                    sev_color, sev_bg = '#9AA0A6', '#2a2a2a'
+                else:
+                    sev_color, sev_bg = '#4CAF50', '#1e4620'
+
+                col1, col2 = st.columns([1, 2])
+
+                with col1:
+                    st.markdown(f"""
+                    <div style="background-color:{sev_bg}; border:2px solid {sev_color};
+                                border-radius:10px; padding:1rem; text-align:center;">
+                        <div style="font-size:1.25rem; font-weight:700; color:{sev_color};">
+                            {vm['classification']}
+                        </div>
+                        <div style="color:#9aa0a6; font-size:0.8rem; margin-top:0.25rem;">
+                            {vm['volume_ratio']:.2f}× 20-day avg
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with col2:
+                    st.markdown(f"**Interpretation**: {interpretation}")
+
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("Today's Volume", f"{vm['latest_volume']:,.0f}")
+                    mc2.metric("20-day Avg", f"{vm['avg_volume_20d']:,.0f}")
+                    mc3.metric(
+                        "Z-Score",
+                        f"{vm['volume_zscore']:+.2f}",
+                        delta="Significant" if statistically_significant else "Normal",
+                        delta_color="normal" if statistically_significant else "off",
+                    )
+
+                    if statistically_significant:
+                        st.caption(
+                            f"🔬 Volume is {vm['volume_zscore']:.1f} standard deviations above the "
+                            f"60-day mean — statistically unusual for this stock."
+                        )
+
+                # Show volume weight applied to the signal
+                volume_weight = summary['signals'].get('volume_weight', 1.0)
+                if abs(volume_weight - 1.0) > 0.1:
+                    direction = "increased" if volume_weight > 1.0 else "reduced"
+                    st.info(
+                        f"⚖️ Signal confidence {direction} to "
+                        f"**{volume_weight:.2f}×** due to volume conditions."
+                    )
+            
+            # --- Key Levels (similar to Stock Analyzer) ---
+            st.markdown("### Key Levels")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Current Price", f"${verdict_data['current_price']:.2f}")
+            with col2:
+                support = verdict_data['support_level']
+                if support:
+                    st.metric("Support Level", f"${support:.2f}", 
+                             delta=f"{((verdict_data['current_price'] - support) / verdict_data['current_price'] * 100):.1f}% above")
+                else:
+                    st.metric("Support Level", "N/A")
+            with col3:
+                resistance = verdict_data['resistance_level']
+                if resistance:
+                    st.metric("Resistance Level", f"${resistance:.2f}",
+                             delta=f"{((resistance - verdict_data['current_price']) / verdict_data['current_price'] * 100):.1f}% above")
+                else:
+                    st.metric("Resistance Level", "N/A")
+            
+            # --- Signal Summary (matching Stock Analyzer table style) ---
+            st.markdown("### Signal Summary")
+            
+            signal_summary = verdict_data['signal_summary']
+            
+            # Create metrics row
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📈 Buy Signals", signal_summary['buy_signals'], 
+                         delta="Bullish" if signal_summary['buy_signals'] > 0 else None)
+            with col2:
+                st.metric("📉 Sell Signals", signal_summary['sell_signals'],
+                         delta="Bearish" if signal_summary['sell_signals'] > 0 else None)
+            with col3:
+                st.metric("⏳ Neutral Signals", signal_summary['neutral_signals'])
+            
+            # --- Display Chart ---
+            st.markdown("### Technical Charts")
+            fig = analyzer.create_interactive_chart()
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Could not generate charts")
+            
+            # --- Display detailed signals (expandable) ---
+            with st.expander("📋 Detailed Signal Breakdown"):
+                signals = summary['signals']
+                
+                if signals.get('buy_signals'):
+                    st.markdown("**Buy Signals**")
+                    for signal in signals['buy_signals']:
+                        st.success(f"✅ {signal}")
+                
+                if signals.get('sell_signals'):
+                    st.markdown("**Sell Signals**")
+                    for signal in signals['sell_signals']:
+                        st.error(f"❌ {signal}")
+                
+                if signals.get('neutral_signals'):
+                    st.markdown("**Neutral / Wait Signals**")
+                    for signal in signals['neutral_signals']:
+                        st.warning(f"⏳ {signal}")
+            
+            # --- Download Data ---
+            with st.expander("📥 Download Data"):
+                csv = analyzer.stock_data.to_csv()
+                st.download_button(
+                    label="Download Full Technical Data (CSV)",
+                    data=csv,
+                    file_name=f"{tech_ticker}_technical_data.csv",
+                    mime="text/csv"
+                )
+
+            # --- TQQQ/SQQQ Strategy Signals (bottom of page) ---
+            st.markdown("---")
+            st.markdown("### 🤖 TQQQ/SQQQ Multi-Strategy Signals")
+            st.caption(
+                "Seven independent sub-strategies vote daily on target allocation. "
+                "Each strategy is a separate module — add, remove, or tune them independently."
+            )
+
+            # Manual refresh button — forces a fresh yfinance fetch
+            refresh_col1, refresh_col2 = st.columns([1, 4])
+            with refresh_col1:
+                if st.button("🔄 Refresh Signals", key="refresh_tqqq", use_container_width=True):
+                    st.cache_data.clear()
+                    st.rerun()
+            with refresh_col2:
+                st.caption(
+                    "Click Refresh to force a fresh fetch at 3:50 PM ET. "
+                    "Otherwise cached data (1-hour TTL) is reused."
+                )
+
+            try:
+                from tqqq_sqqq_strategies import run_all_strategies
+
+                with st.spinner("Running TQQQ/SQQQ strategies..."):
+                    tqqq_signals = run_all_strategies()
+
+                if "error" in tqqq_signals:
+                    st.warning(f"Strategy analysis unavailable: {tqqq_signals['error']}")
+                else:
+                    # Signal card + allocation
+                    col1, col2 = st.columns([1, 2])
+
+                    with col1:
+                        signal = tqqq_signals["signal"]
+                        regime = tqqq_signals["regime"]
+                        confidence = tqqq_signals["confidence"]
+
+                        if "TQQQ" in signal and "HEAVY" in signal:
+                            color, bg = "#4CAF50", "#1e4620"
+                        elif "TQQQ" in signal:
+                            color, bg = "#8BC34A", "#2a3d1e"
+                        elif "SQQQ" in signal and "HEAVY" in signal:
+                            color, bg = "#EF5350", "#4b1e1e"
+                        elif "SQQQ" in signal:
+                            color, bg = "#FF7043", "#3d241e"
+                        else:
+                            color, bg = "#FFA726", "#4a3a1e"
+
+                        st.markdown(f"""
+                        <div style="background-color:{bg}; border:2px solid {color};
+                                    border-radius:10px; padding:1.25rem; text-align:center;">
+                            <div style="font-size:1.5rem; font-weight:700; color:{color};">
+                                {signal}
+                            </div>
+                            <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.4rem;">
+                                Regime: <strong>{regime}</strong>
+                            </div>
+                            <div style="color:#9aa0a6; font-size:0.75rem;">
+                                Confidence: {confidence:.0f}%
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with col2:
+                        alloc_col1, alloc_col2 = st.columns(2)
+                        alloc_col1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
+                        alloc_col2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
+                        st.caption(
+                            f"Position multiplier: {tqqq_signals['position_multiplier']:.1f}× "
+                            f"(adjusts size based on trend strength)"
+                        )
+
+                    # Per-strategy vote breakdown
+                    with st.expander("📋 Sub-Strategy Votes"):
+                        vote_df = pd.DataFrame(tqqq_signals["vote_details"])
+                        vote_df.columns = ["Strategy", "Target TQQQ %", "Reason"]
+                        vote_df["Target TQQQ %"] = vote_df["Target TQQQ %"].round(1)
+                        st.dataframe(vote_df, use_container_width=True, hide_index=True)
+
+                        st.markdown("---")
+                        st.markdown(
+                            f"**Aggregated target**: "
+                            f"{tqqq_signals['target_tqqq_pct']:.1f}% TQQQ / "
+                            f"{tqqq_signals['target_sqqq_pct']:.1f}% SQQQ"
+                        )
+                        st.caption(
+                            "Each strategy votes independently; the average becomes the daily target. "
+                            "Position size is adjusted by BB width (trend strength)."
+                        )
+
+            except ImportError:
+                st.info("TQQQ/SQQQ strategies module not installed. "
+                        "Create `tqqq_sqqq_strategies.py` to enable this feature.")
+            except Exception as e:
+                st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")
+            # ============================================================
+            # CAPITAL INPUT + TARGET SHARE CALCULATOR
+            # ============================================================
+            st.markdown("#### 🎯 Position Calculator")
+            st.caption(
+                "Enter your capital and current holdings. "
+                "The calculator tells you exactly how many fractional shares to buy or sell."
+            )
+
+            # Persist capital across reruns
+            if "tqqq_capital" not in st.session_state:
+                st.session_state["tqqq_capital"] = 2470.0
+
+            colA, colB = st.columns([1, 1])
+            with colA:
+                account_value = st.number_input(
+                    "Account value ($)",
+                    min_value=100.0,
+                    max_value=1_000_000.0,
+                    value=float(st.session_state["tqqq_capital"]),
+                    step=10.0,
+                    key="tqqq_capital_input",
+                )
+                st.session_state["tqqq_capital"] = account_value
+
+            with colB:
+                # Fetch live prices for TQQQ and SQQQ
+                try:
+                    tqqq_price = yf.Ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
+                    sqqq_price = yf.Ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
+                    st.metric("TQQQ Price", f"${tqqq_price:.2f}")
+                    st.metric("SQQQ Price", f"${sqqq_price:.2f}")
+                except Exception as e:
+                    st.error(f"Could not fetch prices: {e}")
+                    tqqq_price = 0.0
+                    sqqq_price = 0.0
+
+            if tqqq_price > 0 and sqqq_price > 0:
+                # Compute target allocation
+                targets = compute_target_shares(
+                    account_value=account_value,
+                    tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                    tqqq_price=tqqq_price,
+                    sqqq_price=sqqq_price,
+                )
+
+                st.markdown("**Target Positions**")
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    st.metric(
+                        "TQQQ target",
+                        f"{targets['tqqq_target_shares']:.4f} shares",
+                        delta=f"${targets['tqqq_target_value']:.2f}",
+                    )
+                with tc2:
+                    st.metric(
+                        "SQQQ target",
+                        f"{targets['sqqq_target_shares']:.4f} shares",
+                        delta=f"${targets['sqqq_target_value']:.2f}",
+                    )
+
+                # ============================================================
+                # CURRENT HOLDINGS INPUT + REBALANCE CALCULATOR
+                # ============================================================
+                st.markdown("**Your Current Holdings**")
+                hc1, hc2 = st.columns(2)
+                with hc1:
+                    current_tqqq = st.number_input(
+                        "Current TQQQ shares", min_value=0.0,
+                        value=0.0, step=1.0, key="cur_tqqq",
+                    )
+                with hc2:
+                    current_sqqq = st.number_input(
+                        "Current SQQQ shares", min_value=0.0,
+                        value=62.0, step=1.0, key="cur_sqqq",
+                    )
+
+                rebalance = compute_rebalance(
+                    current_tqqq_shares=current_tqqq,
+                    current_sqqq_shares=current_sqqq,
+                    tqqq_target_shares=targets["tqqq_target_shares"],
+                    sqqq_target_shares=targets["sqqq_target_shares"],
+                    tqqq_price=tqqq_price,
+                    sqqq_price=sqqq_price,
+                )
+
+                st.markdown("**Actions to Take Now**")
+                ac1, ac2 = st.columns(2)
+
+                with ac1:
+                    delta = rebalance["tqqq_delta_shares"]
+                    if abs(delta) < 0.01:
+                        st.info("TQQQ: no action needed")
+                    elif delta > 0:
+                        st.success(f"TQQQ: **BUY {delta:.4f} shares** "
+                                   f"(~${rebalance['tqqq_delta_value']:.2f})")
+                    else:
+                        st.warning(f"TQQQ: **SELL {abs(delta):.4f} shares** "
+                                   f"(~${abs(rebalance['tqqq_delta_value']):.2f})")
+
+                with ac2:
+                    delta = rebalance["sqqq_delta_shares"]
+                    if abs(delta) < 0.01:
+                        st.info("SQQQ: no action needed")
+                    elif delta > 0:
+                        st.success(f"SQQQ: **BUY {delta:.4f} shares** "
+                                   f"(~${rebalance['sqqq_delta_value']:.2f})")
+                    else:
+                        st.warning(f"SQQQ: **SELL {abs(delta):.4f} shares** "
+                                   f"(~${abs(rebalance['sqqq_delta_value']):.2f})")
+
+                # ============================================================
+                # LOG TRADE BUTTONS
+                # ============================================================
+                st.markdown("**Log These Trades**")
+                lc1, lc2 = st.columns(2)
+
+                with lc1:
+                    if st.button("✅ Log TQQQ trade", key="log_tqqq"):
+                        delta = rebalance["tqqq_delta_shares"]
+                        if abs(delta) >= 0.01:
+                            action = "BUY" if delta > 0 else "SELL"
+                            log_trade(
+                                ticker="TQQQ",
+                                action=action,
+                                shares=abs(delta),
+                                price=tqqq_price,
+                                signal=tqqq_signals["signal"],
+                                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                                account_value=account_value,
+                            )
+                            st.success(f"Logged {action} {abs(delta):.4f} TQQQ @ ${tqqq_price:.2f}")
+
+                with lc2:
+                    if st.button("✅ Log SQQQ trade", key="log_sqqq"):
+                        delta = rebalance["sqqq_delta_shares"]
+                        if abs(delta) >= 0.01:
+                            action = "BUY" if delta > 0 else "SELL"
+                            log_trade(
+                                ticker="SQQQ",
+                                action=action,
+                                shares=abs(delta),
+                                price=sqqq_price,
+                                signal=tqqq_signals["signal"],
+                                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                                account_value=account_value,
+                            )
+                            st.success(f"Logged {action} {abs(delta):.4f} SQQQ @ ${sqqq_price:.2f}")
+            # ============================================================
+            # TRADE HISTORY
+            # ============================================================
+            st.markdown("#### 📒 Trade History")
+
+            trades_df = load_trades()
+
+            if trades_df.empty:
+                st.info("No trades logged yet. Use the Log buttons above to record your fills.")
+            else:
+                # Summary stats
+                total_trades = len(trades_df)
+                buy_count = (trades_df["action"] == "BUY").sum()
+                sell_count = (trades_df["action"] == "SELL").sum()
+                total_volume = trades_df["total_value"].sum()
+
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Total trades", total_trades)
+                sc2.metric("Buys", int(buy_count))
+                sc3.metric("Sells", int(sell_count))
+                sc4.metric("Total volume", f"${total_volume:,.2f}")
+
+                # Full log
+                st.dataframe(
+                    trades_df.sort_values("timestamp", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Download + clear
+                dlc1, dlc2 = st.columns([1, 4])
+                with dlc1:
+                    csv_bytes = trades_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download trade log",
+                        data=csv_bytes,
+                        file_name=f"trades_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                    )
+                with dlc2:
+                    if st.button("🗑️ Clear trade log", key="clear_trades"):
+                        clear_trades()
+                        st.rerun()
+
+tab_analyzer, tab_screener, tab_technical = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener", "📈 Technical Analysis"])
 
 with tab_screener:
     render_stock_screener()
 
 with tab_analyzer:
     render_analyzer()
+
+with tab_technical:
+    render_technical_analysis()

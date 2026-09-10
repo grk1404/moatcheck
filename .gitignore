@@ -1,13 +1,45 @@
+﻿# Python
 __pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
+*.py[cod]
+*.class
+*.so
+.Python
 env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
 .env
-.streamlit/secrets.toml
+.venv
+*.log
+*.sqlite
+*.db
+
+# OS
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
-*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Data files
+*.csv
+*.xlsx
+*.parquet
+data/

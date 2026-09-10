@@ -323,6 +323,14 @@ def fetch(ticker: str) -> Financials:
     try:
         info = yft.info or {}
         company_name = info.get("longName") or info.get("shortName") or symbol
+        # --- ADD THIS: Get exchange from info ---
+        info_exchange = info.get("exchange", "")
+        if info_exchange:
+            exchange = info_exchange  # Override the empty exchange with actual exchange
+        # Also check for fullExchangeName
+        elif info.get("fullExchangeName"):
+            exchange = info.get("fullExchangeName")
+
         if current_price is None:
             current_price = info.get("currentPrice") or info.get("regularMarketPrice")
             if current_price is not None:
