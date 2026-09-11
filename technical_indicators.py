@@ -276,6 +276,7 @@ class TechnicalIndicatorAnalyzer:
             'buy_signals': [],
             'sell_signals': [],
             'neutral_signals': [],
+            'volume_details': [],
             'buy_count': 0,
             'sell_count': 0,
             'total_signals': 0,
@@ -387,13 +388,20 @@ class TechnicalIndicatorAnalyzer:
 
         # Add a volume note to signals details
         if volume_weight > 1.2:
-            signals['details'].append(
-                f"📊 High volume ({self.volume_metrics['classification']}) strengthens the signal"
-            )
+            signals['volume_details'].append({
+                'type': 'positive',
+                'text': f"High volume ({self.volume_metrics['classification']}) strengthens the signal",
+            })
         elif volume_weight < 0.8:
-            signals['details'].append(
-                f"📊 Low volume ({self.volume_metrics['classification']}) weakens the signal"
-            )
+            signals['volume_details'].append({
+                'type': 'caution',
+                'text': f"Low volume ({self.volume_metrics['classification']}) weakens the signal",
+            })
+        else:
+            signals['volume_details'].append({
+                'type': 'neutral',
+                'text': f"Volume at {self.volume_metrics['volume_ratio']:.2f}× average — no signal impact",
+            })
         
         # Determine recommendation with confidence
         if signals['buy_count'] >= 3:
@@ -463,36 +471,214 @@ class TechnicalIndicatorAnalyzer:
         # Row 2: MACD
         fig.add_trace(
             go.Scatter(x=self.stock_data.index, y=self.stock_data['MACD'],
-                      name='MACD', line=dict(color='blue', width=2)),
+                      name='MACD', line=dict(color='#4DABF7', width=2)),
             row=2, col=1
         )
         fig.add_trace(
             go.Scatter(x=self.stock_data.index, y=self.stock_data['Signal_Line'],
-                      name='Signal Line', line=dict(color='red', width=2)),
+                      name='Signal Line', line=dict(color='#FF6B6B', width=2)),
             row=2, col=1
         )
+
         # MACD Histogram
-        colors = ['green' if val >= 0 else 'red' for val in self.stock_data['MACD_Histogram']]
+        colors = ['#51CF66' if val >= 0 else '#FF6B6B' for val in self.stock_data['MACD_Histogram']]
         fig.add_trace(
             go.Bar(x=self.stock_data.index, y=self.stock_data['MACD_Histogram'],
-                   name='Histogram', marker_color=colors),
+                   name='Histogram', marker_color=colors, opacity=0.4),
             row=2, col=1
         )
+
+        # --- Detect MACD crossovers ---
+        macd = self.stock_data['MACD']
+        signal = self.stock_data['Signal_Line']
+
+        # Bullish crossover: MACD crosses above Signal
+        bullish_cross = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+        # Bearish crossover: MACD crosses below Signal
+        bearish_cross = (macd < signal) & (macd.shift(1) >= signal.shift(1))
+
+        # Bullish crossover circles (translucent green)
+        bull_x = self.stock_data.index[bullish_cross]
+        bull_y = macd[bullish_cross]
+        if len(bull_x) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=bull_x, y=bull_y,
+                    mode='markers',
+                    marker=dict(
+                        size=22,
+                        color='rgba(81, 207, 102, 0.25)',
+                        line=dict(color='rgba(81, 207, 102, 0.9)', width=2),
+                    ),
+                    name='MACD Bullish Cross',
+                    showlegend=False,
+                    hovertemplate='Bullish cross<br>%{x}<extra></extra>',
+                ),
+                row=2, col=1
+            )
+            # Green up-arrows just below the circle
+            fig.add_trace(
+                go.Scatter(
+                    x=bull_x, y=bull_y - abs(bull_y).mean() * 0.15,
+                    mode='markers+text',
+                    marker=dict(symbol='triangle-up', size=14, color='#00E676'),
+                    text=['BUY'] * len(bull_x),
+                    textposition='bottom center',
+                    textfont=dict(color='#00E676', size=10),
+                    name='MACD Buy',
+                    showlegend=False,
+                    hovertemplate='BUY signal<br>%{x}<extra></extra>',
+                ),
+                row=2, col=1
+            )
+
+        # Bearish crossover circles (translucent red)
+        bear_x = self.stock_data.index[bearish_cross]
+        bear_y = macd[bearish_cross]
+        if len(bear_x) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=bear_x, y=bear_y,
+                    mode='markers',
+                    marker=dict(
+                        size=22,
+                        color='rgba(255, 107, 107, 0.25)',
+                        line=dict(color='rgba(255, 107, 107, 0.9)', width=2),
+                    ),
+                    name='MACD Bearish Cross',
+                    showlegend=False,
+                    hovertemplate='Bearish cross<br>%{x}<extra></extra>',
+                ),
+                row=2, col=1
+            )
+            # Red down-arrows just above the circle
+            fig.add_trace(
+                go.Scatter(
+                    x=bear_x, y=bear_y + abs(bear_y).mean() * 0.15,
+                    mode='markers+text',
+                    marker=dict(symbol='triangle-down', size=14, color='#FF1744'),
+                    text=['SELL'] * len(bear_x),
+                    textposition='top center',
+                    textfont=dict(color='#FF1744', size=10),
+                    name='MACD Sell',
+                    showlegend=False,
+                    hovertemplate='SELL signal<br>%{x}<extra></extra>',
+                ),
+                row=2, col=1
+            )
+
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
         
         # Row 3: Stochastic
         fig.add_trace(
             go.Scatter(x=self.stock_data.index, y=self.stock_data['%K'],
-                      name='%K', line=dict(color='blue', width=2)),
+                      name='%K', line=dict(color='#4DABF7', width=2)),
             row=3, col=1
         )
         fig.add_trace(
             go.Scatter(x=self.stock_data.index, y=self.stock_data['%D'],
-                      name='%D', line=dict(color='red', width=2)),
+                      name='%D', line=dict(color='#FF6B6B', width=2)),
             row=3, col=1
         )
-        # Add overbought/oversold lines
-        fig.add_hline(y=80, line_dash="dash", line_color="red", row=3, col=1)
-        fig.add_hline(y=20, line_dash="dash", line_color="green", row=3, col=1)
+
+        # Overbought/Oversold lines
+        fig.add_hline(y=80, line_dash="dash", line_color="#FF6B6B", row=3, col=1,
+                      annotation_text="Overbought", annotation_position="right")
+        fig.add_hline(y=20, line_dash="dash", line_color="#51CF66", row=3, col=1,
+                      annotation_text="Oversold", annotation_position="right")
+
+        # --- Highlight overbought and oversold zones ---
+        stoch_k = self.stock_data['%K']
+        stoch_d = self.stock_data['%D']
+
+        # Oversold zone: %K below 20
+        oversold = stoch_k < 20
+        oversold_x = self.stock_data.index[oversold]
+        oversold_y = stoch_k[oversold]
+
+        if len(oversold_x) > 0:
+            # Translucent green circles on oversold bars
+            fig.add_trace(
+                go.Scatter(
+                    x=oversold_x, y=oversold_y,
+                    mode='markers',
+                    marker=dict(
+                        size=18,
+                        color='rgba(81, 207, 102, 0.20)',
+                        line=dict(color='rgba(81, 207, 102, 0.8)', width=1.5),
+                    ),
+                    name='Oversold Zone',
+                    showlegend=True,
+                    hovertemplate='Oversold<br>%{x}<br>%K: %{y:.1f}<extra></extra>',
+                ),
+                row=3, col=1
+            )
+
+        # Overbought zone: %K above 80
+        overbought = stoch_k > 80
+        overbought_x = self.stock_data.index[overbought]
+        overbought_y = stoch_k[overbought]
+
+        if len(overbought_x) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=overbought_x, y=overbought_y,
+                    mode='markers',
+                    marker=dict(
+                        size=18,
+                        color='rgba(255, 107, 107, 0.20)',
+                        line=dict(color='rgba(255, 107, 107, 0.8)', width=1.5),
+                    ),
+                    name='Overbought Zone',
+                    showlegend=True,
+                    hovertemplate='Overbought<br>%{x}<br>%K: %{y:.1f}<extra></extra>',
+                ),
+                row=3, col=1
+            )
+
+        # --- Buy/Sell arrows on Stochastic crossovers ---
+        # Bullish crossover from oversold: %K crosses above %D while %K < 30
+        stoch_bull = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1)) & (stoch_k < 30)
+        # Bearish crossover from overbought: %K crosses below %D while %K > 70
+        stoch_bear = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1)) & (stoch_k > 70)
+
+        bull_x = self.stock_data.index[stoch_bull]
+        bull_y = stoch_k[stoch_bull]
+        if len(bull_x) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=bull_x, y=bull_y - 5,
+                    mode='markers+text',
+                    marker=dict(symbol='triangle-up', size=14, color='#00E676'),
+                    text=['BUY'] * len(bull_x),
+                    textposition='bottom center',
+                    textfont=dict(color='#00E676', size=10),
+                    name='Stoch Buy',
+                    showlegend=False,
+                    hovertemplate='BUY (Stoch cross up from oversold)<br>%{x}<extra></extra>',
+                ),
+                row=3, col=1
+            )
+
+        bear_x = self.stock_data.index[stoch_bear]
+        bear_y = stoch_k[stoch_bear]
+        if len(bear_x) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=bear_x, y=bear_y + 5,
+                    mode='markers+text',
+                    marker=dict(symbol='triangle-down', size=14, color='#FF1744'),
+                    text=['SELL'] * len(bear_x),
+                    textposition='top center',
+                    textfont=dict(color='#FF1744', size=10),
+                    name='Stoch Sell',
+                    showlegend=False,
+                    hovertemplate='SELL (Stoch cross down from overbought)<br>%{x}<extra></extra>',
+                ),
+                row=3, col=1
+            )
+
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
         
         # Row 4: RSI
         fig.add_trace(
@@ -519,145 +705,348 @@ class TechnicalIndicatorAnalyzer:
         
         return fig.to_html(full_html=False)
 
-    def create_interactive_chart(self):
-        """Create interactive Plotly chart with all technical indicators"""
+    def create_interactive_chart(self,
+                                 show_sma20=False,
+                                 show_sma50=False,
+                                 show_sma200=False,
+                                 show_bb=False,
+                                 lookback_days=None):
+        """
+        Create interactive Plotly chart with toggleable overlays.
+
+        Parameters
+        ----------
+        show_sma20 : bool       Show 20-day SMA on Price subplot
+        show_sma50 : bool       Show 50-day SMA on Price subplot
+        show_sma200 : bool      Show 200-day SMA on Price subplot
+        show_bb : bool          Show Bollinger Bands on Price subplot
+        lookback_days : int     Show only the last N calendar days (None = all)
+        """
         if self.stock_data is None or self.stock_data.empty:
             return None
-        
-        # Create subplots: Price, MACD, Stochastic
+
+        # ---- Slice to lookback window ----
+        full = self.stock_data
+        if lookback_days is not None:
+            cutoff = full.index[-1] - pd.Timedelta(days=lookback_days)
+            data = full[full.index >= cutoff].copy()
+            if data.empty:
+                return None
+        else:
+            data = full.copy()
+
         fig = make_subplots(
-            rows=4,
-            cols=1,
+            rows=4, cols=1,
             shared_xaxes=True,
             vertical_spacing=0.06,
             subplot_titles=(
-                'Price & Moving Averages',
+                'Price',
                 'MACD (8, 17, 9)',
                 'Stochastic Oscillator',
                 'Volume',
             ),
             row_heights=[0.35, 0.25, 0.2, 0.2],
         )
-        
-        # Row 1: Price with Moving Averages
+
+        # ============================================================
+        # Row 1: Price with mountain fill and optional overlays
+        # ============================================================
         fig.add_trace(
-            go.Scatter(x=self.stock_data.index, y=self.stock_data['Close'],
-                      name='Close Price', line=dict(color='#00BFFF', width=2)),
+            go.Scatter(
+                x=data.index, y=data['Close'],
+                name='Close',
+                line=dict(color='#4DABF7', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(77, 171, 247, 0.12)',
+            ),
             row=1, col=1
         )
-        
-        # Add SMA lines
-        for ma, color in [(20, '#FF6B6B'), (50, '#FFA94D'), (200, '#51CF66')]:
-            if f'SMA_{ma}' in self.stock_data.columns:
-                fig.add_trace(
-                    go.Scatter(x=self.stock_data.index, y=self.stock_data[f'SMA_{ma}'],
-                              name=f'SMA {ma}', line=dict(color=color, width=1.5, dash='dash')),
-                    row=1, col=1
-                )
-        
-        # Add Bollinger Bands
-        if 'BB_Upper' in self.stock_data.columns:
+
+        if show_sma20 and 'SMA_20' in data.columns:
             fig.add_trace(
-                go.Scatter(x=self.stock_data.index, y=self.stock_data['BB_Upper'],
-                          name='BB Upper', line=dict(color='rgba(128,128,128,0.5)', width=1),
-                          showlegend=True),
+                go.Scatter(x=data.index, y=data['SMA_20'],
+                          name='SMA 20', line=dict(color='#FF6B6B', width=1.5, dash='dash')),
+                row=1, col=1
+            )
+
+        if show_sma50 and 'SMA_50' in data.columns:
+            fig.add_trace(
+                go.Scatter(x=data.index, y=data['SMA_50'],
+                          name='SMA 50', line=dict(color='#FFA94D', width=1.5, dash='dash')),
+                row=1, col=1
+            )
+
+        if show_sma200 and 'SMA_200' in data.columns:
+            fig.add_trace(
+                go.Scatter(x=data.index, y=data['SMA_200'],
+                          name='SMA 200', line=dict(color='#51CF66', width=1.5, dash='dash')),
+                row=1, col=1
+            )
+
+        if show_bb and 'BB_Upper' in data.columns and 'BB_Lower' in data.columns:
+            fig.add_trace(
+                go.Scatter(x=data.index, y=data['BB_Upper'],
+                          name='BB Upper',
+                          line=dict(color='rgba(200,200,200,0.6)', width=1)),
                 row=1, col=1
             )
             fig.add_trace(
-                go.Scatter(x=self.stock_data.index, y=self.stock_data['BB_Lower'],
-                          name='BB Lower', line=dict(color='rgba(128,128,128,0.5)', width=1),
-                          fill='tonexty', fillcolor='rgba(128,128,128,0.1)',
-                          showlegend=True),
+                go.Scatter(x=data.index, y=data['BB_Lower'],
+                          name='BB Lower',
+                          line=dict(color='rgba(200,200,200,0.6)', width=1),
+                          fill='tonexty', fillcolor='rgba(200,200,200,0.08)'),
                 row=1, col=1
             )
-        
+
+        # ============================================================
         # Row 2: MACD
+        # ============================================================
         fig.add_trace(
-            go.Scatter(x=self.stock_data.index, y=self.stock_data['MACD'],
+            go.Scatter(x=data.index, y=data['MACD'],
                       name='MACD', line=dict(color='#4DABF7', width=2)),
             row=2, col=1
         )
         fig.add_trace(
-            go.Scatter(x=self.stock_data.index, y=self.stock_data['Signal_Line'],
+            go.Scatter(x=data.index, y=data['Signal_Line'],
                       name='Signal Line', line=dict(color='#FF6B6B', width=2)),
             row=2, col=1
         )
-        
-        # MACD Histogram
-        colors = ['#51CF66' if val >= 0 else '#FF6B6B' for val in self.stock_data['MACD_Histogram']]
+
+        colors = ['#51CF66' if val >= 0 else '#FF6B6B' for val in data['MACD_Histogram']]
         fig.add_trace(
-            go.Bar(x=self.stock_data.index, y=self.stock_data['MACD_Histogram'],
-                   name='Histogram', marker_color=colors, opacity=0.5),
+            go.Bar(x=data.index, y=data['MACD_Histogram'],
+                   name='Histogram', marker_color=colors, opacity=0.4),
             row=2, col=1
         )
+
+        macd = data['MACD']
+        signal = data['Signal_Line']
+
+        bullish_cross = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+        bearish_cross = (macd < signal) & (macd.shift(1) >= signal.shift(1))
+
+        bull_x = data.index[bullish_cross]
+        bull_y = macd[bullish_cross]
+        if len(bull_x) > 0:
+            fig.add_trace(
+                go.Scatter(x=bull_x, y=bull_y, mode='markers',
+                          marker=dict(size=22,
+                                     color='rgba(81, 207, 102, 0.25)',
+                                     line=dict(color='rgba(81, 207, 102, 0.9)', width=2)),
+                          name='MACD Bullish Cross', showlegend=False,
+                          hovertemplate='Bullish cross<br>%{x}<extra></extra>'),
+                row=2, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=bull_x, y=bull_y - abs(bull_y).mean() * 0.15,
+                          mode='markers+text',
+                          marker=dict(symbol='triangle-up', size=14, color='#00E676'),
+                          text=['BUY'] * len(bull_x), textposition='bottom center',
+                          textfont=dict(color='#00E676', size=10),
+                          name='MACD Buy', showlegend=False,
+                          hovertemplate='BUY signal<br>%{x}<extra></extra>'),
+                row=2, col=1
+            )
+
+        bear_x = data.index[bearish_cross]
+        bear_y = macd[bearish_cross]
+        if len(bear_x) > 0:
+            fig.add_trace(
+                go.Scatter(x=bear_x, y=bear_y, mode='markers',
+                          marker=dict(size=22,
+                                     color='rgba(255, 107, 107, 0.25)',
+                                     line=dict(color='rgba(255, 107, 107, 0.9)', width=2)),
+                          name='MACD Bearish Cross', showlegend=False,
+                          hovertemplate='Bearish cross<br>%{x}<extra></extra>'),
+                row=2, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=bear_x, y=bear_y + abs(bear_y).mean() * 0.15,
+                          mode='markers+text',
+                          marker=dict(symbol='triangle-down', size=14, color='#FF1744'),
+                          text=['SELL'] * len(bear_x), textposition='top center',
+                          textfont=dict(color='#FF1744', size=10),
+                          name='MACD Sell', showlegend=False,
+                          hovertemplate='SELL signal<br>%{x}<extra></extra>'),
+                row=2, col=1
+            )
+
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-        
+
+        # ============================================================
         # Row 3: Stochastic
+        # ============================================================
         fig.add_trace(
-            go.Scatter(x=self.stock_data.index, y=self.stock_data['%K'],
+            go.Scatter(x=data.index, y=data['%K'],
                       name='%K', line=dict(color='#4DABF7', width=2)),
             row=3, col=1
         )
         fig.add_trace(
-            go.Scatter(x=self.stock_data.index, y=self.stock_data['%D'],
+            go.Scatter(x=data.index, y=data['%D'],
                       name='%D', line=dict(color='#FF6B6B', width=2)),
             row=3, col=1
         )
 
+        fig.add_hline(y=80, line_dash="dash", line_color="#FF6B6B",
+                      row=3, col=1, annotation_text="Overbought",
+                      annotation_position="right")
+        fig.add_hline(y=20, line_dash="dash", line_color="#51CF66",
+                      row=3, col=1, annotation_text="Oversold",
+                      annotation_position="right")
+
+        stoch_k = data['%K']
+        stoch_d = data['%D']
+
+        oversold = stoch_k < 20
+        oversold_x = data.index[oversold]
+        oversold_y = stoch_k[oversold]
+        if len(oversold_x) > 0:
+            fig.add_trace(
+                go.Scatter(x=oversold_x, y=oversold_y, mode='markers',
+                          marker=dict(size=18,
+                                     color='rgba(81, 207, 102, 0.20)',
+                                     line=dict(color='rgba(81, 207, 102, 0.8)', width=1.5)),
+                          name='Oversold Zone', showlegend=True,
+                          hovertemplate='Oversold<br>%{x}<br>%K: %{y:.1f}<extra></extra>'),
+                row=3, col=1
+            )
+
+        overbought = stoch_k > 80
+        overbought_x = data.index[overbought]
+        overbought_y = stoch_k[overbought]
+        if len(overbought_x) > 0:
+            fig.add_trace(
+                go.Scatter(x=overbought_x, y=overbought_y, mode='markers',
+                          marker=dict(size=18,
+                                     color='rgba(255, 107, 107, 0.20)',
+                                     line=dict(color='rgba(255, 107, 107, 0.8)', width=1.5)),
+                          name='Overbought Zone', showlegend=True,
+                          hovertemplate='Overbought<br>%{x}<br>%K: %{y:.1f}<extra></extra>'),
+                row=3, col=1
+            )
+
+        stoch_bull = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1)) & (stoch_k < 30)
+        stoch_bear = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1)) & (stoch_k > 70)
+
+        bull_x_s = data.index[stoch_bull]
+        bull_y_s = stoch_k[stoch_bull]
+        if len(bull_x_s) > 0:
+            fig.add_trace(
+                go.Scatter(x=bull_x_s, y=bull_y_s - 5, mode='markers+text',
+                          marker=dict(symbol='triangle-up', size=14, color='#00E676'),
+                          text=['BUY'] * len(bull_x_s), textposition='bottom center',
+                          textfont=dict(color='#00E676', size=10),
+                          name='Stoch Buy', showlegend=False,
+                          hovertemplate='BUY (Stoch cross up)<br>%{x}<extra></extra>'),
+                row=3, col=1
+            )
+
+        bear_x_s = data.index[stoch_bear]
+        bear_y_s = stoch_k[stoch_bear]
+        if len(bear_x_s) > 0:
+            fig.add_trace(
+                go.Scatter(x=bear_x_s, y=bear_y_s + 5, mode='markers+text',
+                          marker=dict(symbol='triangle-down', size=14, color='#FF1744'),
+                          text=['SELL'] * len(bear_x_s), textposition='top center',
+                          textfont=dict(color='#FF1744', size=10),
+                          name='Stoch Sell', showlegend=False,
+                          hovertemplate='SELL (Stoch cross down)<br>%{x}<extra></extra>'),
+                row=3, col=1
+            )
+
+        # ============================================================
+        # Percentage annotations on each crossover marker
+        # ============================================================
+        cycles = self.compute_signal_cycles(
+            lookback_days=lookback_days
+        )
+
+        # MACD annotations
+        macd_cycles = cycles.get("macd", [])
+        for cyc in macd_cycles:
+            # Annotate the SELL marker with the % gained during the BUY→SELL leg
+            pct = cyc["pct_change"]
+            color = '#00E676' if pct >= 0 else '#FF1744'
+            sign = '+' if pct >= 0 else ''
+            fig.add_annotation(
+                x=cyc["sell_date"],
+                y=macd.loc[cyc["sell_date"]] if cyc["sell_date"] in macd.index else 0,
+                text=f"{sign}{pct:.1f}%",
+                showarrow=False,
+                yshift=30,
+                font=dict(color=color, size=10),
+                row=2, col=1,
+            )
+
+        # Stochastic annotations
+        stoch_cycles = cycles.get("stoch", [])
+        for cyc in stoch_cycles:
+            pct = cyc["pct_change"]
+            color = '#00E676' if pct >= 0 else '#FF1744'
+            sign = '+' if pct >= 0 else ''
+            fig.add_annotation(
+                x=cyc["sell_date"],
+                y=stoch_k.loc[cyc["sell_date"]] if cyc["sell_date"] in stoch_k.index else 50,
+                text=f"{sign}{pct:.1f}%",
+                showarrow=False,
+                yshift=-25,
+                font=dict(color=color, size=10),
+                row=3, col=1,
+            )
+
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
+
+        # ============================================================
         # Row 4: Volume
-        if 'Volume' in self.stock_data.columns:
-            # Color bars by up/down day
-            colors_vol = [
-                '#4CAF50' if self.stock_data['Close'].iloc[i] >= self.stock_data['Open'].iloc[i]
-                else '#EF5350'
-                for i in range(len(self.stock_data))
-            ]
-            fig.add_trace(
-                go.Bar(
-                    x=self.stock_data.index,
-                    y=self.stock_data['Volume'],
-                    name='Volume',
-                    marker_color=colors_vol,
-                    opacity=0.6,
-                ),
-                row=4, col=1,
-            )
+        # ============================================================
+        colors_vol = [
+            '#4CAF50' if data['Close'].iloc[i] >= data['Open'].iloc[i]
+            else '#EF5350'
+            for i in range(len(data))
+        ]
+        fig.add_trace(
+            go.Bar(x=data.index, y=data['Volume'],
+                   name='Volume', marker_color=colors_vol, opacity=0.6),
+            row=4, col=1
+        )
 
-            # 20-day average volume line
-            if 'Volume_SMA' not in self.stock_data.columns:
-                self.stock_data['Volume_SMA'] = self.stock_data['Volume'].rolling(20).mean()
-            fig.add_trace(
-                go.Scatter(
-                    x=self.stock_data.index,
-                    y=self.stock_data['Volume_SMA'],
-                    name='Vol Avg (20d)',
-                    line=dict(color='#FFA726', width=1.5),
-                ),
-                row=4, col=1,
-            )
+        vol_avg = data['Volume'].rolling(20).mean()
+        fig.add_trace(
+            go.Scatter(x=data.index, y=vol_avg,
+                      name='Vol Avg (20d)',
+                      line=dict(color='#FFA726', width=1.5)),
+            row=4, col=1
+        )
 
-            fig.update_yaxes(title_text="Volume", row=4, col=1)
-        
-        # Overbought/Oversold lines
-        fig.add_hline(y=80, line_dash="dash", line_color="#FF6B6B", row=3, col=1, 
-                      annotation_text="Overbought", annotation_position="right")
-        fig.add_hline(y=20, line_dash="dash", line_color="#51CF66", row=3, col=1,
-                      annotation_text="Oversold", annotation_position="right")
-        
-        # Update layout
+        # ============================================================
+        # Layout and axis labels
+        # ============================================================
         fig.update_layout(
-            height=800,
+            height=1000,
             title_text=f"{self.ticker.upper()} Technical Analysis Dashboard",
             showlegend=True,
             hovermode='x unified',
-            template='plotly_dark'
+            template='plotly_dark',
         )
-        
-        fig.update_xaxes(title_text="Date", row=4, col=1)
+
+        # Pin x-axis to the sliced window so the plot fills the full width
+        fig.update_xaxes(
+            range=[data.index[0], data.index[-1]],
+            showticklabels=True,
+            tickformat="%b %d\n%Y",
+            row=1, col=1,
+        )
+        fig.update_xaxes(
+            title_text="Date",
+            showticklabels=True,
+            range=[data.index[0], data.index[-1]],
+            row=4, col=1,
+        )
         fig.update_yaxes(title_text="Price ($)", row=1, col=1)
         fig.update_yaxes(title_text="MACD", row=2, col=1)
-        fig.update_yaxes(title_text="Stochastic", row=3, col=1, range=[0, 100])        
-        
+        fig.update_yaxes(title_text="Stochastic", row=3, col=1)
+        fig.update_yaxes(title_text="Volume", row=4, col=1)
+
         return fig
 
     def get_verdict(self):
@@ -807,6 +1196,94 @@ class TechnicalIndicatorAnalyzer:
         print("\n" + "="*70)
         print(f"💡 RECOMMENDATION: {sig['recommendation']} (Confidence: {sig['confidence']:.0f}%)")
         print("="*70 + "\n")
+
+    def compute_signal_cycles(self, lookback_days=None):
+        """
+        Compute historical BUY→SELL and SELL→BUY cycles for MACD and Stochastic.
+
+        Returns a dict:
+        {
+            'macd': [ {'buy_date':..., 'sell_date':..., 'buy_price':..., 'sell_price':...,
+                       'pct_change':..., 'direction':'up'}, ... ],
+            'stoch': [ ... same shape ... ],
+        }
+        """
+        if self.stock_data is None or self.stock_data.empty:
+            return {"macd": [], "stoch": []}
+
+        full = self.stock_data
+        if lookback_days is not None:
+            cutoff = full.index[-1] - pd.Timedelta(days=lookback_days)
+            data = full[full.index >= cutoff].copy()
+        else:
+            data = full.copy()
+
+        if data.empty:
+            return {"macd": [], "stoch": []}
+
+        close = data["Close"]
+
+        # --- MACD signals ---
+        macd = data["MACD"]
+        signal = data["Signal_Line"]
+        macd_buy = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+        macd_sell = (macd < signal) & (macd.shift(1) >= signal.shift(1))
+
+        # --- Stochastic signals ---
+        stoch_k = data["%K"]
+        stoch_d = data["%D"]
+        stoch_buy = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1)) & (stoch_k < 30)
+        stoch_sell = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1)) & (stoch_k > 70)
+
+        def _cycles(buy_mask, sell_mask):
+            """Pair up BUY and SELL signals in chronological order."""
+            buy_dates = list(data.index[buy_mask])
+            sell_dates = list(data.index[sell_mask])
+
+            # Merge into chronological order and pair alternating signals
+            events = [(d, "BUY") for d in buy_dates] + [(d, "SELL") for d in sell_dates]
+            events.sort(key=lambda x: x[0])
+
+            cycles = []
+            open_trade = None
+            for date, kind in events:
+                price = float(close.loc[date])
+                if open_trade is None:
+                    open_trade = {"date": date, "kind": kind, "price": price}
+                elif open_trade["kind"] != kind:
+                    # Opposite signal — close the trade
+                    buy_entry = open_trade if open_trade["kind"] == "BUY" else {"date": date, "price": price}
+                    sell_entry = open_trade if open_trade["kind"] == "SELL" else {"date": date, "price": price}
+
+                    if open_trade["kind"] == "BUY":
+                        pct = (price - open_trade["price"]) / open_trade["price"] * 100
+                        cycles.append({
+                            "buy_date": open_trade["date"],
+                            "sell_date": date,
+                            "buy_price": open_trade["price"],
+                            "sell_price": price,
+                            "pct_change": pct,
+                            "direction": "up" if pct >= 0 else "down",
+                        })
+                    else:
+                        pct = (open_trade["price"] - price) / open_trade["price"] * 100
+                        cycles.append({
+                            "buy_date": date,
+                            "sell_date": open_trade["date"],
+                            "buy_price": price,
+                            "sell_price": open_trade["price"],
+                            "pct_change": pct,
+                            "direction": "up" if pct >= 0 else "down",
+                        })
+                    open_trade = {"date": date, "kind": kind, "price": price}
+                # Same kind repeated — ignore (already in position)
+
+            return cycles
+
+        return {
+            "macd": _cycles(macd_buy, macd_sell),
+            "stoch": _cycles(stoch_buy, stoch_sell),
+        }
 
 # Standalone function for quick analysis
 def quick_technical_analysis(ticker, period='1y'):

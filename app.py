@@ -1291,7 +1291,7 @@ def render_technical_analysis():
     
     if tech_analyze or tech_ticker:
         with st.spinner(f"Analyzing {tech_ticker} technical indicators..."):
-            analyzer = TechnicalIndicatorAnalyzer(tech_ticker, tech_period)
+            analyzer = TechnicalIndicatorAnalyzer(tech_ticker, '10y')
             
             if not analyzer.fetch_data():
                 st.error(f"Could not fetch data for {tech_ticker}. Please check the ticker symbol.")
@@ -1715,11 +1715,102 @@ def render_technical_analysis():
             
             # --- Display Chart ---
             st.markdown("### Technical Charts")
-            fig = analyzer.create_interactive_chart()
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("Could not generate charts")
+
+            # --- Chart window selector ---
+            st.markdown("**Chart window**")
+            period_labels = {
+                "1M": 30,
+                "2M": 60,
+                "3M": 90,
+                "6M": 180,
+                "1Y": 365,
+                "2Y": 730,
+                "3Y": 1095,
+                "5Y": 1825,
+                "10Y": 3650,
+                "MAX": None,
+            }
+            selected_period = st.radio(
+                "Chart period:",
+                options=list(period_labels.keys()),
+                index=5,
+                horizontal=True,
+                key="chart_period",
+                label_visibility="collapsed",
+            )
+            lookback_days = period_labels[selected_period]
+
+            # --- Price overlay selector ---
+            st.markdown("**Overlays**")
+            cb1, cb2, cb3, cb4 = st.columns(4)
+            with cb1:
+                show_sma20 = st.checkbox("SMA 20", value=False, key="cb_sma20")
+            with cb2:
+                show_sma50 = st.checkbox("SMA 50", value=False, key="cb_sma50")
+            with cb3:
+                show_sma200 = st.checkbox("SMA 200", value=False, key="cb_sma200")
+            with cb4:
+                show_bb = st.checkbox("Bollinger Bands", value=False, key="cb_bb")
+
+            try:
+                fig = analyzer.create_interactive_chart(
+                    show_sma20=show_sma20,
+                    show_sma50=show_sma50,
+                    show_sma200=show_sma200,
+                    show_bb=show_bb,
+                    lookback_days=lookback_days
+                )
+                
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # --- Historical signal performance ---
+                    st.markdown("#### 📊 Signal Performance (Historical)")
+
+                    cycles = analyzer.compute_signal_cycles(lookback_days=lookback_days)
+
+                    for label, key in [("MACD (8, 17, 9)", "macd"),
+                                    ("Stochastic Oscillator", "stoch")]:
+                        st.markdown(f"**{label}**")
+                        c_list = cycles.get(key, [])
+
+                        if not c_list:
+                            st.caption("No completed BUY→SELL cycles in this window.")
+                            continue
+
+                        rows = []
+                        for c in c_list:
+                            rows.append({
+                                "Buy Date": c["buy_date"].strftime("%Y-%m-%d"),
+                                "Buy Price": f"${c['buy_price']:.2f}",
+                                "Sell Date": c["sell_date"].strftime("%Y-%m-%d"),
+                                "Sell Price": f"${c['sell_price']:.2f}",
+                                "% Move": f"{c['pct_change']:+.2f}%",
+                            })
+                        df = pd.DataFrame(rows)
+
+                        # Summary stats
+                        pcts = [c["pct_change"] for c in c_list]
+                        wins = sum(1 for p in pcts if p > 0)
+                        losses = sum(1 for p in pcts if p < 0)
+                        avg_win = sum(p for p in pcts if p > 0) / wins if wins else 0
+                        avg_loss = sum(p for p in pcts if p < 0) / losses if losses else 0
+                        hit_rate = wins / len(pcts) * 100 if pcts else 0
+
+                        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+                        sc1.metric("Trades", len(pcts))
+                        sc2.metric("Hit Rate", f"{hit_rate:.0f}%")
+                        sc3.metric("Avg Win", f"{avg_win:+.2f}%")
+                        sc4.metric("Avg Loss", f"{avg_loss:+.2f}%")
+                        sc5.metric("Cumulative", f"{sum(pcts):+.2f}%")
+
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Chart method returned None")
+            except Exception as e:
+                    st.error(f"Chart error: {type(e).__name__}: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
             
             # --- Display detailed signals (expandable) ---
             with st.expander("📋 Detailed Signal Breakdown"):
@@ -1739,6 +1830,21 @@ def render_technical_analysis():
                     st.markdown("**Neutral / Wait Signals**")
                     for signal in signals['neutral_signals']:
                         st.warning(f"⏳ {signal}")
+                # --- Volume Details (separate section) ---
+                volume_details = signals.get('volume_details', [])
+                if volume_details:
+                    st.markdown("---")
+                    st.markdown("**📊 Volume Analysis**")
+                    for detail in volume_details:
+                        dtype = detail.get('type', 'neutral')
+                        text = detail.get('text', '')
+                        if dtype == 'positive':
+                            st.success(f"✅ {text}")
+                        elif dtype == 'caution':
+                            st.warning(f"⚠️ {text}")
+                        else:
+                            st.info(f"ℹ️ {text}")
+    
             
             # --- Download Data ---
             with st.expander("📥 Download Data"):
@@ -1750,294 +1856,284 @@ def render_technical_analysis():
                     mime="text/csv"
                 )
 
-            # --- TQQQ/SQQQ Strategy Signals (bottom of page) ---
-            st.markdown("---")
-            st.markdown("### 🤖 TQQQ/SQQQ Multi-Strategy Signals")
-            st.caption(
-                "Seven independent sub-strategies vote daily on target allocation. "
-                "Each strategy is a separate module — add, remove, or tune them independently."
-            )
+def render_tqqq_sqqq_signals():
+    """TQQQ/SQQQ Multi-Strategy Signals tab — daily trading decisions"""
+    st.header("🤖 TQQQ/SQQQ Multi-Strategy Signals")
+    st.caption(
+        "Seven independent sub-strategies vote daily on target allocation. "
+        "Each strategy is a separate module — add, remove, or tune them independently."
+    )
 
-            # Manual refresh button — forces a fresh yfinance fetch
-            refresh_col1, refresh_col2 = st.columns([1, 4])
-            with refresh_col1:
-                if st.button("🔄 Refresh Signals", key="refresh_tqqq", use_container_width=True):
-                    st.cache_data.clear()
-                    st.rerun()
-            with refresh_col2:
-                st.caption(
-                    "Click Refresh to force a fresh fetch at 3:50 PM ET. "
-                    "Otherwise cached data (1-hour TTL) is reused."
-                )
+    # Manual refresh button — forces a fresh yfinance fetch
+    refresh_col1, refresh_col2 = st.columns([1, 4])
+    with refresh_col1:
+        if st.button("🔄 Refresh Signals", key="refresh_tqqq", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+    with refresh_col2:
+        st.caption(
+            "Click Refresh to force a fresh fetch at 3:50 PM ET. "
+            "Otherwise cached data (1-hour TTL) is reused."
+        )
 
-            try:
-                from tqqq_sqqq_strategies import run_all_strategies
+    try:
+        from tqqq_sqqq_strategies import run_all_strategies
 
-                with st.spinner("Running TQQQ/SQQQ strategies..."):
-                    tqqq_signals = run_all_strategies()
+        with st.spinner("Running TQQQ/SQQQ strategies..."):
+            tqqq_signals = run_all_strategies()
 
-                if "error" in tqqq_signals:
-                    st.warning(f"Strategy analysis unavailable: {tqqq_signals['error']}")
-                else:
-                    # Signal card + allocation
-                    col1, col2 = st.columns([1, 2])
+        if "error" in tqqq_signals:
+            st.warning(f"Strategy analysis unavailable: {tqqq_signals['error']}")
+            return
 
-                    with col1:
-                        signal = tqqq_signals["signal"]
-                        regime = tqqq_signals["regime"]
-                        confidence = tqqq_signals["confidence"]
+        # Signal card + allocation
+        col1, col2 = st.columns([1, 2])
 
-                        if "TQQQ" in signal and "HEAVY" in signal:
-                            color, bg = "#4CAF50", "#1e4620"
-                        elif "TQQQ" in signal:
-                            color, bg = "#8BC34A", "#2a3d1e"
-                        elif "SQQQ" in signal and "HEAVY" in signal:
-                            color, bg = "#EF5350", "#4b1e1e"
-                        elif "SQQQ" in signal:
-                            color, bg = "#FF7043", "#3d241e"
-                        else:
-                            color, bg = "#FFA726", "#4a3a1e"
+        with col1:
+            signal = tqqq_signals["signal"]
+            regime = tqqq_signals["regime"]
+            confidence = tqqq_signals["confidence"]
 
-                        st.markdown(f"""
-                        <div style="background-color:{bg}; border:2px solid {color};
-                                    border-radius:10px; padding:1.25rem; text-align:center;">
-                            <div style="font-size:1.5rem; font-weight:700; color:{color};">
-                                {signal}
-                            </div>
-                            <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.4rem;">
-                                Regime: <strong>{regime}</strong>
-                            </div>
-                            <div style="color:#9aa0a6; font-size:0.75rem;">
-                                Confidence: {confidence:.0f}%
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with col2:
-                        alloc_col1, alloc_col2 = st.columns(2)
-                        alloc_col1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
-                        alloc_col2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
-                        st.caption(
-                            f"Position multiplier: {tqqq_signals['position_multiplier']:.1f}× "
-                            f"(adjusts size based on trend strength)"
-                        )
-
-                    # Per-strategy vote breakdown
-                    with st.expander("📋 Sub-Strategy Votes"):
-                        vote_df = pd.DataFrame(tqqq_signals["vote_details"])
-                        vote_df.columns = ["Strategy", "Target TQQQ %", "Reason"]
-                        vote_df["Target TQQQ %"] = vote_df["Target TQQQ %"].round(1)
-                        st.dataframe(vote_df, use_container_width=True, hide_index=True)
-
-                        st.markdown("---")
-                        st.markdown(
-                            f"**Aggregated target**: "
-                            f"{tqqq_signals['target_tqqq_pct']:.1f}% TQQQ / "
-                            f"{tqqq_signals['target_sqqq_pct']:.1f}% SQQQ"
-                        )
-                        st.caption(
-                            "Each strategy votes independently; the average becomes the daily target. "
-                            "Position size is adjusted by BB width (trend strength)."
-                        )
-
-            except ImportError:
-                st.info("TQQQ/SQQQ strategies module not installed. "
-                        "Create `tqqq_sqqq_strategies.py` to enable this feature.")
-            except Exception as e:
-                st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")
-            # ============================================================
-            # CAPITAL INPUT + TARGET SHARE CALCULATOR
-            # ============================================================
-            st.markdown("#### 🎯 Position Calculator")
-            st.caption(
-                "Enter your capital and current holdings. "
-                "The calculator tells you exactly how many fractional shares to buy or sell."
-            )
-
-            # Persist capital across reruns
-            if "tqqq_capital" not in st.session_state:
-                st.session_state["tqqq_capital"] = 2470.0
-
-            colA, colB = st.columns([1, 1])
-            with colA:
-                account_value = st.number_input(
-                    "Account value ($)",
-                    min_value=100.0,
-                    max_value=1_000_000.0,
-                    value=float(st.session_state["tqqq_capital"]),
-                    step=10.0,
-                    key="tqqq_capital_input",
-                )
-                st.session_state["tqqq_capital"] = account_value
-
-            with colB:
-                # Fetch live prices for TQQQ and SQQQ
-                try:
-                    tqqq_price = yf.Ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
-                    sqqq_price = yf.Ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
-                    st.metric("TQQQ Price", f"${tqqq_price:.2f}")
-                    st.metric("SQQQ Price", f"${sqqq_price:.2f}")
-                except Exception as e:
-                    st.error(f"Could not fetch prices: {e}")
-                    tqqq_price = 0.0
-                    sqqq_price = 0.0
-
-            if tqqq_price > 0 and sqqq_price > 0:
-                # Compute target allocation
-                targets = compute_target_shares(
-                    account_value=account_value,
-                    tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
-                    tqqq_price=tqqq_price,
-                    sqqq_price=sqqq_price,
-                )
-
-                st.markdown("**Target Positions**")
-                tc1, tc2 = st.columns(2)
-                with tc1:
-                    st.metric(
-                        "TQQQ target",
-                        f"{targets['tqqq_target_shares']:.4f} shares",
-                        delta=f"${targets['tqqq_target_value']:.2f}",
-                    )
-                with tc2:
-                    st.metric(
-                        "SQQQ target",
-                        f"{targets['sqqq_target_shares']:.4f} shares",
-                        delta=f"${targets['sqqq_target_value']:.2f}",
-                    )
-
-                # ============================================================
-                # CURRENT HOLDINGS INPUT + REBALANCE CALCULATOR
-                # ============================================================
-                st.markdown("**Your Current Holdings**")
-                hc1, hc2 = st.columns(2)
-                with hc1:
-                    current_tqqq = st.number_input(
-                        "Current TQQQ shares", min_value=0.0,
-                        value=0.0, step=1.0, key="cur_tqqq",
-                    )
-                with hc2:
-                    current_sqqq = st.number_input(
-                        "Current SQQQ shares", min_value=0.0,
-                        value=62.0, step=1.0, key="cur_sqqq",
-                    )
-
-                rebalance = compute_rebalance(
-                    current_tqqq_shares=current_tqqq,
-                    current_sqqq_shares=current_sqqq,
-                    tqqq_target_shares=targets["tqqq_target_shares"],
-                    sqqq_target_shares=targets["sqqq_target_shares"],
-                    tqqq_price=tqqq_price,
-                    sqqq_price=sqqq_price,
-                )
-
-                st.markdown("**Actions to Take Now**")
-                ac1, ac2 = st.columns(2)
-
-                with ac1:
-                    delta = rebalance["tqqq_delta_shares"]
-                    if abs(delta) < 0.01:
-                        st.info("TQQQ: no action needed")
-                    elif delta > 0:
-                        st.success(f"TQQQ: **BUY {delta:.4f} shares** "
-                                   f"(~${rebalance['tqqq_delta_value']:.2f})")
-                    else:
-                        st.warning(f"TQQQ: **SELL {abs(delta):.4f} shares** "
-                                   f"(~${abs(rebalance['tqqq_delta_value']):.2f})")
-
-                with ac2:
-                    delta = rebalance["sqqq_delta_shares"]
-                    if abs(delta) < 0.01:
-                        st.info("SQQQ: no action needed")
-                    elif delta > 0:
-                        st.success(f"SQQQ: **BUY {delta:.4f} shares** "
-                                   f"(~${rebalance['sqqq_delta_value']:.2f})")
-                    else:
-                        st.warning(f"SQQQ: **SELL {abs(delta):.4f} shares** "
-                                   f"(~${abs(rebalance['sqqq_delta_value']):.2f})")
-
-                # ============================================================
-                # LOG TRADE BUTTONS
-                # ============================================================
-                st.markdown("**Log These Trades**")
-                lc1, lc2 = st.columns(2)
-
-                with lc1:
-                    if st.button("✅ Log TQQQ trade", key="log_tqqq"):
-                        delta = rebalance["tqqq_delta_shares"]
-                        if abs(delta) >= 0.01:
-                            action = "BUY" if delta > 0 else "SELL"
-                            log_trade(
-                                ticker="TQQQ",
-                                action=action,
-                                shares=abs(delta),
-                                price=tqqq_price,
-                                signal=tqqq_signals["signal"],
-                                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
-                                account_value=account_value,
-                            )
-                            st.success(f"Logged {action} {abs(delta):.4f} TQQQ @ ${tqqq_price:.2f}")
-
-                with lc2:
-                    if st.button("✅ Log SQQQ trade", key="log_sqqq"):
-                        delta = rebalance["sqqq_delta_shares"]
-                        if abs(delta) >= 0.01:
-                            action = "BUY" if delta > 0 else "SELL"
-                            log_trade(
-                                ticker="SQQQ",
-                                action=action,
-                                shares=abs(delta),
-                                price=sqqq_price,
-                                signal=tqqq_signals["signal"],
-                                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
-                                account_value=account_value,
-                            )
-                            st.success(f"Logged {action} {abs(delta):.4f} SQQQ @ ${sqqq_price:.2f}")
-            # ============================================================
-            # TRADE HISTORY
-            # ============================================================
-            st.markdown("#### 📒 Trade History")
-
-            trades_df = load_trades()
-
-            if trades_df.empty:
-                st.info("No trades logged yet. Use the Log buttons above to record your fills.")
+            if "TQQQ" in signal and "HEAVY" in signal:
+                color, bg = "#4CAF50", "#1e4620"
+            elif "TQQQ" in signal:
+                color, bg = "#8BC34A", "#2a3d1e"
+            elif "SQQQ" in signal and "HEAVY" in signal:
+                color, bg = "#EF5350", "#4b1e1e"
+            elif "SQQQ" in signal:
+                color, bg = "#FF7043", "#3d241e"
             else:
-                # Summary stats
-                total_trades = len(trades_df)
-                buy_count = (trades_df["action"] == "BUY").sum()
-                sell_count = (trades_df["action"] == "SELL").sum()
-                total_volume = trades_df["total_value"].sum()
+                color, bg = "#FFA726", "#4a3a1e"
 
-                sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("Total trades", total_trades)
-                sc2.metric("Buys", int(buy_count))
-                sc3.metric("Sells", int(sell_count))
-                sc4.metric("Total volume", f"${total_volume:,.2f}")
+            st.markdown(f"""
+            <div style="background-color:{bg}; border:2px solid {color};
+                        border-radius:10px; padding:1.25rem; text-align:center;">
+                <div style="font-size:1.5rem; font-weight:700; color:{color};">
+                    {signal}
+                </div>
+                <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.4rem;">
+                    Regime: <strong>{regime}</strong>
+                </div>
+                <div style="color:#9aa0a6; font-size:0.75rem;">
+                    Confidence: {confidence:.0f}%
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-                # Full log
-                st.dataframe(
-                    trades_df.sort_values("timestamp", ascending=False),
-                    use_container_width=True,
-                    hide_index=True,
+        with col2:
+            alloc_col1, alloc_col2 = st.columns(2)
+            alloc_col1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
+            alloc_col2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
+            st.caption(
+                f"Position multiplier: {tqqq_signals['position_multiplier']:.1f}× "
+                f"(adjusts size based on trend strength)"
+            )
+
+        # Per-strategy vote breakdown
+        with st.expander("📋 Sub-Strategy Votes"):
+            vote_df = pd.DataFrame(tqqq_signals["vote_details"])
+            vote_df.columns = ["Strategy", "Target TQQQ %", "Reason"]
+            vote_df["Target TQQQ %"] = vote_df["Target TQQQ %"].round(1)
+            st.dataframe(vote_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.markdown(
+                f"**Aggregated target**: "
+                f"{tqqq_signals['target_tqqq_pct']:.1f}% TQQQ / "
+                f"{tqqq_signals['target_sqqq_pct']:.1f}% SQQQ"
+            )
+            st.caption(
+                "Each strategy votes independently; the average becomes the daily target. "
+                "Position size is adjusted by BB width (trend strength)."
+            )
+
+        # ============================================================
+        # POSITION CALCULATOR
+        # ============================================================
+        st.markdown("---")
+        st.markdown("#### 🎯 Position Calculator")
+        st.caption(
+            "Enter your capital and current holdings. "
+            "The calculator tells you exactly how many fractional shares to buy or sell."
+        )
+
+        if "tqqq_capital" not in st.session_state:
+            st.session_state["tqqq_capital"] = 2470.0
+
+        colA, colB = st.columns([1, 1])
+        with colA:
+            account_value = st.number_input(
+                "Account value ($)",
+                min_value=100.0,
+                max_value=1_000_000.0,
+                value=float(st.session_state["tqqq_capital"]),
+                step=10.0,
+                key="tqqq_capital_input",
+            )
+            st.session_state["tqqq_capital"] = account_value
+
+        with colB:
+            try:
+                tqqq_price = yf.Ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
+                sqqq_price = yf.Ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
+                st.metric("TQQQ Price", f"${tqqq_price:.2f}")
+                st.metric("SQQQ Price", f"${sqqq_price:.2f}")
+            except Exception as e:
+                st.error(f"Could not fetch prices: {e}")
+                tqqq_price = 0.0
+                sqqq_price = 0.0
+
+        if tqqq_price > 0 and sqqq_price > 0:
+            targets = compute_target_shares(
+                account_value=account_value,
+                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                tqqq_price=tqqq_price,
+                sqqq_price=sqqq_price,
+            )
+
+            st.markdown("**Target Positions**")
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                st.metric(
+                    "TQQQ target",
+                    f"{targets['tqqq_target_shares']:.4f} shares",
+                    delta=f"${targets['tqqq_target_value']:.2f}",
+                )
+            with tc2:
+                st.metric(
+                    "SQQQ target",
+                    f"{targets['sqqq_target_shares']:.4f} shares",
+                    delta=f"${targets['sqqq_target_value']:.2f}",
                 )
 
-                # Download + clear
-                dlc1, dlc2 = st.columns([1, 4])
-                with dlc1:
-                    csv_bytes = trades_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "📥 Download trade log",
-                        data=csv_bytes,
-                        file_name=f"trades_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                    )
-                with dlc2:
-                    if st.button("🗑️ Clear trade log", key="clear_trades"):
-                        clear_trades()
-                        st.rerun()
+            st.markdown("**Your Current Holdings**")
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                current_tqqq = st.number_input(
+                    "Current TQQQ shares", min_value=0.0,
+                    value=0.0, step=1.0, key="cur_tqqq",
+                )
+            with hc2:
+                current_sqqq = st.number_input(
+                    "Current SQQQ shares", min_value=0.0,
+                    value=62.0, step=1.0, key="cur_sqqq",
+                )
 
-tab_analyzer, tab_screener, tab_technical = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener", "📈 Technical Analysis"])
+            rebalance = compute_rebalance(
+                current_tqqq_shares=current_tqqq,
+                current_sqqq_shares=current_sqqq,
+                tqqq_target_shares=targets["tqqq_target_shares"],
+                sqqq_target_shares=targets["sqqq_target_shares"],
+                tqqq_price=tqqq_price,
+                sqqq_price=sqqq_price,
+            )
+
+            st.markdown("**Actions to Take Now**")
+            ac1, ac2 = st.columns(2)
+
+            with ac1:
+                delta = rebalance["tqqq_delta_shares"]
+                if abs(delta) < 0.01:
+                    st.info("TQQQ: no action needed")
+                elif delta > 0:
+                    st.success(f"TQQQ: **BUY {delta:.4f} shares** "
+                               f"(~${rebalance['tqqq_delta_value']:.2f})")
+                else:
+                    st.warning(f"TQQQ: **SELL {abs(delta):.4f} shares** "
+                               f"(~${abs(rebalance['tqqq_delta_value']):.2f})")
+
+            with ac2:
+                delta = rebalance["sqqq_delta_shares"]
+                if abs(delta) < 0.01:
+                    st.info("SQQQ: no action needed")
+                elif delta > 0:
+                    st.success(f"SQQQ: **BUY {delta:.4f} shares** "
+                               f"(~${rebalance['sqqq_delta_value']:.2f})")
+                else:
+                    st.warning(f"SQQQ: **SELL {abs(delta):.4f} shares** "
+                               f"(~${abs(rebalance['sqqq_delta_value']):.2f})")
+
+            # Log trade buttons
+            st.markdown("**Log These Trades**")
+            lc1, lc2 = st.columns(2)
+
+            with lc1:
+                if st.button("✅ Log TQQQ trade", key="log_tqqq"):
+                    delta = rebalance["tqqq_delta_shares"]
+                    if abs(delta) >= 0.01:
+                        action = "BUY" if delta > 0 else "SELL"
+                        log_trade(
+                            ticker="TQQQ", action=action,
+                            shares=abs(delta), price=tqqq_price,
+                            signal=tqqq_signals["signal"],
+                            tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                            account_value=account_value,
+                        )
+                        st.success(f"Logged {action} {abs(delta):.4f} TQQQ @ ${tqqq_price:.2f}")
+
+            with lc2:
+                if st.button("✅ Log SQQQ trade", key="log_sqqq"):
+                    delta = rebalance["sqqq_delta_shares"]
+                    if abs(delta) >= 0.01:
+                        action = "BUY" if delta > 0 else "SELL"
+                        log_trade(
+                            ticker="SQQQ", action=action,
+                            shares=abs(delta), price=sqqq_price,
+                            signal=tqqq_signals["signal"],
+                            tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                            account_value=account_value,
+                        )
+                        st.success(f"Logged {action} {abs(delta):.4f} SQQQ @ ${sqqq_price:.2f}")
+
+        # ============================================================
+        # TRADE HISTORY
+        # ============================================================
+        st.markdown("---")
+        st.markdown("#### 📒 Trade History")
+
+        trades_df = load_trades()
+
+        if trades_df.empty:
+            st.info("No trades logged yet. Use the Log buttons above to record your fills.")
+        else:
+            total_trades = len(trades_df)
+            buy_count = (trades_df["action"] == "BUY").sum()
+            sell_count = (trades_df["action"] == "SELL").sum()
+            total_volume = trades_df["total_value"].sum()
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Total trades", total_trades)
+            sc2.metric("Buys", int(buy_count))
+            sc3.metric("Sells", int(sell_count))
+            sc4.metric("Total volume", f"${total_volume:,.2f}")
+
+            st.dataframe(
+                trades_df.sort_values("timestamp", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            dlc1, dlc2 = st.columns([1, 4])
+            with dlc1:
+                csv_bytes = trades_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download trade log",
+                    data=csv_bytes,
+                    file_name=f"trades_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
+            with dlc2:
+                if st.button("🗑️ Clear trade log", key="clear_trades"):
+                    clear_trades()
+                    st.rerun()
+
+    except ImportError:
+        st.info("TQQQ/SQQQ strategies module not installed. "
+                "Create `tqqq_sqqq_strategies.py` to enable this feature.")
+    except Exception as e:
+        st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")           
+
+tab_analyzer, tab_screener, tab_technical, tab_tqqq  = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener", "📈 Technical Analysis","🤖 TQQQ/SQQQ Signals",])
 
 with tab_screener:
     render_stock_screener()
@@ -2047,3 +2143,6 @@ with tab_analyzer:
 
 with tab_technical:
     render_technical_analysis()
+
+with tab_tqqq:
+    render_tqqq_sqqq_signals()
