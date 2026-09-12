@@ -13,14 +13,14 @@ from trade_manager import (
     compute_target_shares,
     compute_rebalance,
     log_trade,
-    load_trades,
-    clear_trades,
+    load_trades,    
 )
 warnings.filterwarnings('ignore')
 # Import the technical indicator analyzer
 from technical_indicators import TechnicalIndicatorAnalyzer
 
-
+#Global constants
+MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
 
 def clear_analyzer_cache():
     """Clear all cached data and reset analyzer state."""
@@ -2028,30 +2028,53 @@ def render_tqqq_sqqq_signals():
                 sqqq_price=sqqq_price,
             )
 
+            #Action Display Block
             st.markdown("**Actions to Take Now**")
             ac1, ac2 = st.columns(2)
 
+            # Minimum percentage shift in allocation to justify a rebalance.
+            # Expressed as a % of account value so it scales with capital.
             with ac1:
                 delta = rebalance["tqqq_delta_shares"]
-                if abs(delta) < 0.01:
-                    st.info("TQQQ: no action needed")
+                delta_value = abs(rebalance["tqqq_delta_value"])
+                delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
+
+                if delta_pct < MIN_TRADE_PCT:
+                    st.info(
+                        f"TQQQ: no action needed "
+                        f"(delta {delta_pct:.2f}% < {MIN_TRADE_PCT:.1f}%)"
+                    )
                 elif delta > 0:
-                    st.success(f"TQQQ: **BUY {delta:.4f} shares** "
-                               f"(~${rebalance['tqqq_delta_value']:.2f})")
+                    st.success(
+                        f"TQQQ: **BUY {delta:.4f} shares** "
+                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    )
                 else:
-                    st.warning(f"TQQQ: **SELL {abs(delta):.4f} shares** "
-                               f"(~${abs(rebalance['tqqq_delta_value']):.2f})")
+                    st.warning(
+                        f"TQQQ: **SELL {abs(delta):.4f} shares** "
+                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    )
 
             with ac2:
                 delta = rebalance["sqqq_delta_shares"]
-                if abs(delta) < 0.01:
-                    st.info("SQQQ: no action needed")
+                delta_value = abs(rebalance["sqqq_delta_value"])
+                delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
+
+                if delta_pct < MIN_TRADE_PCT:
+                    st.info(
+                        f"SQQQ: no action needed "
+                        f"(delta {delta_pct:.2f}% < {MIN_TRADE_PCT:.1f}%)"
+                    )
                 elif delta > 0:
-                    st.success(f"SQQQ: **BUY {delta:.4f} shares** "
-                               f"(~${rebalance['sqqq_delta_value']:.2f})")
+                    st.success(
+                        f"SQQQ: **BUY {delta:.4f} shares** "
+                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    )
                 else:
-                    st.warning(f"SQQQ: **SELL {abs(delta):.4f} shares** "
-                               f"(~${abs(rebalance['sqqq_delta_value']):.2f})")
+                    st.warning(
+                        f"SQQQ: **SELL {abs(delta):.4f} shares** "
+                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    )
 
             # Log trade buttons
             st.markdown("**Log These Trades**")
@@ -2113,19 +2136,13 @@ def render_tqqq_sqqq_signals():
                 hide_index=True,
             )
 
-            dlc1, dlc2 = st.columns([1, 4])
-            with dlc1:
-                csv_bytes = trades_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Download trade log",
-                    data=csv_bytes,
-                    file_name=f"trades_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                )
-            with dlc2:
-                if st.button("🗑️ Clear trade log", key="clear_trades"):
-                    clear_trades()
-                    st.rerun()
+            csv_bytes = trades_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download trade log",
+                data=csv_bytes,
+                file_name=f"trades_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+            )
 
     except ImportError:
         st.info("TQQQ/SQQQ strategies module not installed. "
