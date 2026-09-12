@@ -1291,16 +1291,17 @@ def render_technical_analysis():
     
     if tech_analyze or tech_ticker:
         with st.spinner(f"Analyzing {tech_ticker} technical indicators..."):
-            analyzer = TechnicalIndicatorAnalyzer(tech_ticker, '10y')
-            
+            # Fetch
+            analyzer = TechnicalIndicatorAnalyzer(tech_ticker, 'max')            
+
             if not analyzer.fetch_data():
                 st.error(f"Could not fetch data for {tech_ticker}. Please check the ticker symbol.")
                 return
-            
+
             analyzer.calculate_all_indicators()
             analyzer.get_trading_signals()
             summary = analyzer.get_summary_dict()
-            
+
             # Get verdict data
             verdict_data = analyzer.get_verdict()
 
@@ -1845,7 +1846,92 @@ def render_technical_analysis():
                         else:
                             st.info(f"ℹ️ {text}")
     
-            
+            # ============================================================
+            # MEAN-REVERSION STRATEGY FAMILY (7 sub-strategies)
+            # Independent view — not part of the main verdict
+            # ============================================================
+            st.markdown("### 🔀 Mean-Reversion Strategy Family")
+            st.caption(
+                "Seven trend + mean-reversion rules, weighted independently. "
+                "This is a second opinion, not a replacement for the Verdict above."
+            )
+
+            mr_signal = analyzer.get_mr_signal()
+
+            if "error" in mr_signal:
+                st.warning(mr_signal["error"])
+            else:
+                score = mr_signal["score"]
+                label = mr_signal["label"]
+                regime = mr_signal["regime"]
+                multiplier = mr_signal["multiplier"]
+
+                # Color by label
+                if "STRONG BULLISH" in label:
+                    color, bg = "#00E676", "#1e4620"
+                elif "BULLISH" in label:
+                    color, bg = "#4CAF50", "#1e4620"
+                elif "STRONG BEARISH" in label:
+                    color, bg = "#EF5350", "#4b1e1e"
+                elif "BEARISH" in label:
+                    color, bg = "#FF7043", "#3d241e"
+                else:
+                    color, bg = "#FFA726", "#4a3a1e"
+
+                col1, col2 = st.columns([1, 2])
+
+                with col1:
+                    st.markdown(f"""
+                    <div style="background-color:{bg}; border:2px solid {color};
+                                border-radius:10px; padding:1.25rem; text-align:center;">
+                        <div style="font-size:1.5rem; font-weight:700; color:{color};">
+                            {label}
+                        </div>
+                        <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.4rem;">
+                            Score: <strong>{score:.1f}</strong> / 100
+                        </div>
+                        <div style="color:#9aa0a6; font-size:0.75rem;">
+                            Regime: {regime}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with col2:
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("Raw Score", f"{mr_signal['raw_score']:.1f}")
+                    mc2.metric("BB Multiplier", f"{multiplier:.1f}×")
+                    mc3.metric("Adjusted Score", f"{score:.1f}")
+
+                    st.caption(
+                        f"BB width: {mr_signal['bb_width']*100:.1f}% · "
+                        f"Distance from SMA 50: {mr_signal['dist_sma50']*100:+.1f}% · "
+                        f"RSI: {mr_signal['rsi']:.1f}"
+                    )
+
+                # Per-strategy breakdown
+                with st.expander("📋 Sub-Strategy Votes (7 rules)"):
+                    vote_df = pd.DataFrame(
+                        mr_signal["details"],
+                        columns=["Strategy", "Vote (TQQQ-equivalent %)", "Reason"],
+                    )
+                    st.dataframe(vote_df, use_container_width=True, hide_index=True)
+
+                    st.caption(
+                        "Each rule votes a score from 0 to 100. The average is the raw score. "
+                        "The Bollinger Band width multiplier adjusts for trend strength."
+                    )
+
+                # Disagreement note vs. main verdict
+                main_verdict = verdict_data["verdict"]
+                if ("BULLISH" in label and "SELL" in main_verdict) or \
+                   ("BEARISH" in label and "BUY" in main_verdict):
+                    st.warning(
+                        f"⚠️ **Divergence detected**: the main Verdict says **{main_verdict}** "
+                        f"while this strategy family says **{label}**. "
+                        f"When they disagree, treat the setup as ambiguous — "
+                        f"reduce position size or wait for alignment."
+                    )
+
             # --- Download Data ---
             with st.expander("📥 Download Data"):
                 csv = analyzer.stock_data.to_csv()

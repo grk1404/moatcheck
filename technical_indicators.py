@@ -1146,6 +1146,170 @@ class TechnicalIndicatorAnalyzer:
         
         return analysis_details
     
+    def _compute_mr_votes(self):
+        """
+        Compute votes from a mean-reversion + momentum strategy family.
+        Independent of the general get_trading_signals() verdict.
+
+        Returns:
+            dict with votes list, details, and final score.
+        """
+        if self.stock_data is None or len(self.stock_data) < 200:
+            return {"error": "Not enough data (need 200+ bars)"}
+
+        df = self.stock_data
+        close = df["Close"]
+        price = close.iloc[-1]
+
+        # Shared indicator values
+        sma_20 = df["SMA_20"].iloc[-1]
+        sma_50 = df["SMA_50"].iloc[-1]
+        sma_200 = df["SMA_200"].iloc[-1]
+        bb_upper = df["BB_Upper"].iloc[-1]
+        bb_lower = df["BB_Lower"].iloc[-1]
+        bb_mid = df["BB_Middle"].iloc[-1]
+        rsi = df["RSI"].iloc[-1]
+
+        bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid else 0
+        bb_position = ((price - bb_lower) / (bb_upper - bb_lower)) * 100 if (bb_upper - bb_lower) else 50
+        dist_sma50 = (price - sma_50) / sma_50 if sma_50 else 0
+
+        # Regime
+        if price > sma_50 > sma_200:
+            regime = "BULL"
+        elif price < sma_50 < sma_200:
+            regime = "BEAR"
+        else:
+            regime = "NEUTRAL"
+
+        votes = []
+        details = []
+
+        # --- S1: Momentum Long (trend following) ---
+        if regime == "BULL" and price > sma_50:
+            votes.append(1.0)
+            details.append(("S1 Momentum Long", 100, "Bull regime + price above SMA 50"))
+        elif regime == "BEAR":
+            votes.append(0.0)
+            details.append(("S1 Momentum Long", 0, "Bear regime"))
+        else:
+            votes.append(0.3)
+            details.append(("S1 Momentum Long", 30, "Neutral regime"))
+
+        # --- S2: Mean Reversion (distance from SMA 50) ---
+        if dist_sma50 < -0.08 and regime != "BEAR":
+            votes.append(0.8)
+            details.append(("S2 Mean Reversion", 80, f"Oversold: {dist_sma50*100:.1f}% below SMA 50"))
+        elif dist_sma50 > 0.10:
+            votes.append(0.2)
+            details.append(("S2 Mean Reversion", 20, f"Overextended: {dist_sma50*100:.1f}% above SMA 50"))
+        else:
+            votes.append(0.5)
+            details.append(("S2 Mean Reversion", 50, f"Normal ({dist_sma50*100:.1f}% from SMA 50)"))
+
+        # --- S3: Bollinger Band Reversion ---
+        if bb_position < 15:
+            votes.append(0.9)
+            details.append(("S3 BB Reversion", 90, f"At lower BB ({bb_position:.0f}%)"))
+        elif bb_position > 85:
+            votes.append(0.1)
+            details.append(("S3 BB Reversion", 10, f"At upper BB ({bb_position:.0f}%)"))
+        else:
+            votes.append(0.5)
+            details.append(("S3 BB Reversion", 50, f"Mid-band ({bb_position:.0f}%)"))
+
+        # --- S4: BB Width Momentum Confirmation ---
+        if regime == "BULL" and bb_width > 0.08:
+            votes.append(0.9)
+            details.append(("S4 BB Width", 90, f"Wide BB ({bb_width*100:.1f}%) confirms bull"))
+        elif regime == "BULL":
+            votes.append(0.5)
+            details.append(("S4 BB Width", 50, f"Narrow BB ({bb_width*100:.1f}%)"))
+        else:
+            votes.append(0.2)
+            details.append(("S4 BB Width", 20, "Not in bull regime"))
+
+        # --- S5: Momentum Short (bearish trend following) ---
+        if regime == "BEAR":
+            votes.append(0.0)
+            details.append(("S5 Momentum Short", 0, "Bear regime confirmed"))
+        else:
+            votes.append(0.7)
+            details.append(("S5 Momentum Short", 70, "No bear trend"))
+
+        # --- S6: Short Overbought Fade ---
+        if dist_sma50 > 0.12 and regime != "BULL":
+            votes.append(0.1)
+            details.append(("S6 Short Reversion", 10, f"Overbought fade ({dist_sma50*100:.1f}%)"))
+        else:
+            votes.append(0.6)
+            details.append(("S6 Short Reversion", 60, "No fade signal"))
+
+        # --- S7: Bear Bounce Fade ---
+        if regime == "BEAR" and dist_sma50 < -0.10:
+            votes.append(0.3)
+            details.append(("S7 Bear Bounce Fade", 30, "Bear oversold bounce fade"))
+        else:
+            votes.append(0.5)
+            details.append(("S7 Bear Bounce Fade", 50, "No setup"))
+
+        # Aggregate
+        raw_score = sum(votes) / len(votes)
+
+        # Position multiplier from BB width
+        if regime in ("BULL", "BEAR") and bb_width > 0.10:
+            multiplier = 1.2
+        else:
+            multiplier = 0.8
+
+        adjusted_score = min(1.0, raw_score * multiplier)
+
+        return {
+            "raw_score": raw_score * 100,
+            "adjusted_score": adjusted_score * 100,
+            "regime": regime,
+            "bb_width": bb_width,
+            "bb_position": bb_position,
+            "dist_sma50": dist_sma50,
+            "rsi": rsi,
+            "multiplier": multiplier,
+            "votes": votes,
+            "details": details,
+        }
+
+    def get_mr_signal(self):
+        """
+        Public wrapper — returns a labeled signal for the mean-reversion
+        strategy family. Independent of get_verdict().
+        """
+        result = self._compute_mr_votes()
+        if "error" in result:
+            return result
+
+        score = result["adjusted_score"]
+
+        if score >= 80:
+            label = "STRONG BULLISH"
+            signal_type = "strong_buy"
+        elif score >= 60:
+            label = "BULLISH"
+            signal_type = "buy"
+        elif score >= 40:
+            label = "NEUTRAL"
+            signal_type = "neutral"
+        elif score >= 20:
+            label = "BEARISH"
+            signal_type = "reduce"
+        else:
+            label = "STRONG BEARISH"
+            signal_type = "sell"
+
+        result["label"] = label
+        result["signal_type"] = signal_type
+        result["score"] = score
+        return result
+
+
     def get_summary_dict(self):
         """Get summary in dictionary format for API integration"""
         if not self.indicators:
