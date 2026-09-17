@@ -5,7 +5,7 @@ Supports multiple data providers: yfinance (live) and Nasdaq Data Link (backtest
 """
 
 import os
-import yfinance as yf
+from data_provider import get_ticker
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -50,7 +50,7 @@ class TechnicalIndicatorAnalyzer:
     def fetch_data(self):
         """Fetch stock data from Yahoo Finance"""
         try:
-            stock = yf.Ticker(self.ticker)
+            stock = get_ticker(self.ticker)
             self.stock_data = stock.history(period=self.period)
             if self.stock_data.empty:
                 return False
@@ -1448,6 +1448,138 @@ class TechnicalIndicatorAnalyzer:
             "macd": _cycles(macd_buy, macd_sell),
             "stoch": _cycles(stoch_buy, stoch_sell),
         }
+    # Checks for Takashi Kotegawa (BNF) style mean-reversion setup.
+    def check_bnf_reversal_setup(self):
+        """
+        Checks for Takashi Kotegawa (BNF) style mean-reversion setup.
+        Looks for extreme dislocation below the 25-day MA.
+        """
+        if self.stock_data is None or len(self.stock_data) < 25:
+            return {"setup": False, "reason": "Not enough data"}
+
+        df = self.stock_data
+        current_price = df['Close'].iloc[-1]
+        
+        # 1. Calculate the 25-day MA (the anchor)
+        ma_25 = df['Close'].rolling(window=25).mean().iloc[-1]
+        
+        # 2. Calculate the dislocation (how far below the MA)
+        dislocation_pct = (current_price - ma_25) / ma_25 * 100
+        
+        # 3. Get current RSI and Bollinger Bands (using your existing indicators)
+        rsi = df['RSI'].iloc[-1]
+        bb_lower = df['BB_Lower'].iloc[-1]
+        
+        # 4. Define the BNF thresholds
+        MIN_DISLOCATION = -20.0  # Must be at least 20% below the 25-day MA
+        MAX_DISLOCATION = -35.0  # In extreme panic, he'd look for 35%+
+        RSI_OVERSOLD = 30        # RSI should confirm the oversold condition
+        
+        # 5. Check if the setup is valid
+        is_dislocated = dislocation_pct <= MIN_DISLOCATION
+        is_oversold = rsi < RSI_OVERSOLD
+        is_below_bb = current_price < bb_lower
+        
+        # A high-probability setup would have dislocation + at least one confirmation
+        setup_triggered = is_dislocated and (is_oversold or is_below_bb)
+        
+        return {
+            "setup": setup_triggered,
+            "dislocation_pct": dislocation_pct,
+            "rsi": rsi,
+            "ma_25": ma_25,
+            "current_price": current_price,
+            "reason": f"Dislocation: {dislocation_pct:.1f}% below MA25" if setup_triggered else "No setup"
+        }
+    def _verdict_at_price(self, price: float) -> str:
+        """
+        Recompute indicators with the last Close replaced by `price`,
+        return the resulting trading-signal recommendation.
+
+        WARNING: This mutates self.stock_data (the last bar) and leaves
+        it modified. Callers must restore the original Close afterward.
+        """
+        idx = self.stock_data.index[-1]
+        prev_close = float(self.stock_data["Close"].iloc[-2])
+        o = prev_close
+        h = max(o, price) * 1.001
+        l = min(o, price) * 0.999
+        self.stock_data.loc[idx, "Close"] = price
+        self.stock_data.loc[idx, "Open"] = o
+        self.stock_data.loc[idx, "High"] = h
+        self.stock_data.loc[idx, "Low"] = l
+
+        self.calculate_all_indicators()
+        sig = self.get_trading_signals()
+        return sig.get("recommendation", "NEUTRAL")
+
+
+    def find_entry_price(self) -> dict | None:
+        """
+        Find the highest price at which the current technical verdict
+        becomes BUY (or STRONG BUY). Returns None if data is missing;
+        returns entry_price=None if no tested price yields a BUY.
+        """
+        if self.stock_data is None or self.stock_data.empty:
+            return None
+
+        current_price = float(self.stock_data["Close"].iloc[-1])
+        self.calculate_all_indicators()
+        current_verdict = self.get_trading_signals().get("recommendation", "NEUTRAL")
+
+        # Already BUY — entry is the current price
+        if current_verdict in ("BUY", "STRONG BUY"):
+            return {
+                "current_price": current_price,
+                "current_verdict": current_verdict,
+                "entry_price": current_price,
+                "entry_verdict": current_verdict,
+                "search_range": (current_price, current_price),
+                "iterations": 0,
+            }
+
+        original_close = self.stock_data["Close"].iloc[-1]
+        low = current_price * 0.40
+        high = current_price
+        iterations = 0
+
+        try:
+            # Sanity: is there a BUY at the bottom of the range?
+            verdict_low = self._verdict_at_price(low)
+            if verdict_low not in ("BUY", "STRONG BUY"):
+                return {
+                    "current_price": current_price,
+                    "current_verdict": current_verdict,
+                    "entry_price": None,
+                    "entry_verdict": verdict_low,
+                    "search_range": (low, high),
+                    "iterations": 1,
+                }
+
+            # Binary search: invariant is verdict(low)=BUY, verdict(high)!=BUY
+            for _ in range(30):
+                iterations += 1
+                if high - low < 0.01:
+                    break
+                mid = (low + high) / 2
+                v = self._verdict_at_price(mid)
+                if v in ("BUY", "STRONG BUY"):
+                    low = mid
+                else:
+                    high = mid
+
+            return {
+                "current_price": current_price,
+                "current_verdict": current_verdict,
+                "entry_price": low,
+                "entry_verdict": "BUY",
+                "search_range": (current_price * 0.40, current_price),
+                "iterations": iterations,
+            }
+        finally:
+            # Always restore the original Close, even if an exception fires
+            self.stock_data.loc[self.stock_data.index[-1], "Close"] = original_close
+            self.calculate_all_indicators()
 
 # Standalone function for quick analysis
 def quick_technical_analysis(ticker, period='1y'):
@@ -1473,6 +1605,9 @@ def quick_technical_analysis(ticker, period='1y'):
     else:
         print(f"Error: Could not fetch data for {ticker}")
         return None
+
+
+
 
 # Example usage for testing
 if __name__ == "__main__":

@@ -8,12 +8,75 @@ import time
 
 import pandas as pd
 import streamlit as st
-import yfinance as yf
+from data_provider import get_ticker
 
 from moatcheck import compute_big5, fetch, value_price
 from moatcheck.fetcher import FetchError
-from moatcheck.tickerlist import get_us_stock_universe
+from moatcheck.tickerlist import (
+    get_combined_tickers,
+    get_us_stock_tickers,
+    get_us_stock_universe,
+    get_indian_stock_tickers,
+)
 
+import json
+from pathlib import Path
+
+SCREENER_CACHE = Path("data/screener_results.json")
+SCREENER_TTL = 7 * 24 * 3600  # 7 days
+
+
+def _load_screener_cache() -> dict[str, dict]:
+    if not SCREENER_CACHE.exists():
+        return {}
+    try:
+        return json.loads(SCREENER_CACHE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_screener_cache(cache: dict[str, dict]) -> None:
+    SCREENER_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    SCREENER_CACHE.write_text(json.dumps(cache))
+
+def _row_to_dict(r: ScreenerRow) -> dict:
+    return {
+        "company": r.company, "ticker": r.ticker, "score": r.score,
+        "stock_price": r.stock_price, "value_price": r.value_price,
+        "mos_price": r.mos_price, "verdict": r.verdict,
+        "pe_ratio": r.pe_ratio, "exchange": r.exchange,
+        "sector": r.sector, "industry": r.industry,
+        "market_cap": r.market_cap, "error": r.error,
+    }
+
+
+def _row_from_dict(d: dict) -> ScreenerRow:
+    """Reconstruct a ScreenerRow, coercing numeric fields to float."""
+    def _f(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return ScreenerRow(
+        company=d.get("company", ""),
+        ticker=d.get("ticker", ""),
+        score=_f(d.get("score")),
+        stock_price=_f(d.get("stock_price")),
+        value_price=_f(d.get("value_price")),
+        mos_price=_f(d.get("mos_price")),
+        verdict=d.get("verdict", "Unknown"),
+        pe_ratio=_f(d.get("pe_ratio")),
+        exchange=d.get("exchange"),
+        sector=d.get("sector"),
+        industry=d.get("industry"),
+        market_cap=_f(d.get("market_cap")),
+        error=d.get("error"),
+    )
 
 # ==================== CONFIGURATION ====================
 DEFAULT_MAX_WORKERS = 20
@@ -29,7 +92,7 @@ MARKET_CAP_RANGES = {
     "Mega Cap": (100_000_000_000, float("inf")),
 }
 
-EXCHANGES = ["All Exchanges", "NYSE", "NASDAQ", "AMEX", "BATS", "OTC"]
+EXCHANGES = ["All Exchanges", "NYSE", "NASDAQ", "AMEX", "BATS", "OTC", "NSE", "BSE"]
 
 SECTORS = [
     "All Sectors",
@@ -76,15 +139,31 @@ _VERDICT_COLORS = {
 
 
 # ==================== HELPERS ====================
-def fmt_money(v: float | None) -> str:
+def _currency_symbol(ticker: str) -> str:
+    """Return the currency symbol for a ticker based on its suffix."""
+    t = (ticker or "").upper()
+    if t.endswith(".NS") or t.endswith(".BO"):
+        return "₹"
+    return "$"
+
+
+def fmt_price(v: float | None, ticker: str = "") -> str:
+    """Format a per-share price with the correct currency symbol."""
     if v is None:
         return "n/a"
-    if abs(v) >= 1e9:
-        return f"${v / 1e9:.2f}B"
-    if abs(v) >= 1e6:
-        return f"${v / 1e6:.2f}M"
-    return f"${v:,.2f}"
+    symbol = _currency_symbol(ticker)
+    return f"{symbol}{v:,.2f}"
 
+
+def fmt_money(v: float | None, ticker: str = "") -> str:
+    if v is None:
+        return "n/a"
+    symbol = _currency_symbol(ticker)
+    if abs(v) >= 1e9:
+        return f"{symbol}{v / 1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"{symbol}{v / 1e6:.2f}M"
+    return f"{symbol}{v:,.2f}"
 
 # ==================== LOAD UNIVERSE (NO API KEY) ====================
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -95,74 +174,6 @@ def load_stock_universe() -> list[str]:
         tickers = df["ticker"].tolist()
         st.success(f"✅ Loaded **{len(tickers):,}** stocks")
         return tickers
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def pre_filter_stocks_quick(
-    tickers: list[str],
-    max_stocks: int = 2000,
-    min_mcap: float = 0,
-    max_mcap: float = float("inf"),
-    exchange: str = "All Exchanges",
-    sectors: list[str] = None,
-) -> list[str]:
-    """Quick pre-filter using yFinance info (no full financials)."""
-    st.write("🔄 Pre-filtering stocks (quick check)...")
-
-    if not sectors:
-        sectors = []
-
-    qualified = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    batch_size = 50
-    total = min(len(tickers), max_stocks)
-    tickers_subset = tickers[:total]
-
-    for i in range(0, total, batch_size):
-        batch = tickers_subset[i : i + batch_size]
-        status_text.text(f"Checking: {i+1}-{min(i+batch_size, total)} of {total}")
-
-        for ticker in batch:
-            try:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-
-                # Basic checks
-                price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-                market_cap = info.get("marketCap", 0)
-                pe = info.get("trailingPE", 0)
-                volume = info.get("volume", 0) or info.get("regularMarketVolume", 0)
-                stock_exchange = info.get("exchange", "")
-                stock_sector = info.get("sector", "")
-
-                # Apply filters
-                if price <= 0 or market_cap <= 0 or pe <= 0 or pe >= 50 or volume < 100_000:
-                    continue
-
-                if market_cap < min_mcap or market_cap > max_mcap:
-                    continue
-
-                if exchange != "All Exchanges" and stock_exchange.upper() != exchange.upper():
-                    continue
-
-                if sectors and stock_sector not in sectors:
-                    continue
-
-                qualified.append(ticker)
-
-            except Exception:
-                pass
-
-        progress_bar.progress(min((i + batch_size) / total, 1.0))
-
-    progress_bar.empty()
-    status_text.empty()
-
-    st.write(f"✅ Pre-filter complete: **{len(qualified)}** stocks passed")
-    return qualified
-
 
 # ==================== DEEP ANALYSIS ====================
 def big5_eps_growth(big5) -> float | None:
@@ -179,15 +190,28 @@ def big5_eps_growth(big5) -> float | None:
 
 
 def positive_eps(fin) -> float | None:
+    """Return a plausible per-share EPS, or None if the data looks corrupted."""
     if fin.eps.empty:
         return None
+
     eps_ttm = float(fin.eps.iloc[-1])
     if eps_ttm > 0:
+        if fin.current_price and fin.current_price > 0:
+            # Tightened: a real per-share EPS is never more than 50% of the
+            # stock price (that would be a P/E below 2, essentially impossible).
+            if abs(eps_ttm) / fin.current_price > 0.5:
+                return None
         return eps_ttm
+
     positive_history = fin.eps[fin.eps > 0]
     if positive_history.empty:
         return None
-    return float(positive_history.tail(3).mean())
+
+    candidate = float(positive_history.tail(3).mean())
+    if fin.current_price and fin.current_price > 0:
+        if abs(candidate) / fin.current_price > 0.5:
+            return None
+    return candidate
 
 
 def verdict_price(current: float | None, mos: float | None, value: float | None) -> str:
@@ -203,27 +227,58 @@ def verdict_price(current: float | None, mos: float | None, value: float | None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def deep_analyze_ticker(ticker: str) -> ScreenerRow:
+def deep_analyze_ticker(ticker: str, thresholds_tuple: tuple) -> ScreenerRow:
     """Full MoatCheck analysis on a single ticker."""
+    # Reconstruct thresholds dict from the tuple (Streamlit cache needs hashable args)
+    thresholds = dict(thresholds_tuple) if thresholds_tuple else None
     try:
         # Get the financial data
         fin = fetch(ticker)
-        big5 = compute_big5(fin)
+        # Normalize exchange for display and exchange-based filtering
+        _EXCHANGE_DISPLAY = {
+            "NSI": "NSE", "BSE": "BSE",
+            "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ",
+            "NYQ": "NYSE", "PCX": "NYSE Arca", "ASE": "AMEX",
+        }
+        big5 = compute_big5(fin, thresholds=thresholds)
         score = big5.wonderfulness().overall
 
         # Get valuation
         current_eps = positive_eps(fin)
+         # Sanity guard: EPS must be plausibly per-share.
+        # A per-share EPS cannot exceed the stock price by more than ~2×
+        # (even the richest company has a P/E above 0.5). If it does,
+        # the data source returned a total, not a per-share value.
+        if current_eps is not None and fin.current_price and fin.current_price > 0:
+            eps_to_price = current_eps / fin.current_price
+            if eps_to_price > 0.5 or eps_to_price < -0.5:
+                current_eps = None
+
+         # --- Sanity guard: P/E must be plausible ---
+        historical_pe = fin.pe_ratio_ttm
+        if historical_pe is not None and (historical_pe <= 0 or historical_pe > 200):
+            historical_pe = None
+            
         big5_eps_g = big5_eps_growth(big5)
 
         val = value_price(
             current_eps=current_eps,
             big5_eps_growth=big5_eps_g,
             analyst_growth=fin.analyst_5yr_growth,
-            historical_pe=fin.pe_ratio_ttm,
+            historical_pe=historical_pe,
         )
 
         value_price_val = val.value_price if val else None
         mos_price_val = val.mos_price if val else None
+        verdict = verdict_price(fin.current_price, mos_price_val, value_price_val)
+
+        # Sanity guard: an intrinsic value more than 5× the market price is
+        # almost always bad input data, not a real opportunity.
+        if value_price_val is not None and fin.current_price and fin.current_price > 0:
+            if value_price_val / fin.current_price > 5.0:
+                value_price_val = None
+                mos_price_val = None
+
         verdict = verdict_price(fin.current_price, mos_price_val, value_price_val)
 
         # Always fetch additional info from yfinance as fallback
@@ -237,13 +292,17 @@ def deep_analyze_ticker(ticker: str) -> ScreenerRow:
 
         # Get fresh info from yfinance for sector/industry
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             info = stock.info
             sector = info.get("sector")
             industry = info.get("industry")
             
-            if not exchange:
-                exchange = info.get("exchange", "US")
+            if ticker.upper().endswith(".NS"):
+                exchange = "NSE"
+            elif ticker.upper().endswith(".BO"):
+                exchange = "BSE"
+            elif exchange in _EXCHANGE_DISPLAY:
+                exchange = _EXCHANGE_DISPLAY[exchange]
             
             if market_cap is None:
                 market_cap = info.get("marketCap")
@@ -256,6 +315,8 @@ def deep_analyze_ticker(ticker: str) -> ScreenerRow:
                 
         except Exception:
             pass
+
+        #print(f"DEBUG {ticker}: current_eps={current_eps}, big5_eps_g={big5_eps_g}, value_price={value_price_val}, mos_price={mos_price_val}, market_cap={market_cap}")
 
         return ScreenerRow(
             company=company_name,
@@ -283,7 +344,7 @@ def deep_analyze_ticker(ticker: str) -> ScreenerRow:
         pe_ratio = None
         
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             info = stock.info
             company_name = info.get("longName") or info.get("shortName") or ticker
             stock_price = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -316,10 +377,29 @@ def deep_analyze_batch(
     tickers: list[str],
     max_workers: int = DEFAULT_MAX_WORKERS,
     show_live: bool = True,
+    thresholds: dict | None = None,
 ) -> list[ScreenerRow]:
     """Run deep analysis in parallel with LIVE results display."""
     if not tickers:
         return []
+
+    cache = _load_screener_cache()
+    now = time.time()
+
+    to_run: list[str] = []
+    from_cache: list[ScreenerRow] = []
+    for t in tickers:
+        entry = cache.get(t)
+        if entry and (now - entry.get("cached_at", 0) < SCREENER_TTL):
+            from_cache.append(_row_from_dict(entry["row"]))
+        else:
+            to_run.append(t)
+
+    if not to_run:
+        st.info("✅ All results loaded from cache")
+        all_results = list(from_cache)
+        all_results.sort(key=lambda r: (r.score is None, -(r.score or 0)))
+        return all_results
 
     st.write(f"🔄 Deep analysis of **{len(tickers)}** candidates (parallel processing)...")
 
@@ -328,13 +408,17 @@ def deep_analyze_batch(
 
     results = []
     completed = 0
-    total = len(tickers)
+    total = len(to_run)
 
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ticker = {executor.submit(deep_analyze_ticker, ticker): ticker for ticker in tickers}
+        thresholds_tuple = tuple(sorted((thresholds or {}).items()))
+        future_to_ticker = {
+            executor.submit(deep_analyze_ticker, ticker, thresholds_tuple): ticker
+            for ticker in to_run
+        }
 
         for future in as_completed(future_to_ticker):
             ticker = future_to_ticker[future]
@@ -373,9 +457,10 @@ def deep_analyze_batch(
                         {
                             "Company": r.company[:30] + "..." if len(r.company) > 30 else r.company,
                             "Ticker": r.ticker,
-                            "Score": f"{r.score:.1f}/10" if r.score is not None else "n/a",
-                            "Price": fmt_money(r.stock_price),
-                            "Value": fmt_money(r.value_price),
+                            "Score": f"{_safe_float(r.score):.1f}/10" if _safe_float(r.score) is not None else "n/a",
+                            "Price": fmt_price(_safe_float(r.stock_price), r.ticker),
+                            "Value": fmt_price(_safe_float(r.value_price), r.ticker),
+                            "MOS Price": fmt_price(_safe_float(r.mos_price), r.ticker),
                             "Verdict": r.verdict,
                         }
                         for r in sorted_results[:20]
@@ -397,11 +482,34 @@ def deep_analyze_batch(
     progress_bar.empty()
     status_text.empty()
 
-    results.sort(key=lambda r: (r.score is None, -(r.score or 0)))
-    return results
+    # After analysis, merge and save cache
+    all_results = from_cache + results
+    new_cache = {**cache}
+    for r in results:
+        new_cache[r.ticker] = {
+            "cached_at": now,
+            "row": _row_to_dict(r),
+        }
+    _save_screener_cache(new_cache)
+
+    all_results.sort(key=lambda r: (r.score is None, -(r.score or 0)))
+    return all_results
 
 
 # ==================== DISPLAY ====================
+def _safe_float(v) -> float | None:
+    """Coerce a value to float, returning None if it can't be converted."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        f = float(v)
+        return f if f == f else None   # reject NaN
+    except (TypeError, ValueError):
+        return None
+
+
 def rows_to_dataframe(rows: list[ScreenerRow]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -411,12 +519,12 @@ def rows_to_dataframe(rows: list[ScreenerRow]) -> pd.DataFrame:
                 "Sector": r.sector or "n/a",
                 "Industry": r.industry or "n/a",
                 "Exchange": r.exchange or "n/a",
-                "Market Cap": fmt_money(r.market_cap),
-                "Wonderfulness": f"{r.score:.1f}/10" if r.score is not None else "n/a",
-                "Stock Price": fmt_money(r.stock_price),
-                "Value Price": fmt_money(r.value_price),
-                "MOS Price": fmt_money(r.mos_price),
-                "P/E": f"{r.pe_ratio:.1f}" if r.pe_ratio else "n/a",
+                "Market Cap": fmt_money(_safe_float(r.market_cap), r.ticker),
+                "Wonderfulness": f"{_safe_float(r.score):.1f}/10" if _safe_float(r.score) is not None else "n/a",
+                "Stock Price": fmt_price(_safe_float(r.stock_price), r.ticker),
+                "Value Price": fmt_price(_safe_float(r.value_price), r.ticker),
+                "MOS Price": fmt_price(_safe_float(r.mos_price), r.ticker),
+                "P/E": f"{_safe_float(r.pe_ratio):.1f}" if _safe_float(r.pe_ratio) is not None else "n/a",
                 "Verdict": r.verdict,
             }
             for r in rows
@@ -457,7 +565,9 @@ def apply_filters(
     sector_filter: list,
     exchange_filter: list,
     ticker_search: str, 
-    show_full_table: bool
+    show_full_table: bool,
+    mcap_min: float = 0,
+    mcap_max: float = float("inf"),
 ) -> list[ScreenerRow]:
     """Apply filters to the results."""
     filtered = rows.copy()
@@ -477,14 +587,17 @@ def apply_filters(
     # Filter by exchange (multi-select)
     if exchange_filter:
         filtered = [r for r in filtered if r.exchange in exchange_filter]
-    
+
+    # Market cap filter (applied at display time)
+    if mcap_min > 0:
+        filtered = [r for r in filtered if r.market_cap is not None and r.market_cap >= mcap_min]
+    if mcap_max < float("inf"):
+        filtered = [r for r in filtered if r.market_cap is not None and r.market_cap <= mcap_max]
+        
     # Filter by search term
     if ticker_search:
         search = ticker_search.upper()
-        filtered = [
-            r for r in filtered
-            if search in r.ticker.upper() or search in r.company.upper()
-        ]
+        filtered = [r for r in filtered if search in r.ticker.upper() or search in r.company.upper()]
     
     # Filter out errors
     if not show_full_table:
@@ -499,14 +612,13 @@ def render_stock_screener() -> None:
 
     st.markdown("### 🏦 Stock Screener - Find Wonderful Businesses")
     st.caption(
-        "**Two-phase screening:** "
-        "1️⃣ Quick pre-filter using yFinance (basic metrics) "
-        "2️⃣ Deep MoatCheck analysis on top candidates — **results appear LIVE!**"
+      "**Full-universe screening:** Scans every US-listed stock via SEC EDGAR + "
+        "yFinance. Results are cached for 7 days — reruns are incremental."
     )
 
     with st.expander("⚙️ Screener Settings", expanded=True):
         # Elegant single-row filter layout
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             st.markdown("**Company Size**")
@@ -537,23 +649,10 @@ def render_stock_screener() -> None:
                 label_visibility="collapsed",
                 help="Select one or more sectors. Leave empty for all sectors.",
                 placeholder="All Sectors",
-            )
-
-        with col4:
-            st.markdown("**Analysis Depth**")
-            max_candidates = st.slider(
-                "Candidates",
-                min_value=10,
-                max_value=200,
-                value=100,
-                step=10,
-                label_visibility="collapsed",
-                help="Number of stocks to deep-analyze"
-            )
-
+            )        
         # Performance settings in a secondary row
-        col5, col6, col7 = st.columns([1, 1, 2])
-        with col5:
+        col4, col5 = st.columns([1, 3])
+        with col4:
             max_workers = st.slider(
                 "Workers",
                 min_value=5,
@@ -561,62 +660,185 @@ def render_stock_screener() -> None:
                 value=20,
                 step=5,
                 help="Parallel processing speed"
-            )
-        with col6:
-            max_to_check = st.slider(
-                "Pre-Filter Range",
-                min_value=100,
-                max_value=5000,
-                value=2000,
-                step=100,
-                help="Stocks to scan initially"
-            )
-        with col7:
+            )        
+        with col5:
             show_live_results = st.checkbox(
                 "📡 Show LIVE results as they come in",
                 value=True,
                 help="Display each company immediately after analysis (recommended)"
             )
+        include_india = st.checkbox(
+            "🇮🇳 Include Indian stocks (NSE)",
+            value=False,
+            help=(
+                "Adds ~2,000 NSE-listed tickers. Note: EDGAR doesn't cover Indian "
+                "companies, so the Big 5 will show n/a for long-history metrics. "
+                "Technical signals and intrinsic value still work."
+            ),
+        )
+
+        force_refresh = st.checkbox(
+            "🔄 Force fresh scan (ignore cache)",
+            value=False,
+            help="Ignore all cached results and re-analyze every ticker from scratch."
+        )
+
+        # --- Big 5 growth thresholds ---
+        with st.expander("📊 Big 5 growth thresholds", expanded=False):
+            st.caption(
+                "Set a minimum and maximum acceptable growth rate for each metric. "
+                "A company passes a metric only if its CAGR falls within [Min, Max] "
+                "for **every** computed window. Changes take effect on the next run."
+            )
+
+            tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
+
+            with tcol1:
+                st.markdown("**Revenue**")
+                rev_min = st.number_input(
+                    "Rev min", min_value=0.0, max_value=100.0,
+                    value=10.0, step=1.0, format="%.0f",
+                    key="scr_rev_min", label_visibility="collapsed",
+                ) / 100
+                rev_max = st.number_input(
+                    "Rev max", min_value=0.0, max_value=100.0,
+                    value=50.0, step=1.0, format="%.0f",
+                    key="scr_rev_max", label_visibility="collapsed",
+                ) / 100
+
+            with tcol2:
+                st.markdown("**EPS**")
+                eps_min = st.number_input(
+                    "EPS min", min_value=0.0, max_value=100.0,
+                    value=10.0, step=1.0, format="%.0f",
+                    key="scr_eps_min", label_visibility="collapsed",
+                ) / 100
+                eps_max = st.number_input(
+                    "EPS max", min_value=0.0, max_value=100.0,
+                    value=50.0, step=1.0, format="%.0f",
+                    key="scr_eps_max", label_visibility="collapsed",
+                ) / 100
+
+            with tcol3:
+                st.markdown("**Equity**")
+                eq_min = st.number_input(
+                    "Eq min", min_value=0.0, max_value=100.0,
+                    value=10.0, step=1.0, format="%.0f",
+                    key="scr_eq_min", label_visibility="collapsed",
+                ) / 100
+                eq_max = st.number_input(
+                    "Eq max", min_value=0.0, max_value=100.0,
+                    value=50.0, step=1.0, format="%.0f",
+                    key="scr_eq_max", label_visibility="collapsed",
+                ) / 100
+
+            with tcol4:
+                st.markdown("**OCF**")
+                ocf_min = st.number_input(
+                    "OCF min", min_value=0.0, max_value=100.0,
+                    value=10.0, step=1.0, format="%.0f",
+                    key="scr_ocf_min", label_visibility="collapsed",
+                ) / 100
+                ocf_max = st.number_input(
+                    "OCF max", min_value=0.0, max_value=100.0,
+                    value=50.0, step=1.0, format="%.0f",
+                    key="scr_ocf_max", label_visibility="collapsed",
+                ) / 100
+
+            with tcol5:
+                st.markdown("**ROIC**")
+                roic_min = st.number_input(
+                    "ROIC min", min_value=0.0, max_value=100.0,
+                    value=10.0, step=1.0, format="%.0f",
+                    key="scr_roic_min", label_visibility="collapsed",
+                ) / 100
+                roic_max = st.number_input(
+                    "ROIC max", min_value=0.0, max_value=100.0,
+                    value=50.0, step=1.0, format="%.0f",
+                    key="scr_roic_max", label_visibility="collapsed",
+                ) / 100
+
+        # --- Additional quality filters ---
+        with st.expander("📊 Additional quality filters", expanded=False):
+            st.caption(
+                "One-sided floors. A company passes if its metric is **at or above** "
+                "the value entered here. Changes take effect on the next run."
+            )
+
+            acol1, acol2, acol3 = st.columns(3)
+
+            with acol1:
+                st.markdown("**Cash Conversion ≥**")
+                cash_conv_min = st.number_input(
+                    "Cash Conversion", min_value=0.0, max_value=500.0,
+                    value=80.0, step=5.0, format="%.0f",
+                    key="scr_cash_conv", label_visibility="collapsed",
+                ) / 100
+
+            with acol2:
+                st.markdown("**Discount to FV (FCF) ≥**")
+                disc_fcf_min = st.number_input(
+                    "Discount FCF", min_value=-100.0, max_value=100.0,
+                    value=30.0, step=5.0, format="%.0f",
+                    key="scr_disc_fcf", label_visibility="collapsed",
+                ) / 100
+
+            with acol3:
+                st.markdown("**Discount to FV (NP) ≥**")
+                disc_np_min = st.number_input(
+                    "Discount NP", min_value=-100.0, max_value=100.0,
+                    value=30.0, step=5.0, format="%.0f",
+                    key="scr_disc_np", label_visibility="collapsed",
+                ) / 100
+
+        # --- Combine into the thresholds dict (after both expanders) ---
+        screener_thresholds = {
+            "revenue":         {"min": rev_min,       "max": rev_max},
+            "eps":             {"min": eps_min,       "max": eps_max},
+            "equity":          {"min": eq_min,        "max": eq_max},
+            "ocf":             {"min": ocf_min,       "max": ocf_max},
+            "roic":            {"min": roic_min,      "max": roic_max},
+            "cash_conversion": {"min": cash_conv_min, "max": 999.0},
+            "discount_fcf":    {"min": disc_fcf_min,  "max": 999.0},
+            "discount_np":     {"min": disc_np_min,   "max": 999.0},
+        }
+
+    st.caption(
+        "**Active filters:** "
+        f"Revenue {screener_thresholds['revenue']['min']*100:.0f}–{screener_thresholds['revenue']['max']*100:.0f}% · "
+        f"EPS {screener_thresholds['eps']['min']*100:.0f}–{screener_thresholds['eps']['max']*100:.0f}% · "
+        f"Equity {screener_thresholds['equity']['min']*100:.0f}–{screener_thresholds['equity']['max']*100:.0f}% · "
+        f"OCF {screener_thresholds['ocf']['min']*100:.0f}–{screener_thresholds['ocf']['max']*100:.0f}% · "
+        f"ROIC {screener_thresholds['roic']['min']*100:.0f}–{screener_thresholds['roic']['max']*100:.0f}% · "
+        f"Cash Conversion ≥ {screener_thresholds['cash_conversion']['min']*100:.0f}% · "
+        f"Discount FCF ≥ {screener_thresholds['discount_fcf']['min']*100:.0f}% · "
+        f"Discount NP ≥ {screener_thresholds['discount_np']['min']*100:.0f}%"
+    )
 
     if st.button("🔍 Start Screening", type="primary"):
         start_time = time.time()
 
-        # Load universe
-        all_tickers = load_stock_universe()
+        if force_refresh:
+            # Nuke both caches
+            st.cache_data.clear()                # Streamlit memory cache
+            if SCREENER_CACHE.exists():
+                SCREENER_CACHE.unlink()          # Disk cache
+        
+        all_tickers = get_combined_tickers(include_us=True, include_india=include_india)
+        region = "US + India" if include_india else "US"
+        st.info(f"📊 **Universe:** {len(all_tickers):,} {region}-listed stocks — running full scan")
 
-        # Phase 1: Pre-filter
-        st.info("📊 **Phase 1:** Quick pre-filtering...")
-        
-        # If multiple sectors selected, pass them as a list
-        sectors_to_filter = sector_filter if sector_filter else []
-        
-        filtered_tickers = pre_filter_stocks_quick(
+        results = deep_analyze_batch(
             all_tickers,
-            max_stocks=max_to_check,
-            min_mcap=min_mcap if min_mcap != float("inf") else 0,
-            max_mcap=max_mcap if max_mcap != float("inf") else float("inf"),
-            exchange=exchange,
-            sectors=sectors_to_filter,
+            max_workers,
+            show_live_results,
+            thresholds=screener_thresholds,
         )
 
-        if not filtered_tickers:
-            st.warning("No stocks passed pre-filter. Try increasing the range or choosing 'All Sectors'.")
-            return
-
-        # Limit candidates
-        candidates = filtered_tickers[:max_candidates]
-        st.info(f"📊 **Phase 2:** Deep analysis of **{len(candidates)}** candidates...")
-
-        # Phase 2: Deep analysis with live results
-        results = deep_analyze_batch(candidates, max_workers, show_live_results)
-
         elapsed = time.time() - start_time
-
         st.session_state["screener_results"] = results
         st.session_state["screener_time"] = elapsed
-        st.session_state["screener_total_filtered"] = len(filtered_tickers)
-
-        st.success(f"✅ Screening complete in **{elapsed:.1f} seconds**!")
+        st.success(f"✅ Scanned **{len(all_tickers):,}** stocks in **{elapsed:.1f}s**")
 
     # Display final results
     if "screener_results" not in st.session_state:
@@ -652,7 +874,7 @@ def render_stock_screener() -> None:
         verdict_filter = st.multiselect(
             "Verdict",
             options=["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown", "Error"],
-            default=["BARGAIN BUY", "BUY", "WATCH", "AVOID"],
+            default=["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown", "Error"],
             help="Select which verdicts to show"
         )
     
@@ -701,7 +923,9 @@ def render_stock_screener() -> None:
         sector_result_filter, 
         exchange_result_filter,
         ticker_search, 
-        show_full_table
+        show_full_table,
+        mcap_min=min_mcap,
+        mcap_max=max_mcap,
     )
     
     # Show count

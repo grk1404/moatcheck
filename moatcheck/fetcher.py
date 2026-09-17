@@ -6,7 +6,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
+import yfinance_cache as yf
+from curl_cffi import requests as curl_requests
+
+_session = curl_requests.Session(impersonate="chrome")
 
 
 class FetchError(Exception):
@@ -128,23 +131,29 @@ _ROW_ALIASES = {
 
 def _normalize_ticker(ticker: str) -> tuple[str, str]:
     """
-    Normalize ticker and detect exchange.
-    Returns (normalized_ticker, exchange)
+    Normalize a user-supplied ticker and detect its exchange.
+
+    Rules (in order):
+      1. If the ticker already ends in .NS or .BO, keep it and mark the exchange.
+      2. If the ticker is in the explicit indian_tickers allowlist, append .NS.
+      3. Otherwise, leave the ticker as-is and let the caller try it bare first.
+
+    Note: this function does NOT auto-append .NS to "any short alpha ticker"
+    — that heuristic matched almost every US ticker (PGR, AON, AA, AER, ...)
+    and silently misrouted them to the Indian exchange.
     """
     ticker = ticker.strip().upper()
-    
-    # If it already has .NS or .BO suffix, keep it
+
     if ticker.endswith(".NS"):
         return ticker, "NSE"
     if ticker.endswith(".BO"):
         return ticker, "BSE"
-    
-    # Common Indian stock tickers - add .NS suffix by default for NSE
-    # Expand this list as needed
+
+    # Explicit allowlist of NSE symbols that are commonly typed without
+    # a suffix. Only these get auto-suffixed.
     indian_tickers = {
-        # Large Cap
-        "RELIANCE", "TCS", "HDFC", "HDFCBANK", "INFY", "ICICIBANK", 
-        "ITC", "KOTAKBANK", "SBIN", "BHARTIARTL", "HINDUNILVR", 
+        "RELIANCE", "TCS", "HDFC", "HDFCBANK", "INFY", "ICICIBANK",
+        "ITC", "KOTAKBANK", "SBIN", "BHARTIARTL", "HINDUNILVR",
         "LT", "AXISBANK", "WIPRO", "ASIANPAINT", "MARUTI", "HCLTECH",
         "SUNPHARMA", "TITAN", "ULTRACEMCO", "BAJFINANCE", "ADANIENT",
         "ADANIPORTS", "NTPC", "ONGC", "POWERGRID", "TATASTEEL",
@@ -153,8 +162,6 @@ def _normalize_ticker(ticker: str) -> tuple[str, str]:
         "DRREDDY", "EICHERMOT", "HINDALCO", "M&M", "SHREECEM",
         "TATAMOTORS", "UPL", "BAJAJ-AUTO", "BHARATFORGE", "DIVISLAB",
         "ZOMATO", "DMART", "JIOFIN",
-        
-        # Mid Cap
         "ABFRL", "ACC", "ADANIGREEN", "ADANITRANS", "ALKEM", "AMBUJACEM",
         "APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "AUROPHARMA", "BANDHANBNK",
         "BANKBARODA", "BERGEPAINT", "BIOCON", "BOSCHLTD", "CANBK",
@@ -168,15 +175,11 @@ def _normalize_ticker(ticker: str) -> tuple[str, str]:
         "SUNTV", "TATACONSUM", "TATAPOWER", "TORNTPHARM", "TRENT",
         "TVSMOTOR", "UBL", "VEDL", "VOLTAS", "WHIRLPOOL", "YESBANK",
         "ZEEL",
-        
-        # Add more as needed
     }
-    
-    # Also check if it's an Indian ticker pattern (3-6 letters, all alpha)
-    # This will catch any Indian stock not in the list
-    if ticker in indian_tickers or (len(ticker) >= 3 and len(ticker) <= 6 and ticker.isalpha()):
+
+    if ticker in indian_tickers:
         return f"{ticker}.NS", "NSE"
-    
+
     return ticker, ""
 
 def _pick_row(df: pd.DataFrame, keys: list[str]) -> pd.Series | None:
@@ -207,44 +210,71 @@ def fetch(ticker: str) -> Financials:
 
     Raises FetchError with a user-friendly message if the ticker is invalid
     or returns no usable data.
+
+    Resolution order:
+      1. If the ticker already has .NS/.BO, use it as-is.
+      2. If it's in the explicit Indian allowlist, try <ticker>.NS first.
+      3. Otherwise try the bare ticker first.
+      4. If the first candidate fails, try the alternate form (bare vs suffixed).
     """
     if not ticker or not ticker.strip():
         raise FetchError("Please enter a ticker symbol.")
 
-    #symbol = ticker.strip().upper()
-    symbol, exchange = _normalize_ticker(ticker.strip())
+    original = ticker.strip().upper()
+    symbol, exchange = _normalize_ticker(original)
 
-    yft = yf.Ticker(symbol, session=_SESSION)
+    # Build an ordered list of candidates to try.
+    # The first candidate is what _normalize_ticker resolved to; the second
+    # is the alternate form (bare vs suffixed) as a fallback.
+    candidates: list[tuple[str, str]] = [(symbol, exchange)]
 
-    try:
-        income = yft.income_stmt
-        balance = yft.balance_sheet
-        cash = yft.cashflow
-    except Exception as e:
-        raise FetchError(f"Could not fetch data for {symbol}: {e}") from e
+    if "." not in original:
+        # User typed a bare ticker. If the resolver auto-suffixed it,
+        # also try the bare form as a fallback.
+        if symbol != original:
+            candidates.append((original, ""))
+    else:
+        # User typed an explicit suffix. If it fails, try without the suffix.
+        bare = original.split(".")[0]
+        candidates.append((bare, ""))
 
-    if (income is None or income.empty) and (balance is None or balance.empty):
-        # If Indian ticker failed with .NS, try without suffix
-        if exchange == "NSE" and not ticker.endswith(".NS"):
-            try:
-                yft = yf.Ticker(ticker, session=_SESSION)
-                income = yft.income_stmt
-                balance = yft.balance_sheet
-                cash = yft.cashflow
-                symbol = ticker
-                if (income is None or income.empty) and (balance is None or balance.empty):
-                    raise FetchError(
-                        f"No financial statements available for {symbol}. "
-                        "Check the ticker symbol or try a US-listed company."
-                    )
-            except Exception:
-                raise FetchError(
-                    f"No financial statements available for {symbol}. "
-                    "Check the ticker symbol or try a US-listed company."
-                )
-        else:
-            raise FetchError(f"No financial statements available for {symbol}. " "Check the ticker symbol or try a US-listed company.")
+    income = None
+    balance = None
+    cash = None
+    yft = None
+    last_error: Exception | None = None
 
+    for cand_symbol, cand_exchange in candidates:
+        try:
+            cand_yft = yf.Ticker(cand_symbol, session=_SESSION)
+            cand_income = cand_yft.income_stmt
+            cand_balance = cand_yft.balance_sheet
+            cand_cash = cand_yft.cashflow
+        except Exception as e:
+            last_error = e
+            continue
+
+        has_income = cand_income is not None and not cand_income.empty
+        has_balance = cand_balance is not None and not cand_balance.empty
+
+        if has_income or has_balance:
+            yft = cand_yft
+            income = cand_income
+            balance = cand_balance
+            cash = cand_cash
+            symbol = cand_symbol
+            exchange = cand_exchange or exchange
+            break
+        # Empty result — try the next candidate.
+
+    if yft is None:
+        detail = f" ({last_error})" if last_error else ""
+        raise FetchError(
+            f"No financial statements available for {original}. "
+            f"Check the ticker symbol or try a US-listed company.{detail}"
+        )
+
+    # ---------- Extract annual series ----------
     revenue = _to_year_series(_pick_row(income, _ROW_ALIASES["revenue"]))
     net_income = _to_year_series(_pick_row(income, _ROW_ALIASES["net_income"]))
     eps = _to_year_series(_pick_row(income, _ROW_ALIASES["eps"]))
@@ -293,7 +323,7 @@ def fetch(ticker: str) -> Financials:
             "delisted, non-US, or recently IPO'd with no annual filings yet."
         )
 
-    # Snapshot info: price, market cap, PE, analyst growth.
+    # ---------- Snapshot info: price, market cap, PE, analyst growth ----------
     current_price = None
     market_cap = None
     company_name = ""
@@ -320,16 +350,14 @@ def fetch(ticker: str) -> Financials:
     analyst_target_mean = None
     analyst_target_high = None
     analyst_target_low = None
+    info_exchange = ""
+
     try:
         info = yft.info or {}
         company_name = info.get("longName") or info.get("shortName") or symbol
-        # --- ADD THIS: Get exchange from info ---
-        info_exchange = info.get("exchange", "")
+        info_exchange = info.get("exchange", "") or info.get("fullExchangeName", "")
         if info_exchange:
-            exchange = info_exchange  # Override the empty exchange with actual exchange
-        # Also check for fullExchangeName
-        elif info.get("fullExchangeName"):
-            exchange = info.get("fullExchangeName")
+            exchange = info_exchange
 
         if current_price is None:
             current_price = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -350,8 +378,7 @@ def fetch(ticker: str) -> Financials:
             shares_outstanding = float(so)
         dy = info.get("dividendYield")
         if dy is not None:
-            # yfinance 0.2.40+ returns dividend yield as a percentage value
-            # (e.g. 2.44 means 2.44%, not 244%). Convert to decimal.
+            # yfinance returns dividend yield as a percentage (e.g. 2.44 = 2.44%).
             dividend_yield = float(dy) / 100
         b = info.get("beta")
         if b is not None:
@@ -359,7 +386,6 @@ def fetch(ticker: str) -> Financials:
         bvps = info.get("bookValue")
         if bvps is not None:
             book_value_per_share = float(bvps)
-        # Analyst rating snapshot
         rec_key = info.get("recommendationKey")
         rec_mean = info.get("recommendationMean")
         num_ops = info.get("numberOfAnalystOpinions")
@@ -380,11 +406,7 @@ def fetch(ticker: str) -> Financials:
     if shares_outstanding is None and market_cap and current_price:
         shares_outstanding = market_cap / current_price
 
-    # --- Currency normalization ---
-    # For foreign-listed tickers (e.g. Kaspi.kz / KSPI, some ADRs), Yahoo returns
-    # the statement values in the local currency (KZT) but the quote in USD.
-    # We convert all statement series and per-share amounts into the QUOTE
-    # currency so downstream valuation math is consistent.
+    # ---------- Currency normalization ----------
     fin_ccy = None
     quote_ccy = None
     fx_rate = None
@@ -397,35 +419,28 @@ def fetch(ticker: str) -> Financials:
         pass
 
     if fin_ccy and quote_ccy and fin_ccy != quote_ccy:
-        # Yahoo FX ticker convention: "XXX=X" means "USD per 1 XXX" for major pairs,
-        # BUT for most non-USD pairs "XXX=X" actually returns "XXX per 1 USD".
-        # Handle both by fetching USD-based FX and computing the ratio we need.
         try:
             if fin_ccy == "USD" or quote_ccy == "USD":
                 other = quote_ccy if fin_ccy == "USD" else fin_ccy
-                fx_pair = f"{other}=X"  # units of `other` per 1 USD
+                fx_pair = f"{other}=X"
                 fx_ticker = yf.Ticker(fx_pair, session=_SESSION)
                 hist = fx_ticker.history(period="5d")
                 if not hist.empty:
                     rate_other_per_usd = float(hist["Close"].iloc[-1])
                     if fin_ccy == "USD":
-                        # statement in USD, quote in `other` — multiply statement by rate
                         fx_rate = rate_other_per_usd
                     else:
-                        # statement in `other`, quote in USD — divide statement by rate
                         fx_rate = 1.0 / rate_other_per_usd
                     fx_note = (
                         f"Statements in {fin_ccy} converted to {quote_ccy} at "
                         f"1 {fin_ccy} = {fx_rate:.6f} {quote_ccy}."
                     )
             else:
-                # Neither side is USD — pivot through USD
                 fx1 = yf.Ticker(f"{fin_ccy}=X", session=_SESSION).history(period="5d")
                 fx2 = yf.Ticker(f"{quote_ccy}=X", session=_SESSION).history(period="5d")
                 if not fx1.empty and not fx2.empty:
                     fin_per_usd = float(fx1["Close"].iloc[-1])
                     quote_per_usd = float(fx2["Close"].iloc[-1])
-                    # 1 fin_ccy = (1/fin_per_usd) USD = (quote_per_usd/fin_per_usd) quote_ccy
                     fx_rate = quote_per_usd / fin_per_usd
                     fx_note = (
                         f"Statements in {fin_ccy} converted to {quote_ccy} at "
@@ -435,9 +450,6 @@ def fetch(ticker: str) -> Financials:
             fx_rate = None
 
     if fx_rate is not None:
-        # Apply to every statement series and per-share amount that came from
-        # the statements (i.e. in fin_ccy). Do NOT touch price / market_cap /
-        # dividend_yield / PE / analyst_growth — those come from the quote side.
         revenue = revenue * fx_rate if not revenue.empty else revenue
         net_income = net_income * fx_rate if not net_income.empty else net_income
         eps = eps * fx_rate if not eps.empty else eps
@@ -447,7 +459,6 @@ def fetch(ticker: str) -> Financials:
         fcf = fcf * fx_rate if not fcf.empty else fcf
         long_term_debt = long_term_debt * fx_rate if not long_term_debt.empty else long_term_debt
         ebit = ebit * fx_rate if not ebit.empty else ebit
-        # tax_rate is a ratio, unaffected by currency
         if book_value_per_share is not None:
             book_value_per_share = book_value_per_share * fx_rate
 
@@ -479,7 +490,15 @@ def fetch(ticker: str) -> Financials:
         analyst_target_high=analyst_target_high,
         analyst_target_low=analyst_target_low,
         company_name=company_name or symbol,
-        data_source_note=fx_note,  # populated only when a currency conversion happened
-        raw={"income": income, "balance": balance, "cash": cash, "fx_rate": fx_rate, "fin_ccy": fin_ccy, "quote_ccy": quote_ccy},
+        data_source_note=fx_note,
+        raw={
+            "income": income,
+            "balance": balance,
+            "cash": cash,
+            "fx_rate": fx_rate,
+            "fin_ccy": fin_ccy,
+            "quote_ccy": quote_ccy,
+            "candidate_tried": [c[0] for c in candidates],
+        },
         exchange=exchange,
     )

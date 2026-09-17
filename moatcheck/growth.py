@@ -28,7 +28,7 @@ def cagr(series: pd.Series, years: int, min_base_ratio: float = 0.15) -> float |
     if typical > 0 and start < min_base_ratio * typical:
         return None    
     result = (end / start) ** (1 / years) - 1
-    print(f"DEBUG cagr(years={years}) result={result}")
+    #print(f"DEBUG cagr(years={years}) result={result}")
     return result
 
 

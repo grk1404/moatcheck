@@ -69,6 +69,11 @@ CONCEPTS: dict[str, list[str]] = {
     "capex": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
+        "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
+        "PaymentsToAcquireProductiveAssetsAndIntangibleAssets",
+        "PaymentsToAcquireOtherProductiveAssets",
+        "PaymentsForCapitalImprovements",
+        "PaymentsToAcquireMachineryAndEquipment",
     ],
     "ebit": [
         "OperatingIncomeLoss",

@@ -2,19 +2,27 @@ from __future__ import annotations
 import streamlit as st
 
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import json
 import warnings
+from data_provider import get_ticker
 
 from trade_manager import (
     compute_target_shares,
     compute_rebalance,
     log_trade,
-    load_trades,    
+    load_trades,
+    load_position,
+    save_position,
+    load_capital,
+    save_capital,
+    net_capital,
+    compute_running_pnl,
+    compute_realized_pnl,
 )
+
 warnings.filterwarnings('ignore')
 # Import the technical indicator analyzer
 from technical_indicators import TechnicalIndicatorAnalyzer
@@ -203,7 +211,7 @@ def _render_big5_table(big5: Big5Result) -> None:
         return styles
 
     styled = display.style.apply(_style, axis=1)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
 
 def _verdict_price(current: float | None, mos: float | None, value: float | None) -> tuple[str, str, str]:
@@ -511,7 +519,7 @@ def render_analyzer() -> None:
             format="%.1f%%",
             help="Discount applied to fair value to get a buy price. MOS uses a fixed 50% on Value Price.",
         ) / 100
-
+        
     with st.form("analyze"):
         col_a, col_b, col_c = st.columns([2, 1, 5])
         with col_a:
@@ -522,9 +530,9 @@ def render_analyzer() -> None:
             st.markdown("<div style='height: 28px;color: #FFFFFF'></div>", unsafe_allow_html=True)
             # Check if we're currently analyzing
             if "analyzing" in st.session_state and st.session_state["analyzing"]:
-                submitted = st.form_submit_button("⏳ Analyzing...", use_container_width=True, disabled=True)
+                submitted = st.form_submit_button("⏳ Analyzing...", width="stretch", disabled=True)
             else:
-                submitted = st.form_submit_button("Analyze", use_container_width=True)
+                submitted = st.form_submit_button("Analyze", width="stretch")
 
     with st.sidebar:
         if st.button("🔄 Reset Analyzer", help="Clear cache and reset for new ticker"):
@@ -610,8 +618,10 @@ def render_analyzer() -> None:
     )
     st.caption(
         "As per Buffett, a wonderful business has a durable competitive advantage — a "
-        '"moat". Ideally, all five metrics below should show historical growth rates of '
-        "10% or more per year over the 10, 5, 3, and 1-year windows. All these numbers are Compounded Annual Growth Rates (CAGRs)."
+        f'"moat". Ideally, all five metrics below should show historical growth rates of '
+        f"10% or more per year over the 10, 5, 3, and 1-year windows "
+        "(adjust thresholds in the sidebar). All these numbers are Compounded Annual "
+        "Growth Rates (CAGRs)."
     )
     st.caption("Note: ROIC is shown as a period-average return, not a CAGR.")
     _render_big5_table(big5)
@@ -1190,7 +1200,7 @@ def render_analyzer() -> None:
 
         st.dataframe(
             methods_df.style.apply(_style_row, axis=1),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -1251,7 +1261,7 @@ def render_analyzer() -> None:
         }
         combined = pd.DataFrame({k: v for k, v in frames.items() if not v.empty})
         combined.index.name = "Year"
-        st.dataframe(combined.sort_index(ascending=False), use_container_width=True)
+        st.dataframe(combined.sort_index(ascending=False), width="stretch")
 
     st.divider()
 
@@ -1478,7 +1488,7 @@ def render_technical_analysis():
                 }).set_table_styles([
                     {'selector': 'thead th', 'props': [('background-color', '#1e1e1e'), ('color', '#b6f0b6')]}
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
             
@@ -1697,7 +1707,79 @@ def render_technical_analysis():
                              delta=f"{((resistance - verdict_data['current_price']) / verdict_data['current_price'] * 100):.1f}% above")
                 else:
                     st.metric("Resistance Level", "N/A")
-            
+
+                        # --- Suggested entry price (from inverting the technical verdict) ---
+            st.markdown("### 🎯 Technical BUY Price")
+
+            entry_info = analyzer.find_entry_price()
+
+            if entry_info is None:
+                st.info("Not enough data to compute a BUY price.")
+            elif entry_info["entry_price"] is None:
+                st.warning(
+                    f"No BUY price found even at 60% below the current price. "
+                    f"The verdict remains {entry_info['entry_verdict']} at "
+                    f"${entry_info['search_range'][0]:.2f}."
+                )
+            else:
+                tgt = entry_info["entry_price"]
+                cur = entry_info["current_price"]
+                drop_pct = (tgt - cur) / cur * 100
+
+                # Color depends on how close the current price is to the target
+                if drop_pct >= -0.5:
+                    # Already there — bright green
+                    box_bg, box_color = "#1e4620", "#00E676"
+                    status_text = "READY NOW"
+                elif drop_pct >= -3.0:
+                    # Close — light green
+                    box_bg, box_color = "#2a3d1e", "#8BC34A"
+                    status_text = "NEAR ENTRY"
+                elif drop_pct >= -8.0:
+                    # Moderate pullback needed — amber
+                    box_bg, box_color = "#4a3a1e", "#FFA726"
+                    status_text = "WAIT FOR PULLBACK"
+                else:
+                    # Deep pullback needed — red
+                    box_bg, box_color = "#4b1e1e", "#EF5350"
+                    status_text = "DEEP PULLBACK NEEDED"
+
+                # Big highlighted card
+                st.markdown(f"""
+                <div style="background-color:{box_bg}; border:2px solid {box_color};
+                            border-radius:10px; padding:1.5rem; text-align:center;
+                            margin:0.5rem 0;">
+                    <div style="color:#9aa0a6; font-size:0.75rem;
+                                text-transform:uppercase; letter-spacing:0.05em;
+                                margin-bottom:0.35rem;">
+                        Technical BUY Price
+                    </div>
+                    <div style="font-size:3rem; font-weight:700; color:{box_color};
+                                line-height:1.1;">
+                        ${tgt:.2f}
+                    </div>
+                    <div style="color:{box_color}; font-size:1rem;
+                                font-weight:600; margin-top:0.35rem;">
+                        {status_text}
+                    </div>
+                    <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.25rem;">
+                        {drop_pct:+.2f}% from current (${cur:.2f})
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if drop_pct >= -0.5:
+                    st.success(
+                        f"✅ Price is essentially at the BUY level. "
+                        f"A marginal move down flips the verdict to BUY."
+                    )
+                else:
+                    st.info(
+                        f"⏳ Wait for a pullback to ${tgt:.2f} before the "
+                        f"technical rules flip to BUY."
+                    )
+
+
             # --- Signal Summary (matching Stock Analyzer table style) ---
             st.markdown("### Signal Summary")
             
@@ -1763,7 +1845,7 @@ def render_technical_analysis():
                 )
                 
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # --- Historical signal performance ---
                     st.markdown("#### 📊 Signal Performance (Historical)")
@@ -1805,7 +1887,7 @@ def render_technical_analysis():
                         sc4.metric("Avg Loss", f"{avg_loss:+.2f}%")
                         sc5.metric("Cumulative", f"{sum(pcts):+.2f}%")
 
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.dataframe(df, width="stretch", hide_index=True)
                 else:
                     st.warning("Chart method returned None")
             except Exception as e:
@@ -1914,7 +1996,7 @@ def render_technical_analysis():
                         mr_signal["details"],
                         columns=["Strategy", "Vote (TQQQ-equivalent %)", "Reason"],
                     )
-                    st.dataframe(vote_df, use_container_width=True, hide_index=True)
+                    st.dataframe(vote_df, width="stretch", hide_index=True)
 
                     st.caption(
                         "Each rule votes a score from 0 to 100. The average is the raw score. "
@@ -1932,6 +2014,89 @@ def render_technical_analysis():
                         f"reduce position size or wait for alignment."
                     )
 
+            # ============================================================
+            # BNF REVERSAL SETUP SCANNER
+            # Takashi Kotegawa style — mean-reversion on extreme dislocation
+            # ============================================================
+            st.markdown("---")
+            st.markdown("### 🔄 BNF Reversal Setup")
+            st.caption(
+                "Takashi Kotegawa (BNF) style mean-reversion check. "
+                "Looks for stocks dislocated 20%+ below their 25-day MA with RSI/BB confirmation. "
+                "This is a bear-market / panic setup — not a trend-following signal."
+            )
+
+            bnf = analyzer.check_bnf_reversal_setup()
+
+            # Color and icon by setup state
+            if bnf.get("setup"):
+                bnf_color, bnf_bg = "#00E676", "#1e4620"
+                bnf_label = "⚡ SETUP DETECTED"
+            else:
+                bnf_color, bnf_bg = "#9AA0A6", "#2a2a2a"
+                bnf_label = "No setup"
+
+            col1, col2 = st.columns([1, 2])
+
+            with col1:
+                st.markdown(f"""
+                <div style="background-color:{bnf_bg}; border:2px solid {bnf_color};
+                            border-radius:10px; padding:1.25rem; text-align:center;">
+                    <div style="font-size:1.25rem; font-weight:700; color:{bnf_color};">
+                        {bnf_label}
+                    </div>
+                    <div style="color:#9aa0a6; font-size:0.8rem; margin-top:0.4rem;">
+                        {bnf.get('reason', '')}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col2:
+                # Show the dislocation as the headline metric
+                dislocation = bnf.get("dislocation_pct")
+                if dislocation is not None:
+                    # Color delta by severity
+                    if dislocation <= -35:
+                        delta_color = "normal"   # extreme — highlighted
+                    elif dislocation <= -20:
+                        delta_color = "normal"   # setup zone
+                    else:
+                        delta_color = "off"      # not dislocated
+
+                    st.metric(
+                        "Dislocation from MA25",
+                        f"{dislocation:+.2f}%",
+                        delta="Extreme" if dislocation <= -35 else
+                              "In setup zone" if dislocation <= -20 else
+                              "Normal range",
+                        delta_color=delta_color,
+                    )
+
+                # Confirmation metrics
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("RSI", f"{bnf.get('rsi', 0):.1f}",
+                          delta="Oversold" if bnf.get("rsi", 50) < 30 else "Normal",
+                          delta_color="normal" if bnf.get("rsi", 50) < 30 else "off")
+                mc2.metric("MA 25", f"${bnf.get('ma_25', 0):.2f}")
+                mc3.metric("Current Price", f"${bnf.get('current_price', 0):.2f}")
+
+            # Thresholds explanation (collapsed by default)
+            with st.expander("📖 How this setup works"):
+                st.markdown("""
+                **The BNF Reversal Setup** (Takashi Kotegawa style):
+
+                - **Anchor**: 25-day moving average
+                - **Dislocation threshold**: price at least 20% below MA25
+                - **Extreme panic threshold**: price 35%+ below MA25
+                - **Confirmation**: RSI < 30 **OR** price below lower Bollinger Band
+                - **Holding period**: 2–6 days, exit as price reverts to the mean
+
+                **When it works**: high-volatility bear markets and panic-driven selloffs.
+                **When it fails**: strong trending bull markets — "oversold" stocks keep grinding lower.
+
+                This is a **short-term swing setup**, not a buy-and-hold signal. Cut losses
+                if the bounce doesn't materialize within 2–3 days.
+                """)
             # --- Download Data ---
             with st.expander("📥 Download Data"):
                 csv = analyzer.stock_data.to_csv()
@@ -1953,7 +2118,7 @@ def render_tqqq_sqqq_signals():
     # Manual refresh button — forces a fresh yfinance fetch
     refresh_col1, refresh_col2 = st.columns([1, 4])
     with refresh_col1:
-        if st.button("🔄 Refresh Signals", key="refresh_tqqq", use_container_width=True):
+        if st.button("🔄 Refresh Signals", key="refresh_tqqq", width="stretch"):
             st.cache_data.clear()
             st.rerun()
     with refresh_col2:
@@ -2020,7 +2185,7 @@ def render_tqqq_sqqq_signals():
             vote_df = pd.DataFrame(tqqq_signals["vote_details"])
             vote_df.columns = ["Strategy", "Target TQQQ %", "Reason"]
             vote_df["Target TQQQ %"] = vote_df["Target TQQQ %"].round(1)
-            st.dataframe(vote_df, use_container_width=True, hide_index=True)
+            st.dataframe(vote_df, width="stretch", hide_index=True)
 
             st.markdown("---")
             st.markdown(
@@ -2039,29 +2204,106 @@ def render_tqqq_sqqq_signals():
         st.markdown("---")
         st.markdown("#### 🎯 Position Calculator")
         st.caption(
-            "Enter your capital and current holdings. "
+            "Enter your current sleeve value and holdings. "
             "The calculator tells you exactly how many fractional shares to buy or sell."
         )
 
+        # --- Capital baseline strip (from data/capital.json) ---
+        _cap = load_capital()
+        starting = _cap.get("starting_capital", 0.0)
+        deposits = sum(x["amount"] for x in _cap.get("deposits", []))
+        withdrawals = sum(x["amount"] for x in _cap.get("withdrawals", []))
+        net_cap = starting + deposits - withdrawals
+
+        st.markdown("**Capital committed to this strategy**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Starting capital", f"${starting:,.2f}")
+        c2.metric("Net deposits", f"${deposits - withdrawals:+,.2f}")
+        c3.metric("Total committed", f"${net_cap:,.2f}")
+
         if "tqqq_capital" not in st.session_state:
-            st.session_state["tqqq_capital"] = 2470.0
+            st.session_state["tqqq_capital"] = net_cap
 
         colA, colB = st.columns([1, 1])
         with colA:
             account_value = st.number_input(
-                "Account value ($)",
+                "Current sleeve value — TQQQ + SQQQ from Fidelity Market Value ($)",
                 min_value=100.0,
                 max_value=1_000_000.0,
                 value=float(st.session_state["tqqq_capital"]),
                 step=10.0,
                 key="tqqq_capital_input",
+                help=(
+                    "Open Fidelity → Accounts & Trade → Portfolio → Positions. "
+                    "Add ONLY the Market Value of your TQQQ and SQQQ rows. "
+                    "Do not include cash, ACLS, EVVTY, INTC, LCID, or any other holding."
+                ),
+            )
+            st.caption(
+                "📋 Enter only TQQQ + SQQQ market value. "
+                "Cash and other positions are **not** part of this sleeve."
             )
             st.session_state["tqqq_capital"] = account_value
 
+        # --- Cumulative P&L banner ---
+        _running = compute_running_pnl()
+
+        if _running["net_capital"] > 0 and _running["sleeve_value"] > 0:
+            _pnl = _running["pnl_dollars"]
+            _pnl_pct = _running["pnl_pct"]
+
+            # Green when positive, red when negative
+            if _pnl > 0:
+                _pnl_color, _pnl_bg = "#00E676", "#1e4620"
+                _pnl_icon = "📈"
+            elif _pnl < 0:
+                _pnl_color, _pnl_bg = "#EF5350", "#4b1e1e"
+                _pnl_icon = "📉"
+            else:
+                _pnl_color, _pnl_bg = "#9AA0A6", "#2a2a2a"
+                _pnl_icon = "➖"
+
+            st.markdown(f"""
+            <div style="background-color:{_pnl_bg}; border:2px solid {_pnl_color};
+                        border-radius:10px; padding:1.25rem; margin:0.75rem 0;
+                        display:flex; align-items:center; justify-content:space-between;">
+                <div style="flex:1;">
+                    <div style="color:#9aa0a6; font-size:0.75rem; text-transform:uppercase;
+                                letter-spacing:0.05em;">
+                        Cumulative P&amp;L vs committed capital
+                    </div>
+                    <div style="color:{_pnl_color}; font-size:2.25rem; font-weight:700;
+                                line-height:1.1; margin-top:0.25rem;">
+                        {_pnl_icon} ${_pnl:+,.2f}
+                    </div>
+                    <div style="color:{_pnl_color}; font-size:1rem; margin-top:0.15rem;">
+                        {_pnl_pct:+.2f}%
+                    </div>
+                </div>
+                <div style="text-align:right; color:#9aa0a6; font-size:0.85rem;">
+                    <div>Sleeve value: <strong style="color:#e8eaed;">${_running['sleeve_value']:,.2f}</strong></div>
+                    <div>Committed: <strong style="color:#e8eaed;">${_running['net_capital']:,.2f}</strong></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.info(
+                "Cumulative P&L will appear once capital and a current position are recorded."
+            )
+
+            # P&L vs committed capital
+            pnl = account_value - net_cap
+            pnl_pct = (pnl / net_cap * 100) if net_cap > 0 else 0.0
+            st.metric(
+                "P&L vs committed capital",
+                f"${pnl:+,.2f}",
+                f"{pnl_pct:+.2f}%",
+                delta_color="normal" if pnl >= 0 else "inverse",
+            )
         with colB:
             try:
-                tqqq_price = yf.Ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
-                sqqq_price = yf.Ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
+                tqqq_price = get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
+                sqqq_price = get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
                 st.metric("TQQQ Price", f"${tqqq_price:.2f}")
                 st.metric("SQQQ Price", f"${sqqq_price:.2f}")
             except Exception as e:
@@ -2069,13 +2311,29 @@ def render_tqqq_sqqq_signals():
                 tqqq_price = 0.0
                 sqqq_price = 0.0
 
+        # --- Cross-check: entered sleeve value vs saved position ---
         if tqqq_price > 0 and sqqq_price > 0:
-            targets = compute_target_shares(
-                account_value=account_value,
-                tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
-                tqqq_price=tqqq_price,
-                sqqq_price=sqqq_price,
+            _pos_check = load_position()
+            _implied = (
+                _pos_check.get("tqqq_shares", 0.0) * tqqq_price
+                + _pos_check.get("sqqq_shares", 0.0) * sqqq_price
             )
+            if _implied > 0:
+                diff_pct = abs(account_value - _implied) / _implied * 100
+                if diff_pct > 5:
+                    st.warning(
+                        f"⚠️ Entered ${account_value:,.2f}, but the saved position "
+                        f"implies ${_implied:,.2f} ({diff_pct:.1f}% off). "
+                        f"Double-check the number from Fidelity."
+                    )
+
+            if tqqq_price > 0 and sqqq_price > 0:
+                targets = compute_target_shares(
+                    account_value=account_value,
+                    tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                    tqqq_price=tqqq_price,
+                    sqqq_price=sqqq_price,
+                )
 
             st.markdown("**Target Positions**")
             tc1, tc2 = st.columns(2)
@@ -2092,17 +2350,33 @@ def render_tqqq_sqqq_signals():
                     delta=f"${targets['sqqq_target_value']:.2f}",
                 )
 
+            _pos = load_position()
+
             st.markdown("**Your Current Holdings**")
             hc1, hc2 = st.columns(2)
             with hc1:
                 current_tqqq = st.number_input(
-                    "Current TQQQ shares", min_value=0.0,
-                    value=0.0, step=1.0, key="cur_tqqq",
+                    "Current TQQQ shares",
+                    min_value=0.0,
+                    value=float(_pos.get("tqqq_shares", 0.0)),
+                    step=0.001,
+                    format="%.4f",
+                    key="cur_tqqq_input",
                 )
             with hc2:
                 current_sqqq = st.number_input(
-                    "Current SQQQ shares", min_value=0.0,
-                    value=62.0, step=1.0, key="cur_sqqq",
+                    "Current SQQQ shares",
+                    min_value=0.0,
+                    value=float(_pos.get("sqqq_shares", 0.0)),
+                    step=0.001,
+                    format="%.4f",
+                    key="cur_sqqq_input",
+                )
+
+            if st.button("💾 Save current holdings", key="save_position"):
+                save_position(current_tqqq, current_sqqq)
+                st.success(
+                    f"Saved: TQQQ {current_tqqq:.4f}, SQQQ {current_sqqq:.4f}"
                 )
 
             rebalance = compute_rebalance(
@@ -2163,36 +2437,62 @@ def render_tqqq_sqqq_signals():
                     )
 
             # Log trade buttons
+            # Snapshot signal + target so a refresh between display and click
+            # can't desync what gets logged
+            signal_snapshot = tqqq_signals["signal"]
+            target_snapshot = tqqq_signals["target_tqqq_pct"]
+
             st.markdown("**Log These Trades**")
+            st.caption("Enter the actual share count from your Fidelity fill confirmation.")
             lc1, lc2 = st.columns(2)
 
             with lc1:
+                actual_tqqq_fill = st.number_input(
+                    "Actual TQQQ shares filled",
+                    min_value=0.0, value=0.0, step=0.001, format="%.4f",
+                    key="actual_tqqq_fill",
+                )
                 if st.button("✅ Log TQQQ trade", key="log_tqqq"):
-                    delta = rebalance["tqqq_delta_shares"]
-                    if abs(delta) >= 0.01:
+                    if actual_tqqq_fill > 0:
+                        delta = rebalance["tqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
                         log_trade(
                             ticker="TQQQ", action=action,
-                            shares=abs(delta), price=tqqq_price,
-                            signal=tqqq_signals["signal"],
-                            tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                            shares=abs(actual_tqqq_fill),
+                            price=tqqq_price,
+                            signal=signal_snapshot,
+                            tqqq_target_pct=target_snapshot,
                             account_value=account_value,
                         )
-                        st.success(f"Logged {action} {abs(delta):.4f} TQQQ @ ${tqqq_price:.2f}")
+                        st.success(
+                            f"Logged {action} {actual_tqqq_fill:.4f} TQQQ @ ${tqqq_price:.2f}"
+                        )
+                    else:
+                        st.info("Enter the filled share count above first.")
 
             with lc2:
+                actual_sqqq_fill = st.number_input(
+                    "Actual SQQQ shares filled",
+                    min_value=0.0, value=0.0, step=0.001, format="%.4f",
+                    key="actual_sqqq_fill",
+                )
                 if st.button("✅ Log SQQQ trade", key="log_sqqq"):
-                    delta = rebalance["sqqq_delta_shares"]
-                    if abs(delta) >= 0.01:
+                    if actual_sqqq_fill > 0:
+                        delta = rebalance["sqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
                         log_trade(
                             ticker="SQQQ", action=action,
-                            shares=abs(delta), price=sqqq_price,
-                            signal=tqqq_signals["signal"],
-                            tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                            shares=abs(actual_sqqq_fill),
+                            price=sqqq_price,
+                            signal=signal_snapshot,
+                            tqqq_target_pct=target_snapshot,
                             account_value=account_value,
                         )
-                        st.success(f"Logged {action} {abs(delta):.4f} SQQQ @ ${sqqq_price:.2f}")
+                        st.success(
+                            f"Logged {action} {actual_sqqq_fill:.4f} SQQQ @ ${sqqq_price:.2f}"
+                        )
+                    else:
+                        st.info("Enter the filled share count above first.")
 
         # ============================================================
         # TRADE HISTORY
@@ -2200,7 +2500,7 @@ def render_tqqq_sqqq_signals():
         st.markdown("---")
         st.markdown("#### 📒 Trade History")
 
-        trades_df = load_trades()
+        trades_df = compute_realized_pnl()
 
         if trades_df.empty:
             st.info("No trades logged yet. Use the Log buttons above to record your fills.")
@@ -2209,16 +2509,33 @@ def render_tqqq_sqqq_signals():
             buy_count = (trades_df["action"] == "BUY").sum()
             sell_count = (trades_df["action"] == "SELL").sum()
             total_volume = trades_df["total_value"].sum()
+            total_realized = trades_df["cumulative_realized_pnl"].iloc[-1]
 
-            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
             sc1.metric("Total trades", total_trades)
             sc2.metric("Buys", int(buy_count))
             sc3.metric("Sells", int(sell_count))
             sc4.metric("Total volume", f"${total_volume:,.2f}")
+            sc5.metric(
+                "Cumulative realized P&L",
+                f"${total_realized:+,.2f}",
+                delta_color="normal" if total_realized >= 0 else "inverse",
+            )
+
+            # Display sorted by time descending so the newest trade is at the top
+            display_df = trades_df.sort_values("timestamp", ascending=True).copy()
+
+            # Format the new columns for readability
+            display_df["realized_pnl_this_trade"] = display_df["realized_pnl_this_trade"].apply(
+                lambda v: f"${v:+,.2f}" if v else "—"
+            )
+            display_df["cumulative_realized_pnl"] = display_df["cumulative_realized_pnl"].apply(
+                lambda v: f"${v:+,.2f}"
+            )
 
             st.dataframe(
-                trades_df.sort_values("timestamp", ascending=False),
-                use_container_width=True,
+                display_df,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2234,7 +2551,7 @@ def render_tqqq_sqqq_signals():
         st.info("TQQQ/SQQQ strategies module not installed. "
                 "Create `tqqq_sqqq_strategies.py` to enable this feature.")
     except Exception as e:
-        st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")           
+        st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")
 
 tab_analyzer, tab_screener, tab_technical, tab_tqqq  = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener", "📈 Technical Analysis","🤖 TQQQ/SQQQ Signals",])
 

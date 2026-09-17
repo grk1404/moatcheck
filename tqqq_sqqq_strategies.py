@@ -16,7 +16,7 @@ Each strategy follows the same signature:
 Add new strategies by writing a function and registering it in STRATEGIES.
 """
 
-import yfinance as yf
+from data_provider import get_ticker
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -34,7 +34,7 @@ def load_strategy_data(period: str = "2y") -> dict:
     data = {}
     for ticker in ["QQQ", "TQQQ", "SQQQ"]:
         try:
-            df = yf.Ticker(ticker).history(period=period)
+            df = get_ticker(ticker).history(period=period)
             if df.empty:
                 continue
             data[ticker] = df
