@@ -28,20 +28,22 @@ from datetime import datetime, timedelta
 
 def load_strategy_data(period: str = "2y") -> dict:
     """
-    Fetch QQQ, TQQQ, SQQQ data and precompute common indicators.
+    Fetch QQQ, TQQQ, SQQQ data and precompute common indicators safely.
     All strategies read from this shared data dict.
     """
     data = {}
     for ticker in ["QQQ", "TQQQ", "SQQQ"]:
         try:
-            df = get_ticker(ticker).history(period=period)
+            ticker_obj = get_ticker(ticker)
+            df = ticker_obj.history(period=period)
             if df.empty:
                 continue
             data[ticker] = df
         except Exception as e:
             print(f"Failed to fetch {ticker}: {e}")
 
-    if "QQQ" not in data:
+    if "QQQ" not in data or len(data["QQQ"]) < 200:
+        print("Error: Insufficient data rows (< 200) returned for QQQ.")
         return {}
 
     qqq = data["QQQ"]
@@ -66,8 +68,15 @@ def load_strategy_data(period: str = "2y") -> dict:
     ind = data["_indicators"]
     ind["bb_upper"] = ind["bb_mid"] + 2 * ind["bb_std"]
     ind["bb_lower"] = ind["bb_mid"] - 2 * ind["bb_std"]
-    ind["bb_width"] = (ind["bb_upper"] - ind["bb_lower"]) / ind["bb_mid"]
-    ind["bb_position"] = (ind["price"] - ind["bb_lower"]) / (ind["bb_upper"] - ind["bb_lower"]) * 100
+    
+    # Protect against flatline (zero range) AND NaN (bad data) divisions.
+    # NaN != 0 is True in Python, so a bare `!= 0` check wouldn't catch it.
+    bb_range = ind["bb_upper"] - ind["bb_lower"]
+    denom_width = ind["bb_mid"] if pd.notna(ind["bb_mid"]) and ind["bb_mid"] != 0 else 1.0
+    denom_pos = bb_range if pd.notna(bb_range) and bb_range != 0 else 1.0
+
+    ind["bb_width"] = (bb_range if pd.notna(bb_range) else 0.0) / denom_width
+    ind["bb_position"] = ((ind["price"] - ind["bb_lower"]) / denom_pos * 100) if pd.notna(ind["price"]) else 50.0
 
     # Regime classification
     if ind["price"] > ind["sma_50"] > ind["sma_200"]:
@@ -81,11 +90,36 @@ def load_strategy_data(period: str = "2y") -> dict:
 
 
 def _compute_rsi(close: pd.Series, period: int = 14) -> float:
+    """Compute standard RSI using Wilder's smoothing with explicit guards.
+
+    NaN rows are dropped before computation; if fewer than period+1 valid
+    observations remain, returns 50.0 (neutral).
+    """
+    if close is None:
+        return 50.0
+
+    close = close.dropna()
+    if len(close) < period + 1:
+        return 50.0
+
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss
-    return (100 - 100 / (1 + rs)).iloc[-1]
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+
+    last_gain = avg_gain.iloc[-1]
+    last_loss = avg_loss.iloc[-1]
+
+    if pd.isna(last_gain) or pd.isna(last_loss):
+        return 50.0
+
+    if last_loss == 0:
+        return 100.0 if last_gain > 0 else 50.0
+
+    rs = last_gain / last_loss
+    return float(100 - (100 / (1 + rs)))
 
 
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -208,13 +242,20 @@ def strategy_short_reversion(data: dict) -> dict:
 # ============================================================
 
 def strategy_bear_bounce_fade(data: dict) -> dict:
+    """Strategy 7: Bearish Bounce Fade with structural completeness."""
     ind = data["_indicators"]
     dist = ind["dist_from_sma50"]
     regime = ind["regime"]
 
+    # Trap a massive short-squeeze bear rally overextending upward near the SMA 50
+    if regime == "BEAR" and dist > -0.02:
+        return {"name": "Bear Bounce Fade", "target_tqqq": 0.0,
+                "reason": f"Bear market rally overextended ({dist*100:.1f}% from SMA50) — heavy short fade active"}
+    
     if regime == "BEAR" and dist < -0.10:
         return {"name": "Bear Bounce Fade", "target_tqqq": 0.3,
-                "reason": "Bear regime oversold bounce — fade strength"}
+                "reason": "Bear regime deeply oversold bounce — fade strength"}
+                
     return {"name": "Bear Bounce Fade", "target_tqqq": 0.5,
             "reason": "No bear-bounce setup"}
 
@@ -234,14 +275,15 @@ STRATEGIES = [
 ]
 
 
+
 # ============================================================
 # COORDINATOR - Runs all strategies and aggregates votes
 # ============================================================
 
 def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
     """
-    Run all registered strategies and aggregate their votes.
-    Returns the target allocation plus per-strategy vote details.
+    Run all registered strategies and aggregate their votes with symmetrical scaling.
+    Returns the target allocation plus per-strategy vote details with tolerance bands.
     """
     if data is None:
         data = load_strategy_data(period)
@@ -270,7 +312,7 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
         return {"error": "All strategies failed"}
 
     # Average vote = base allocation
-    target_tqqq = sum(votes) / len(votes)
+    base_tqqq = sum(votes) / len(votes)
 
     # Position multiplier based on BB width (trend strength)
     if ind["regime"] in ("BULL", "BEAR") and ind["bb_width"] > 0.10:
@@ -278,20 +320,52 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
     else:
         position_multiplier = 0.8
 
-    target_tqqq = min(1.0, target_tqqq * position_multiplier)
+    # Scale conviction symmetrically away from the 0.50 neutral baseline midpoint.
+    deviation = base_tqqq - 0.50
+    target_tqqq = 0.50 + (deviation * position_multiplier)
+    
+    # Bound exposures safely between 0.0 and 1.0 (0% to 100%)
+    target_tqqq = max(0.0, min(1.0, target_tqqq))
     target_sqqq = 1.0 - target_tqqq
 
-    # Signal classification
-    if target_tqqq > 0.6:
-        signal, signal_type = "TQQQ HEAVY", "long"
-    elif target_tqqq > 0.4:
-        signal, signal_type = "MILD TQQQ", "long_light"
-    elif target_sqqq > 0.6:
-        signal, signal_type = "SQQQ HEAVY", "short"
-    elif target_sqqq > 0.4:
-        signal, signal_type = "MILD SQQQ", "short_light"
-    else:
+    # FIX: Define a neutral dead-zone tolerance band around the 50/50 baseline midpoint.
+    # A threshold of 0.02 means allocations between 48.0% and 52.0% are labeled BALANCED.
+    NEUTRAL_THRESHOLD = 0.02
+    EPSILON = 1e-9   # tolerate floating-point representation error
+
+    # ============================================================
+    # SIGNAL CLASSIFICATION — bands are symmetric around 50/50
+    # ============================================================
+    #
+    #  target_tqqq       Label           Signal type
+    #  ───────────       ─────           ───────────
+    #  0.00 – 0.40       SQQQ HEAVY      short        (SQQQ >= 60%)
+    #  0.40 – 0.48       MILD SQQQ       short_light  (SQQQ 52–60%)
+    #  0.48 – 0.52       BALANCED        neutral      (within ±2% of even)
+    #  0.52 – 0.60       MILD TQQQ       long_light   (TQQQ 52–60%)
+    #  0.60 – 1.00       TQQQ HEAVY      long         (TQQQ >= 60%)
+    #
+    #  Boundary semantics:
+    #    - Bands are half-open on the upper edge: [lo, hi)
+    #    - The 0.60 boundary belongs to MILD TQQQ, not TQQQ HEAVY
+    #      (fires only when target_tqqq > 0.60, not >=)
+    #    - The 0.40 boundary belongs to MILD SQQQ, not SQQQ HEAVY
+    #      (fires only when target_sqqq > 0.60, not >=)
+    #
+    #  EPSILON (1e-9) absorbs floating-point representation error.
+    #  Without it, a target of 0.48 evaluates abs(0.48 - 0.50) as
+    #  0.020000000000000018 > 0.02 and silently escapes the dead-zone.
+    # ============================================================
+    if abs(target_tqqq - 0.50) <= NEUTRAL_THRESHOLD + EPSILON:
         signal, signal_type = "BALANCED", "neutral"
+    elif target_tqqq > 0.60:
+        signal, signal_type = "TQQQ HEAVY", "long"
+    elif target_tqqq > 0.50:
+        signal, signal_type = "MILD TQQQ", "long_light"
+    elif target_sqqq > 0.60:
+        signal, signal_type = "SQQQ HEAVY", "short"
+    else:
+        signal, signal_type = "MILD SQQQ", "short_light"
 
     return {
         "signal": signal,
