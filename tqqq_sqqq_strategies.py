@@ -42,9 +42,19 @@ def load_strategy_data(period: str = "2y") -> dict:
         except Exception as e:
             print(f"Failed to fetch {ticker}: {e}")
 
-    if "QQQ" not in data or len(data["QQQ"]) < 200:
-        print("Error: Insufficient data rows (< 200) returned for QQQ.")
+    if "QQQ" not in data:
+        print("Error: QQQ data missing entirely.")
         return {}
+
+    # Drop rows with NaN Close before checking length.
+    # len() alone doesn't catch a truncated fetch where the frame has the
+    # right number of rows but the most recent rows have NaN values.
+    qqq_clean = data["QQQ"].dropna(subset=["Close"])
+    if len(qqq_clean) < 200:
+        print(f"Error: Insufficient valid QQQ rows ({len(qqq_clean)} < 200).")
+        return {}
+
+    data["QQQ"] = qqq_clean
 
     qqq = data["QQQ"]
     close = qqq["Close"]
@@ -356,16 +366,16 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
     #  Without it, a target of 0.48 evaluates abs(0.48 - 0.50) as
     #  0.020000000000000018 > 0.02 and silently escapes the dead-zone.
     # ============================================================
-    if abs(target_tqqq - 0.50) <= NEUTRAL_THRESHOLD + EPSILON:
-        signal, signal_type = "BALANCED", "neutral"
-    elif target_tqqq > 0.60:
+    if target_tqqq > 0.60 + EPSILON:
         signal, signal_type = "TQQQ HEAVY", "long"
-    elif target_tqqq > 0.50:
+    elif target_tqqq > 0.50 + NEUTRAL_THRESHOLD + EPSILON:
         signal, signal_type = "MILD TQQQ", "long_light"
-    elif target_sqqq > 0.60:
-        signal, signal_type = "SQQQ HEAVY", "short"
-    else:
+    elif target_tqqq >= 0.50 - NEUTRAL_THRESHOLD - EPSILON:
+        signal, signal_type = "BALANCED", "neutral"
+    elif target_tqqq >= 0.40 - EPSILON:
         signal, signal_type = "MILD SQQQ", "short_light"
+    else:
+        signal, signal_type = "SQQQ HEAVY", "short"
 
     return {
         "signal": signal,

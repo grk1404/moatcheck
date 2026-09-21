@@ -2254,33 +2254,33 @@ def render_tqqq_sqqq_signals():
 
             # Green when positive, red when negative
             if _pnl > 0:
-                _pnl_color, _pnl_bg = "#00E676", "#1e4620"
-                _pnl_icon = "📈"
+                _pnl_color, _pnl_bg, _pnl_icon = "#00E676", "#1e4620", "📈"
             elif _pnl < 0:
-                _pnl_color, _pnl_bg = "#EF5350", "#4b1e1e"
-                _pnl_icon = "📉"
+                _pnl_color, _pnl_bg, _pnl_icon = "#EF5350", "#4b1e1e", "📉"
             else:
-                _pnl_color, _pnl_bg = "#9AA0A6", "#2a2a2a"
-                _pnl_icon = "➖"
+                _pnl_color, _pnl_bg, _pnl_icon = "#9AA0A6", "#2a2a2a", "➖"
 
             st.markdown(f"""
             <div style="background-color:{_pnl_bg}; border:2px solid {_pnl_color};
-                        border-radius:10px; padding:1.25rem; margin:0.75rem 0;
-                        display:flex; align-items:center; justify-content:space-between;">
-                <div style="flex:1;">
+                        border-radius:10px; padding:1.5rem; margin:0.75rem 0;
+                        display:flex; align-items:center; justify-content:space-between;
+                        flex-wrap:wrap; gap:1rem;">
+                <div style="flex:1; min-width:220px;">
                     <div style="color:#9aa0a6; font-size:0.75rem; text-transform:uppercase;
                                 letter-spacing:0.05em;">
                         Cumulative P&amp;L vs committed capital
                     </div>
-                    <div style="color:{_pnl_color}; font-size:2.25rem; font-weight:700;
-                                line-height:1.1; margin-top:0.25rem;">
+                    <div style="color:{_pnl_color}; font-size:3rem; font-weight:700;
+                                line-height:1.05; margin-top:0.35rem;">
                         {_pnl_icon} ${_pnl:+,.2f}
                     </div>
-                    <div style="color:{_pnl_color}; font-size:1rem; margin-top:0.15rem;">
+                    <div style="color:{_pnl_color}; font-size:1.1rem; font-weight:600;
+                                margin-top:0.25rem;">
                         {_pnl_pct:+.2f}%
                     </div>
                 </div>
-                <div style="text-align:right; color:#9aa0a6; font-size:0.85rem;">
+                <div style="text-align:right; color:#9aa0a6; font-size:0.9rem;
+                            line-height:1.6;">
                     <div>Sleeve value: <strong style="color:#e8eaed;">${_running['sleeve_value']:,.2f}</strong></div>
                     <div>Committed: <strong style="color:#e8eaed;">${_running['net_capital']:,.2f}</strong></div>
                 </div>
@@ -2456,6 +2456,8 @@ def render_tqqq_sqqq_signals():
                     if actual_tqqq_fill > 0:
                         delta = rebalance["tqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
+
+                        # 1. Append to the trade log
                         log_trade(
                             ticker="TQQQ", action=action,
                             shares=abs(actual_tqqq_fill),
@@ -2464,9 +2466,28 @@ def render_tqqq_sqqq_signals():
                             tqqq_target_pct=target_snapshot,
                             account_value=account_value,
                         )
-                        st.success(
-                            f"Logged {action} {actual_tqqq_fill:.4f} TQQQ @ ${tqqq_price:.2f}"
+
+                        # 2. Update the position file with the new TQQQ total
+                        _pos = load_position()
+                        _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
+                        _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
+                        _new_tqqq = (
+                            _cur_tqqq + abs(actual_tqqq_fill)
+                            if action == "BUY"
+                            else _cur_tqqq - abs(actual_tqqq_fill)
                         )
+                        _new_tqqq = max(0.0, _new_tqqq)   # never go negative
+                        save_position(_new_tqqq, _cur_sqqq)
+
+                        # 3. Sync the UI widgets so the new values appear immediately
+                        st.session_state["cur_tqqq_input"] = _new_tqqq
+                        st.session_state["cur_sqqq_input"] = _cur_sqqq
+                        st.session_state["actual_tqqq_fill"] = 0.0
+                        st.session_state["_last_log_msg"] = (
+                            f"Logged {action} {abs(actual_tqqq_fill):.4f} TQQQ @ ${tqqq_price:.2f}. "
+                            f"Holdings now {_new_tqqq:.4f} TQQQ."
+                        )
+                        st.rerun()
                     else:
                         st.info("Enter the filled share count above first.")
 
@@ -2480,6 +2501,7 @@ def render_tqqq_sqqq_signals():
                     if actual_sqqq_fill > 0:
                         delta = rebalance["sqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
+
                         log_trade(
                             ticker="SQQQ", action=action,
                             shares=abs(actual_sqqq_fill),
@@ -2488,12 +2510,33 @@ def render_tqqq_sqqq_signals():
                             tqqq_target_pct=target_snapshot,
                             account_value=account_value,
                         )
-                        st.success(
-                            f"Logged {action} {actual_sqqq_fill:.4f} SQQQ @ ${sqqq_price:.2f}"
+
+                        _pos = load_position()
+                        _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
+                        _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
+                        _new_sqqq = (
+                            _cur_sqqq + abs(actual_sqqq_fill)
+                            if action == "BUY"
+                            else _cur_sqqq - abs(actual_sqqq_fill)
                         )
+                        _new_sqqq = max(0.0, _new_sqqq)
+                        save_position(_cur_tqqq, _new_sqqq)
+
+                        st.session_state["cur_tqqq_input"] = _cur_tqqq
+                        st.session_state["cur_sqqq_input"] = _new_sqqq
+                        st.session_state["actual_sqqq_fill"] = 0.0
+                        st.session_state["_last_log_msg"] = (
+                            f"Logged {action} {abs(actual_sqqq_fill):.4f} SQQQ @ ${sqqq_price:.2f}. "
+                            f"Holdings now {_new_sqqq:.4f} SQQQ."
+                        )
+                        st.rerun()
                     else:
                         st.info("Enter the filled share count above first.")
 
+            # Show the success message from a rerun (if any)
+            _msg = st.session_state.pop("_last_log_msg", None)
+            if _msg:
+                st.success(_msg)
         # ============================================================
         # TRADE HISTORY
         # ============================================================
