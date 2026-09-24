@@ -481,44 +481,7 @@ def render_analyzer() -> None:
         "Graham Formula, and PEG. Enter a ticker to compute all methods side-by-side."
     )
 
-    with st.sidebar:
-        st.header("Valuation knobs")
-        dcf_discount = st.slider(
-            "DCF discount rate",
-            min_value=6.0,
-            max_value=15.0,
-            value=10.0,
-            step=0.5,
-            format="%.1f%%",
-            help="Required annual return. 10% = long-run S&P 500 average; 15% = Buffet's aggressive rate.",
-        ) / 100
-        dcf_terminal = st.slider(
-            "DCF terminal growth",
-            min_value=0.0,
-            max_value=4.0,
-            value=2.5,
-            step=0.5,
-            format="%.1f%%",
-            help="Perpetual growth rate after the fade period. Should be <= long-run GDP growth (~2.5-3%).",
-        ) / 100
-        aaa_yield = st.slider(
-            "AAA corporate bond yield (for Graham Formula)",
-            min_value=2.0,
-            max_value=10.0,
-            value=4.5,
-            step=0.5,
-            format="%.1f%%",
-            help="Current AAA corporate bond yield. Used in Graham's revised 1974 formula.",
-        ) / 100
-        mos_pct = st.slider(
-            "Margin of Safety (Lynch/Graham/PEG)",
-            min_value=10.0,
-            max_value=60.0,
-            value=25.0,
-            step=5.0,
-            format="%.1f%%",
-            help="Discount applied to fair value to get a buy price. MOS uses a fixed 50% on Value Price.",
-        ) / 100
+    
         
     with st.form("analyze"):
         col_a, col_b, col_c = st.columns([2, 1, 5])
@@ -685,6 +648,93 @@ def render_analyzer() -> None:
 
     st.markdown("### Valuation")
 
+    # Compute Big 5 EPS growth FIRST so the DCF section can use it
+    big5_eps_g = _big5_eps_growth(big5)
+
+    # ============================================================
+    # DCF METHOD VALUATION
+    # ============================================================
+    st.markdown("#### DCF Method Valuation")
+    st.caption(
+        "Discounted Cash Flow — projects free cash flow forward and discounts "
+        "it back to today. Adjust the two assumptions below; only this section "
+        "reacts to the sliders."
+    )
+    dcf_col1, dcf_col2 = st.columns(2)
+    with dcf_col1:
+        dcf_discount = st.slider(
+            "DCF discount rate",
+            min_value=6.0,
+            max_value=15.0,
+            value=10.0,
+            step=0.5,
+            format="%.1f%%",
+            help="Required annual return. 10% = long-run S&P 500 average; 15% = Buffett's aggressive rate.",
+            key="dcf_discount_slider",
+        ) / 100
+    with dcf_col2:
+        dcf_terminal = st.slider(
+            "DCF terminal growth",
+            min_value=0.0,
+            max_value=4.0,
+            value=2.5,
+            step=0.5,
+            format="%.1f%%",
+            help="Perpetual growth rate after the fade period. Should be <= long-run GDP growth (~2.5-3%).",
+            key="dcf_terminal_slider",
+        ) / 100
+
+    st.caption(f"DEBUG: discount={dcf_discount:.4f}, terminal={dcf_terminal:.4f}")
+
+    # Run the two-stage DCF with these inputs
+    _fcf_ttm_dcf = float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None
+    _growth_dcf = big5_eps_g if big5_eps_g is not None else fin.analyst_5yr_growth
+    _dcf_val = dcf_two_stage(
+        fcf_ttm=_fcf_ttm_dcf,
+        shares_out=fin.shares_outstanding,
+        current_price=fin.current_price,
+        growth_rate=_growth_dcf,
+        discount_rate=dcf_discount,
+        terminal_growth=dcf_terminal,
+    )
+    st.caption(f"DEBUG: dcf fair_value={_dcf_val.fair_value if _dcf_val else None}")
+    if _dcf_val is None:
+        st.info("DCF not computable — needs positive TTM free cash flow and shares outstanding.")
+    else:
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.metric("DCF Fair Value", _fmt_money(_dcf_val.fair_value, fin.exchange, fin.ticker))
+        with d2:
+            st.metric("DCF MOS Buy Price", _fmt_money(_dcf_val.mos_price, fin.exchange, fin.ticker))
+        with d3:
+            st.metric(
+                "DCF Upside",
+                _fmt_pct(_dcf_val.upside_pct) if _dcf_val.upside_pct is not None else "n/a",
+            )
+        with d4:
+            st.metric("DCF Verdict", _dcf_val.verdict)
+
+        with st.expander("How the DCF was calculated"):
+            st.markdown(
+                f"""
+                **Inputs**
+                - TTM Free Cash Flow: **{_fmt_money(_fcf_ttm_dcf, fin.exchange, fin.ticker)}**
+                - Shares outstanding: **{fin.shares_outstanding:,.0f}** *(from yfinance)*
+                - Projection growth rate: **{_fmt_pct(_growth_dcf)}**
+                - Discount rate (WACC proxy): **{_fmt_pct(dcf_discount)}**
+                - Terminal growth: **{_fmt_pct(dcf_terminal)}**
+
+                **Method**
+                Two-stage DCF: FCF grows at the projection rate for a fade period,
+                then settles into perpetual terminal growth. All cash flows are
+                discounted at the required return rate. Fair value is divided by
+                shares outstanding to get a per-share price. MOS Buy Price applies
+                a 25% margin of safety.
+                """
+            )
+
+    st.markdown("---")
+
     # --- EPS selection: prefer latest year, but fall back to a 3yr positive-EPS
     # average when the latest year is negative (value Price and other formulas
     # can't handle negative earnings). This surfaces to the user as an amber note.
@@ -710,9 +760,7 @@ def render_analyzer() -> None:
             f"average of the last {len(_normalized_years)} positive years ({yrs_txt}). "
             f"Treat these valuations as guidance about what this business *could* be worth "
             f"if it returns to prior profitability, not what it's worth today."
-        )
-
-    big5_eps_g = _big5_eps_growth(big5)
+        )    
 
     def _moat_conservative_growth() -> float | None:
         """Return a conservative 15% growth rate for Buffett-style valuation."""
@@ -1083,6 +1131,32 @@ def render_analyzer() -> None:
     - = **{_fmt_money(val.mos_price, fin.exchange, fin.ticker)}**  ← *MOS Buy Price*
     """.strip()
             )
+
+    # Assumptions for the other methods (Graham Formula and Lynch/Graham/PEG MOS)
+    with st.expander("⚙️ Assumptions for the other methods", expanded=False):
+        a_col1, a_col2 = st.columns(2)
+        with a_col1:
+            aaa_yield = st.slider(
+                "AAA corporate bond yield (Graham Formula)",
+                min_value=2.0,
+                max_value=10.0,
+                value=4.5,
+                step=0.5,
+                format="%.1f%%",
+                help="Used in Graham's revised 1974 formula.",
+                key="aaa_yield_slider",
+            ) / 100
+        with a_col2:
+            mos_pct = st.slider(
+                "Margin of Safety (Lynch/Graham/PEG)",
+                min_value=10.0,
+                max_value=60.0,
+                value=25.0,
+                step=5.0,
+                format="%.1f%%",
+                help="Discount applied to fair value to get a buy price.",
+                key="mos_pct_slider",
+            ) / 100
 
     _tip_other = _VERDICT_TOOLTIP_SECTION.replace('"', "&quot;")
     st.markdown(
@@ -2184,8 +2258,52 @@ def render_tqqq_sqqq_signals():
         with st.expander("📋 Sub-Strategy Votes"):
             vote_df = pd.DataFrame(tqqq_signals["vote_details"])
             vote_df.columns = ["Strategy", "Target TQQQ %", "Reason"]
+
+            # --- Derived insight columns ---------------------------------------
+            # 1. Implied SQQQ %: if the sub-strategy is fully allocated, whatever
+            #    isn't TQQQ is presumed to be the short-side vote.
+            vote_df["Target SQQQ %"] = (100 - vote_df["Target TQQQ %"]).round(1)
+
+            # 2. Equal-weight contribution to the final aggregated target.
+            n = len(vote_df)
+            vote_df["Weight"] = f"{100 / n:.1f}%"
+            vote_df["Contribution"] = (vote_df["Target TQQQ %"] / n).round(1)
+
+            # 3. Net directional bias per sub-strategy.
+            vote_df["Bias"] = vote_df["Target TQQQ %"].apply(
+                lambda v: "Bullish" if v >= 60 else ("Bearish" if v <= 40 else "Neutral")
+            )
+
+            # Order columns for readability
+            vote_df = vote_df[
+                ["Strategy", "Target TQQQ %", "Target SQQQ %",
+                "Weight", "Contribution", "Bias", "Reason"]
+            ]
+
+            # Round the numeric columns
             vote_df["Target TQQQ %"] = vote_df["Target TQQQ %"].round(1)
-            st.dataframe(vote_df, width="stretch", hide_index=True)
+
+            # --- Center the numeric columns, left-align text columns -----------
+            numeric_cols = ["Target TQQQ %", "Target SQQQ %", "Weight", "Contribution", "Bias"]
+
+            styled = (
+                vote_df.style
+                .set_properties(subset=numeric_cols, **{"text-align": "center"})
+                .set_properties(subset=["Strategy", "Reason"], **{"text-align": "left"})
+            )
+
+            st.dataframe(styled, width="stretch", hide_index=True)
+
+            st.markdown("---")
+            st.markdown(
+                f"**Aggregated target**: "
+                f"{tqqq_signals['target_tqqq_pct']:.1f}% TQQQ / "
+                f"{tqqq_signals['target_sqqq_pct']:.1f}% SQQQ"
+            )
+            st.caption(
+                "Each strategy votes independently; the average becomes the daily target. "
+                "Position size is adjusted by BB width (trend strength)."
+            )
 
             st.markdown("---")
             st.markdown(
