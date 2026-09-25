@@ -27,7 +27,7 @@ warnings.filterwarnings('ignore')
 # Import the technical indicator analyzer
 from technical_indicators import TechnicalIndicatorAnalyzer
 
-#Global constants
+# Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
 
 def clear_analyzer_cache():
@@ -56,10 +56,6 @@ from moatcheck import (
     peter_lynch_fair,
     value_price,
 )
-# import inspect
-
-# st.write("value_price loaded from:", inspect.getsourcefile(value_price))
-# st.write("value_price signature:", inspect.signature(value_price))
 
 from moatcheck.big5 import WINDOWS, PASS_THRESHOLD
 from moatcheck.fetcher import FetchError
@@ -124,6 +120,20 @@ def _fmt_money(v: float | None, exchange: str = "", ticker: str = "") -> str:
         return f"{currency}{v / 1e6:.2f}M"
     return f"{currency}{v:,.2f}"
 
+def _as_fraction(value, *, is_percent: bool) -> float | None:
+    """Normalize a Yahoo Finance percentage-ish field to a fraction.
+
+    Yahoo returns some fields as fractions (yield=0.0098 means 0.98%)
+    and others as percents (netExpenseRatio=0.0945 means 0.0945%).
+    Pass is_percent=True when the raw value is already a percent.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v / 100.0 if is_percent else v
 
 def _color_pass(val: float | None) -> str:
     if val is None:
@@ -133,26 +143,6 @@ def _color_pass(val: float | None) -> str:
     return "background-color: #4b1e1e; color: #f0b6b6;"
 
 
-# def _render_big5_table(big5: Big5Result) -> None:
-#     df = big5.as_dataframe()
-#     display = df.copy()
-#     for w in WINDOWS:
-#         col = f"{w}yr"
-#         display[col] = display[col].map(_fmt_pct)
-#     display["pass"] = display["pass"].map(lambda p: "PASS" if p else "FAIL")
-#     display = display.rename(columns={"metric": "Metric", "pass": "Verdict"})
-
-#     def _style(row):
-#         original = df.loc[row.name]
-#         out = [""]  # Metric column
-#         for w in WINDOWS:
-#             out.append(_color_pass(original[f"{w}yr"]))
-#         out.append(
-#             "background-color: #1e4620; color: #b6f0b6;"
-#             if original["pass"]
-#             else "background-color: #4b1e1e; color: #f0b6b6;"
-#         )
-#         return out
 def _render_big5_table(big5: Big5Result) -> None:
     df = big5.as_dataframe()
 
@@ -281,204 +271,244 @@ def _big5_eps_growth(big5: Big5Result) -> float | None:
     return None
 
 
-st.markdown(
-    """
-    <div style="margin-bottom: 0.5rem;">
-        <div style="font-size: 1.1rem; font-weight: 500; color: #4CAF50; letter-spacing: 0.04em; margin-bottom: 0.35rem;">
-            Find Great Businesses at Attractive Prices
-        </div>
-        <div style="font-size: 2.75rem; font-weight: 700; line-height: 1.1;">
-            MoatCheck<span style="font-weight: 400; color: #9aa0a6; font-size: 1.6rem; margin-left: 0.5rem;">— Modern Value Investing Stock Scanner and Advanced Screeners</span>
-        </div>
-        <div style="font-size: 0.85rem; color: #9aa0a6; margin-top: 0.15rem;">
-            Modern Value Investing with base principles rooted in the  Benjamin Graham, David Dodd, Warren Buffett and Charlie Munger.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# #def _inject_tab_styles() -> None:
-#     """Rounded-square tab styling (also in .streamlit/style.css for reload)."""
-#     st.markdown(
-#         """
-#         <style>
-#         .stTabs [data-baseweb="tab-list"] {
-#             gap: 0.75rem;
-#             background-color: transparent;
-#             border-bottom: none;
-#             padding-bottom: 0.25rem;
-#         }
-#         .stTabs [data-baseweb="tab-border"] { display: none; }
-#         .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"],
-#         .stTabs [data-baseweb="tab-list"] button[role="tab"] {
-#             height: auto;
-#             min-height: 2.75rem;
-#             background-color: rgba(255, 255, 255, 0.05);
-#             border: 1.5px solid rgba(255, 255, 255, 0.14);
-#             border-radius: 10px;
-#             padding: 0.65rem 1.5rem;
-#             color: #9aa0a6;
-#             font-weight: 600;
-#             font-size: 0.95rem;
-#         }
-#         .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"]:hover,
-#         .stTabs [data-baseweb="tab-list"] button[role="tab"]:hover {
-#             background-color: rgba(255, 255, 255, 0.09);
-#             border-color: rgba(76, 175, 80, 0.5);
-#             color: #e8eaed;
-#         }
-#         .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"],
-#         .stTabs [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] {
-#             background-color: rgba(76, 175, 80, 0.2);
-#             border-color: #4CAF50;
-#             color: #b6f0b6;
-#             box-shadow: 0 0 0 1px rgba(76, 175, 80, 0.3);
-#         }
-#         .stTabs [data-baseweb="tab-panel"] { padding-top: 1rem; }
-#         </style>
-#         """,
-#         unsafe_allow_html=True,
-#     )
-
-# RG new function replaces the above function for makign TABS prominent.
 def _inject_tab_styles() -> None:
-    """Inject attached light-grey rounded tab headers with a full content border box."""
+    """Global CSS: buttons, headers, links, sidebar nav styling."""
     st.markdown(
         """
         <style>
-        /* 1. Main Tab Bar Container Alignment */
-        div[data-testid="stTabs"] {
-            margin-top: 0.5rem;
-        }
-
-        /* Remove spacing gap between tabs and flush them together */
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 0px !important;
-            background-color: transparent !important;
-            border-bottom: none !important;
-            padding: 0px !important;
-            margin-bottom: -2px !important; /* Overlap header seamlessly with panel border */
-            z-index: 2 !important;
-        }
-
-        /* Hide Streamlit's default red/blue underline */
-        .stTabs [data-baseweb="tab-border"],
-        .stTabs [data-baseweb="tab-highlight-title"] {
-            display: none !important;
-        }
-
-        /* 2. Inactive Tabs: Light Grey attached tiles */
-        .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"],
-        .stTabs [data-baseweb="tab-list"] button[role="tab"],
-        div[data-testid="stTab"] {
-            height: auto !important;
-            min-height: 48px !important;
-            padding: 12px 28px !important;
-            /* Top rounded corners only so they sit flat on the content box */
-            border-top-left-radius: 10px !important;
-            border-top-right-radius: 10px !important;
-            border-bottom-left-radius: 0px !important;
-            border-bottom-right-radius: 0px !important;
-            background-color: #E2E8F0 !important;         /* Light Grey card fill */
-            border: 2px solid #CBD5E1 !important;          /* Slate grey border */
-            border-bottom: none !important;                /* Flush against content panel */
-            color: #1E293B !important;                    /* Dark slate readable text */
-            font-weight: 700 !important;
-            font-size: 1.05rem !important;
-            cursor: pointer !important;
-            margin-right: -2px !important;                 /* Overlap borders so they connect */
-            transition: background-color 0.2s ease !important;
-        }
-
-        /* Enforce child text color */
-        .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"] *,
-        .stTabs [data-baseweb="tab-list"] button[role="tab"] * {
+        /* ----- Buttons ----- */
+        div.stButton > button,
+        div[data-testid="stForm"] button,
+        button {
+            background-color: #B0B8C0 !important;
             color: #1E293B !important;
+            border: none !important;
             font-weight: 700 !important;
+            border-radius: 8px !important;
+            padding: 0.5rem 1.5rem !important;
+            transition: all 0.2s ease !important;
+        }
+        div.stButton > button:hover,
+        div[data-testid="stForm"] button:hover,
+        button:hover {
+            background-color: #C8D0D8 !important;
+            color: #1E293B !important;
+            border: none !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
+            transform: translateY(-1px) !important;
+        }
+        div.stButton > button:active,
+        div[data-testid="stForm"] button:active,
+        button:active {
+            background-color: #9AA2AA !important;
+            transform: translateY(0px) !important;
         }
 
-        /* 3. Hover State */
-        .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"]:hover,
-        .stTabs [data-baseweb="tab-list"] button[role="tab"]:hover {
-            background-color: #F8FAFC !important;
+        /* ----- Sidebar navigation links (Yahoo-Mail style) ----- */
+        section[data-testid="stSidebar"] {
+            background-color: #0b0f14;
+            border-right: 1px solid rgba(255,255,255,0.06);
         }
-
-        /* 4. Active Selected Tab: Soft Light Green with Bold Border */
-        .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"],
-        .stTabs [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] {
-            background-color: #E8F5E9 !important;         /* Light pastel green */
-            border: 2px solid #4CAF50 !important;          /* Green border matching panel */
-            border-bottom: 2px solid #E8F5E9 !important;   /* Conceal bottom border to merge into panel */
-            position: relative !important;
-            z-index: 3 !important;                         /* Sits above the panel border line */
+        section[data-testid="stSidebar"] a[data-testid="stPageLink-NavLink"] {
+            padding: 0.7rem 0.9rem !important;
+            border-radius: 8px !important;
+            color: #c5c8cd !important;
+            font-weight: 600 !important;
+            font-size: 0.95rem !important;
+            transition: background-color 0.15s ease !important;
+            margin-bottom: 2px;
         }
-
-        /* Active tab text color */
-        .stTabs [data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"] *,
-        .stTabs [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] * {
-            color: #1B5E20 !important;
-            font-weight: 800 !important;
+        section[data-testid="stSidebar"] a[data-testid="stPageLink-NavLink"]:hover {
+            background-color: rgba(255,255,255,0.06) !important;
+            color: #e8eaed !important;
         }
-
-        /* 5. Full Border Enclosure around the Tab Content Below */
-        .stTabs [data-baseweb="tab-panel"] {
-            background-color: #0E1117 !important;         /* Dark background interior */
-            border: 2px solid #4CAF50 !important;          /* Full border outline around content */
-            border-radius: 0px 12px 12px 12px !important;  /* Rounded corners except top-left under first tab */
-            padding: 1.5rem !important;
-            margin-top: 0px !important;
-            position: relative !important;
-            z-index: 1 !important;
-            box-shadow: 0px 8px 24px rgba(0, 0, 0, 0.4) !important;
+        section[data-testid="stSidebar"] a[data-testid="stPageLink-NavLink"][aria-current="page"] {
+            background-color: rgba(76, 175, 80, 0.16) !important;
+            color: #b6f0b6 !important;
+            border-left: 3px solid #4CAF50 !important;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+
 _inject_tab_styles()
 
-st.markdown(
-    """
-    <style>
-    /* Override all Streamlit buttons */
-    div.stButton > button,
-    div[data-testid="stForm"] button,
-    button {
-        background-color: #B0B8C0 !important;
-        color: #1E293B !important;
-        border: none !important;
-        font-weight: 700 !important;
-        border-radius: 8px !important;
-        padding: 0.5rem 1.5rem !important;
-        transition: all 0.2s ease !important;
-    }
-    div.stButton > button:hover,
-    div[data-testid="stForm"] button:hover,
-    button:hover {
-        background-color: #C8D0D8 !important;
-        color: #1E293B !important;
-        border: none !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
-        transform: translateY(-1px) !important;
-    }
-    div.stButton > button:active,
-    div[data-testid="stForm"] button:active,
-    button:active {
-        background-color: #9AA2AA !important;
-        transform: translateY(0px) !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def render_etf_dashboard(symbol: str, yft) -> None:
+    """Lightweight ETF view — no financial statements, just fund facts + price stats."""
+    import yfinance as yf
+
+    try:
+        info = yft.info or {}
+    except Exception:
+        info = {}
+
+    name = info.get("longName") or info.get("shortName") or symbol
+    st.subheader(f"{name} ({symbol.upper()})")
+    st.caption(
+        f"🏦 Exchange-Traded Fund · {info.get('category', 'ETF')} · "
+        f"Listed on {info.get('exchange', 'n/a')}"
+    )
+    st.info(
+        "ETFs don't report financial statements, so Big 5 growth, DCF, and the "
+        "value-investing formulas don't apply. Below are the fund-level metrics "
+        "that matter for an ETF. For entry/exit signals, use **📈 Technical Analysis**."
+    )
+
+    # --- Top-line metrics strip ---
+    _last_price = info.get("regularMarketPrice") or info.get("previousClose") or info.get("navPrice")
+    _aum = info.get("totalAssets")
+    _expense = _as_fraction(info.get("netExpenseRatio") or info.get("annualReportExpenseRatio"), is_percent=True,)
+    _yield = _as_fraction(info.get("yield"), is_percent=False)
+    _beta = info.get("beta3Year") or info.get("beta")
+    _ytd = _as_fraction(info.get("ytdReturn"), is_percent=True)
+    
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Price", f"${_last_price:,.2f}" if _last_price else "n/a")
+    m2.metric("Fund Size (AUM)", _fmt_money(_aum, "USD") if _aum else "n/a")
+    m3.metric("Expense Ratio", f"{_expense * 100:.2f}%" if _expense is not None else "n/a")
+    m4.metric("Distribution Yield", f"{_yield * 100:.2f}%" if _yield is not None else "n/a")
+    m5.metric("Beta (3yr)", f"{_beta:.2f}" if _beta else "n/a")
+    m6.metric("YTD Return", f"{_ytd * 100:+.1f}%" if _ytd is not None else "n/a", delta=f"{_ytd * 100:+.1f}%" if _ytd is not None else None, delta_color="normal",)
+    
+
+    # --- 52-week range ---
+    _low = info.get("fiftyTwoWeekLow")
+    _high = info.get("fiftyTwoWeekHigh")
+    if _low and _high and _last_price:
+        _pos_pct = (_last_price - _low) / (_high - _low) * 100 if _high > _low else 0
+        st.markdown("#### 52-Week Range")
+        st.markdown(
+            f"""
+            <div style="margin: 0.25rem 0 1rem;">
+                <div style="display:flex; justify-content:space-between; color:#9aa0a6; font-size:0.85rem;">
+                    <span>${_low:,.2f}</span><span>${_high:,.2f}</span>
+                </div>
+                <div style="position:relative; height:8px; background:rgba(255,255,255,0.08); border-radius:4px; margin-top:0.4rem;">
+                    <div style="position:absolute; left:{_pos_pct:.1f}%; top:-4px; width:3px; height:16px; background:#4CAF50; border-radius:2px;"></div>
+                </div>
+                <div style="color:#9aa0a6; font-size:0.75rem; margin-top:0.4rem;">
+                    Current ${_last_price:,.2f} sits at {_pos_pct:.0f}% of the 52-week range.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # --- Top holdings ---
+    try:
+        fd = yft.funds_data
+        holdings = fd.top_holdings
+        if holdings is not None and not holdings.empty:
+            st.markdown("#### Top Holdings")
+            _holdings_display = holdings.copy()
+            if "Holding Percent" in _holdings_display.columns:
+                _holdings_display["Holding Percent"] = _holdings_display["Holding Percent"].map(
+                    lambda v: f"{v*100:.2f}%" if v is not None and v == v else "n/a"
+                )
+            st.dataframe(_holdings_display, width="stretch")
+    except Exception:
+        pass
+
+    # --- Sector weightings ---
+    try:
+        fd = yft.funds_data
+        sectors = fd.sector_weightings
+        if sectors:
+            st.markdown("#### Sector Weightings")
+            sec_df = (
+                pd.DataFrame(
+                    [{"Sector": k.replace("_", " ").title(), "Weight": v}
+                     for k, v in sectors.items()]
+                )
+                .sort_values("Weight", ascending=False)
+                .reset_index(drop=True)
+            )
+            sec_df["Weight"] = sec_df["Weight"].map(lambda v: f"{v*100:.2f}%")
+            st.dataframe(sec_df, width="stretch", hide_index=True)
+    except Exception:
+        pass
+
+    # --- Annualized Returns (5/10/20 year) ---
+    st.markdown("#### Annualized Returns (Total Return, CAGR)")
+    rets = compute_annualized_returns(yft, symbol)
+    if rets:
+        r1, r2, r3 = st.columns(3)
+
+        def _cagr_metric(col, label: str, value: float | None) -> None:
+            if value is None:
+                col.metric(label, "n/a")
+                return
+            pct = value * 100
+            col.metric(
+                label,
+                f"{pct:+.2f}%",
+                delta="positive" if pct >= 0 else "negative",
+                delta_color="normal" if pct >= 0 else "inverse",
+            )
+
+        _cagr_metric(r1, "5-Year", rets.get(5))
+        _cagr_metric(r2, "10-Year", rets.get(10))
+        _cagr_metric(r3, "20-Year", rets.get(20))
+
+        st.caption("Adjusted for dividends and splits. n/a if the ETF is younger than the period.")
+    else:
+        st.caption("Annualized returns unavailable.")
+    
+    # --- Price History with selectable window ---
+    st.markdown("#### Price History")
+
+    _window_options = {"1Y": 1,"5Y": 5,"10Y": 10,"20Y": 20,}
+
+    selected_window = st.radio(
+        "Window:",
+        options=list(_window_options.keys()),
+        index=0,                       # 1Y default
+        horizontal=True,
+        key=f"etf_price_window_{symbol}",
+        label_visibility="collapsed",
+    )
+    years = _window_options[selected_window]
+
+    try:
+        hist = yft.history(period=f"{years}y")
+    except Exception:
+        hist = None
+
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        st.caption(f"n/a — {symbol} has less than {years} years of history.")
+    else:
+        series = hist["Close"].dropna()
+        base = float(series.iloc[0]) if not series.empty else 0.0
+        if series.empty or base <= 0:
+            st.caption("n/a — no usable data in this window.")
+        else:
+            total_return = (float(series.iloc[-1]) / base - 1) * 100
+            st.caption(
+                f"{series.index[0].date()} → {series.index[-1].date()} · "
+                f"+{total_return:.1f}% total return"
+            )
+            st.line_chart(series, height=260)
+
+    st.caption("Data from Yahoo Finance. Expense ratios, AUM, and holdings update daily; " "verify against the fund's prospectus before investing.")
 
 def render_analyzer() -> None:
+    st.markdown(
+        '<h2 style="margin-bottom: 0.25rem;">'
+        '🔍 Stock Analyzer '
+        '<span style="font-size: 0.95rem; font-weight: 500; color: #4CAF50; letter-spacing: 0.03em;">'
+        '— Separating Wonderful Businesses from the Merely Good'
+        '</span>'
+        '</h2>',
+        unsafe_allow_html=True,
+    )
     st.caption(
-        "Big 5 growth screening plus DCF, Peter Lynch Fair Value, Graham Number, "
-        "Graham Formula, and PEG. Enter a ticker to compute all methods side-by-side."
+        "Enter a US-listed ticker (e.g. AAPL, MSFT, KO) or an Indian ticker "
+        "(e.g. RELIANCE, TCS). Results cover 5 key growth rates, five valuation "
+        "methods (DCF, Peter Lynch Fair Value, Graham Number, Graham Formula, "
+        "and PEG), plus Buffett-style health checks."
     )
 
     
@@ -496,11 +526,6 @@ def render_analyzer() -> None:
                 submitted = st.form_submit_button("⏳ Analyzing...", width="stretch", disabled=True)
             else:
                 submitted = st.form_submit_button("Analyze", width="stretch")
-
-    with st.sidebar:
-        if st.button("🔄 Reset Analyzer", help="Clear cache and reset for new ticker"):
-            clear_analyzer_cache()
-            st.rerun()
 
     if submitted:
         st.session_state["analyzing"] = True
@@ -532,21 +557,34 @@ def render_analyzer() -> None:
         st.session_state["valuation_growth_mode"] = "Value conservative"
         st.session_state["valuation_growth_result"] = None
 
+    # --- Detect instrument type before doing anything expensive ---
+    from data_provider import get_ticker
+
+    with st.spinner(f"Looking up {symbol}..."):
+        try:
+            _probe = get_ticker(symbol)
+            _qtype = (_probe.info or {}).get("quoteType", "").upper()
+        except Exception:
+            _qtype = ""
+
+    if _qtype in ("ETF", "MUTUALFUND", "INDEX", "CRYPTOCURRENCY", "CURRENCY"):
+        st.session_state["analyzing"] = False
+        render_etf_dashboard(symbol, _probe)
+        return
+
     with st.spinner(f"Fetching 10-year financials for {symbol}..."):
         try:
-            # Clear cache for this specific ticker if it's new
             if st.session_state.get("valuation_ticker") != symbol:
                 st.cache_data.clear()
                 st.session_state["valuation_ticker"] = symbol
             fin = _cached_fetch(symbol)
-
-            # Reset analyzing state after successful fetch
             st.session_state["analyzing"] = False
-
         except FetchError as e:
+            st.session_state["analyzing"] = False
             st.error(str(e))
             return
         except Exception as e:
+            st.session_state["analyzing"] = False
             st.error(f"Unexpected error fetching {symbol}: {e}")
             return
 
@@ -1358,6 +1396,7 @@ def render_analyzer() -> None:
         """,
         unsafe_allow_html=True,
     )
+
 
 def render_technical_analysis():
     """Technical Analysis tab - Trading signals based on technical indicators"""
@@ -2181,6 +2220,7 @@ def render_technical_analysis():
                     mime="text/csv"
                 )
 
+
 def render_tqqq_sqqq_signals():
     """TQQQ/SQQQ Multi-Strategy Signals tab — daily trading decisions"""
     st.header("🤖 TQQQ/SQQQ Multi-Strategy Signals")
@@ -2188,6 +2228,16 @@ def render_tqqq_sqqq_signals():
         "Seven independent sub-strategies vote daily on target allocation. "
         "Each strategy is a separate module — add, remove, or tune them independently."
     )
+
+    # --- Apply pending widget-state updates BEFORE widgets are instantiated ---
+    for _pending, _target in (
+        ("_pending_cur_tqqq",      "cur_tqqq_input"),
+        ("_pending_cur_sqqq",      "cur_sqqq_input"),
+        ("_pending_actual_tqqq",   "actual_tqqq_fill"),
+        ("_pending_actual_sqqq",   "actual_sqqq_fill"),
+    ):
+        if _pending in st.session_state:
+            st.session_state[_target] = st.session_state.pop(_pending)
 
     # Manual refresh button — forces a fresh yfinance fetch
     refresh_col1, refresh_col2 = st.columns([1, 4])
@@ -2597,10 +2647,10 @@ def render_tqqq_sqqq_signals():
                         _new_tqqq = max(0.0, _new_tqqq)   # never go negative
                         save_position(_new_tqqq, _cur_sqqq)
 
-                        # 3. Sync the UI widgets so the new values appear immediately
-                        st.session_state["cur_tqqq_input"] = _new_tqqq
-                        st.session_state["cur_sqqq_input"] = _cur_sqqq
-                        st.session_state["actual_tqqq_fill"] = 0.0
+                        # 3. Queue widget updates for the NEXT run.
+                        st.session_state["_pending_cur_tqqq"] = _new_tqqq
+                        st.session_state["_pending_cur_sqqq"] = _cur_sqqq
+                        st.session_state["_pending_actual_tqqq"] = 0.0
                         st.session_state["_last_log_msg"] = (
                             f"Logged {action} {abs(actual_tqqq_fill):.4f} TQQQ @ ${tqqq_price:.2f}. "
                             f"Holdings now {_new_tqqq:.4f} TQQQ."
@@ -2640,9 +2690,9 @@ def render_tqqq_sqqq_signals():
                         _new_sqqq = max(0.0, _new_sqqq)
                         save_position(_cur_tqqq, _new_sqqq)
 
-                        st.session_state["cur_tqqq_input"] = _cur_tqqq
-                        st.session_state["cur_sqqq_input"] = _new_sqqq
-                        st.session_state["actual_sqqq_fill"] = 0.0
+                        st.session_state["_pending_cur_tqqq"] = _cur_tqqq
+                        st.session_state["_pending_cur_sqqq"] = _new_sqqq
+                        st.session_state["_pending_actual_sqqq"] = 0.0
                         st.session_state["_last_log_msg"] = (
                             f"Logged {action} {abs(actual_sqqq_fill):.4f} SQQQ @ ${sqqq_price:.2f}. "
                             f"Holdings now {_new_sqqq:.4f} SQQQ."
@@ -2714,16 +2764,132 @@ def render_tqqq_sqqq_signals():
     except Exception as e:
         st.warning(f"Could not run TQQQ/SQQQ strategies: {e}")
 
-tab_analyzer, tab_screener, tab_technical, tab_tqqq  = st.tabs(["🔍 Stock Analyzer", "📊 Stock Screener", "📈 Technical Analysis","🤖 TQQQ/SQQQ Signals",])
 
-with tab_screener:
-    render_stock_screener()
+# ---------------------------------------------------------------------- #
+# Page wrappers — each defines its own header, then calls the render fn
+# ---------------------------------------------------------------------- #
 
-with tab_analyzer:
+def page_home() -> None:
+    st.markdown(
+        """
+        <div style="margin-bottom: 0.5rem;">
+            <div style="font-size: 1.1rem; font-weight: 500; color: #4CAF50; letter-spacing: 0.04em; margin-bottom: 0.35rem;">
+                Find Great Businesses at Attractive Prices
+            </div>
+            <div style="font-size: 2.75rem; font-weight: 700; line-height: 1.1;">
+                MoatCheck<span style="font-weight: 400; color: #9aa0a6; font-size: 1.6rem; margin-left: 0.5rem;">— Modern Value Investing Stock Scanner and Advanced Screeners</span>
+            </div>
+            <div style="font-size: 0.85rem; color: #9aa0a6; margin-top: 0.15rem;">
+                Modern Value Investing with base principles rooted in the  Benjamin Graham, David Dodd, Warren Buffett and Charlie Munger.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        ### What this tool does
+
+        MoatCheck brings together four independent lenses on a stock:
+
+        - **🔍 Stock Analyzer** — Big 5 growth screening plus DCF, Peter Lynch Fair Value,
+          Graham Number, Graham Formula, and PEG, side-by-side.
+        - **📊 Stock Screener** — filter a universe of tickers by valuation and quality rules.
+        - **📈 Technical Analysis** — RSI, MACD, Stochastic, SMA, Bollinger Bands,
+          volume analysis, mean-reversion strategies, and a BNF-style reversal scanner.
+        - **🤖 TQQQ/SQQQ Signals** — seven independent sub-strategies voting on daily
+          target allocation, with a position calculator and trade log.
+
+        Use the navigation on the left to switch between tools.
+        """
+    )
+    st.caption("Not investment advice. Cross-check with 10-K filings before any capital decision.")
+
+def compute_annualized_returns(yft, symbol: str) -> dict:
+    """Calculate 5, 10, and 20-year annualized total returns.
+
+    yfinance_cache returns a split- and dividend-adjusted 'Close' column and
+    does not provide a separate 'Adj Close', so we use 'Close' directly.
+    """
+    import pandas as pd
+
+    try:
+        hist = yft.history(period="max")
+    except Exception as e:
+        st.write("DEBUG history error:", repr(e))
+        return {}
+
+    if hist is None or hist.empty:
+        return {}
+
+    if "Adj Close" in hist.columns:
+        adj = hist["Adj Close"].dropna()
+    elif "Close" in hist.columns:
+        adj = hist["Close"].dropna()
+    else:
+        return {}
+
+    if len(adj) < 2:
+        return {}
+
+    end_date = adj.index[-1]
+    end_price = float(adj.iloc[-1])
+    results: dict[int, float | None] = {}
+
+    for years in (5, 10, 20):
+        target = end_date - pd.DateOffset(years=years)
+        past = adj[adj.index <= target]
+        if past.empty:
+            results[years] = None
+            continue
+        start_price = float(past.iloc[-1])
+        if start_price <= 0:
+            results[years] = None
+            continue
+        results[years] = (end_price / start_price) ** (1 / years) - 1
+
+    return results
+
+def page_analyzer() -> None:
     render_analyzer()
 
-with tab_technical:
+
+def page_screener() -> None:
+    render_stock_screener()
+
+
+def page_technical() -> None:
     render_technical_analysis()
 
-with tab_tqqq:
+
+def page_tqqq() -> None:
     render_tqqq_sqqq_signals()
+
+
+# ---------------------------------------------------------------------- #
+# Navigation
+# ---------------------------------------------------------------------- #
+
+_pages = [
+    st.Page(page_home,      title="Home",              icon="🏠", default=True),
+    st.Page(page_analyzer,  title="Stock Analyzer",    icon="🔍"),
+    st.Page(page_screener,  title="Stock Screener",    icon="📊"),
+    st.Page(page_technical, title="Technical Analysis",icon="📈"),
+    st.Page(page_tqqq,      title="TQQQ/SQQQ Signals", icon="🤖"),
+]
+
+_nav = st.navigation(_pages, position="sidebar")
+
+# Small brand mark above the nav links
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="padding: 0.25rem 0 0.5rem; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(255,255,255,0.06);">
+            <div style="font-size: 1.1rem; font-weight: 700; color: #e8eaed;">MoatCheck</div>
+            <div style="font-size: 0.7rem; color: #9aa0a6; letter-spacing: 0.04em;">Value Investing Toolkit</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+_nav.run()

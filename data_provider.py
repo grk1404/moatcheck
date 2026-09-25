@@ -11,7 +11,7 @@ import yfinance_cache as yfc
 
 # One shared session for the whole process. Reusing it preserves cookies and
 # the TLS session so Yahoo sees consistent traffic from a single browser.
-_shared_session = curl_requests.Session(impersonate="chrome")
+_shared_session = curl_requests.Session(impersonate="chrome", timeout=15)
 
 
 def get_ticker(symbol: str):
