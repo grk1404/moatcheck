@@ -33,6 +33,95 @@ def _market_is_open() -> bool:
     close_t = dtime(16, 0)
     return open_t <= now_et.time() <= close_t
 
+def _portfolio_returns(df: pd.DataFrame, windows: tuple[int, ...] = (10, 5, 3)) -> dict:
+    """Cost-basis-weighted CAGR of current holdings over each window.
+
+    For each position with at least N years of price history, compute the N-year
+    CAGR of that position, then weight by the cost basis you have in it.
+    Positions younger than N years are excluded from that window — not
+    zero-filled, not short-windowed. Coverage is reported per window.
+    """
+    from data_provider import get_ticker
+    import pandas as pd
+
+    view = df[
+        df["Symbol"].str.match(r"^[A-Z]{1,5}$", na=False)
+        & (df["_value"] > 0)
+        & (df["Quantity"] > 0)
+    ]
+    if view.empty:
+        return {}
+
+    # Aggregate across accounts: quantity, value, and cost basis
+    agg = view.groupby("Symbol").agg(
+        qty=("Quantity", "sum"),
+        value=("_value", "sum"),
+        basis=("_basis", "sum"),
+    )
+
+    total_basis = float(agg["basis"].sum())
+    n_total = int(len(agg))
+
+    results = {
+        w: {
+            "cagr": None,
+            "coverage_basis": 0.0,
+            "total_basis": total_basis,
+            "n_included": 0,
+            "n_total": n_total,
+        }
+        for w in windows
+    }
+
+    for sym, row in agg.iterrows():
+        try:
+            hist = get_ticker(sym).history(period="max")
+        except Exception:
+            continue
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            continue
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            continue
+
+        closes.index = pd.to_datetime(closes.index).tz_localize(None)
+        end_date = closes.index[-1]
+        end_price = float(closes.iloc[-1])
+        if end_price <= 0:
+            continue
+
+        basis = float(row["basis"])
+
+        for w in windows:
+            target = end_date - pd.DateOffset(years=w)
+            past = closes[closes.index <= target]
+            if past.empty:
+                continue  # position doesn't have N years of history — exclude
+            start_price = float(past.iloc[-1])
+            if start_price <= 0:
+                continue
+
+            try:
+                cagr = (end_price / start_price) ** (1.0 / w) - 1.0
+            except Exception:
+                continue
+
+            r = results[w]
+            if r["cagr"] is None:
+                r["cagr"] = 0.0
+            r["cagr"] += basis * cagr
+            r["coverage_basis"] += basis
+            r["n_included"] += 1
+
+    for w in windows:
+        r = results[w]
+        if r["coverage_basis"] > 0:
+            r["cagr"] = r["cagr"] / r["coverage_basis"]
+        else:
+            r["cagr"] = None
+
+    return results
+
 def _fetch_mover_data(symbol: str, quantity: float, position_value: float) -> dict | None:
     """Fetch OHLCV and compute mover metrics for one symbol.
 
@@ -114,8 +203,17 @@ def _fetch_mover_data(symbol: str, quantity: float, position_value: float) -> di
         "AtLow": pct_change < 0 and pos_in_range <= 0.1,
     }
 
-def _top_movers(df: pd.DataFrame, n: int = 7) -> tuple[list[dict], list[dict], dict]:
+def _top_movers(
+    df: pd.DataFrame,
+    n: int = 7,
+    rank_by: str = "Dollar Impact",
+) -> tuple[list[dict], list[dict], dict]:
     """Rank positions by mover score, aggregated across accounts.
+
+    rank_by:
+      "Dollar Impact" — sort by |dollar move| (what moved your P&L)
+      "Percent Change" — sort by |percent move| (what moved in the market)
+      "Portfolio Impact" — sort by |portfolio move| (what moved your overall portfolio)
 
     Returns (gainers, losers, summary). Each mover is a dict with
     Symbol, Pct, Dollar, RVOL, Freshness, Score, AtHigh, AtLow, Accounts.
@@ -156,15 +254,18 @@ def _top_movers(df: pd.DataFrame, n: int = 7) -> tuple[list[dict], list[dict], d
 
     movers = pd.DataFrame(rows)
 
+    # Choose the ranking key    
+    sort_col = "Pct" if "percent" in (rank_by or "").lower() else "Dollar"
+
     gainers = (
-        movers[movers["Pct"] > 0]
-        .sort_values("Dollar", ascending=False)
+        movers[movers[sort_col] > 0]
+        .sort_values(sort_col, ascending=False)
         .head(n)
         .to_dict("records")
     )
     losers = (
-        movers[movers["Pct"] < 0]
-        .sort_values("Dollar", ascending=True)
+        movers[movers[sort_col] < 0]
+        .sort_values(sort_col, ascending=True)
         .head(n)
         .to_dict("records")
     )
@@ -178,7 +279,7 @@ def _top_movers(df: pd.DataFrame, n: int = 7) -> tuple[list[dict], list[dict], d
         "net_pct": net_pct,
         "n_up": int((movers["Pct"] > 0).sum()),
         "n_down": int((movers["Pct"] < 0).sum()),
-        "bar_source": "today" if _market_is_open() else "yesterday's close",
+        "rank_by": rank_by,
     }
     return gainers, losers, summary
 
@@ -212,44 +313,61 @@ def _elapsed_session_fraction() -> float:
 
 
 def _rvol_html(rvol: float) -> str:
-    """Format the RVOL cell with a hover tooltip explaining the badge."""
+    """Format the RVOL cell with a plain-English hover tooltip."""
     if rvol >= 2.0:
-        tier = "High conviction — trading well above normal volume"
+        msg = "Heavy volume — well above normal. This move has real participation behind it."
         color = "#FFA726"
-        label = f"· RVOL {rvol:.1f}×"
+        label = f"{rvol:.1f}×"
     elif rvol >= 1.5:
-        tier = "Elevated volume — move has participation"
+        msg = "Above-average volume. More participation than usual."
         color = "#9aa0a6"
-        label = f"· RVOL {rvol:.1f}×"
-    elif rvol >= 0.6:
-        tier = "Normal volume range"
-        color = "#6c6f75"
-        label = f"· {rvol:.1f}×"
+        label = f"{rvol:.1f}×"
+    elif rvol >= 0.7:
+        msg = "Normal volume for this time of day."
+        color = "#9aa0a6"
+        label = f"{rvol:.1f}×"
     else:
-        tier = "Light volume — move has little participation, treat as noise"
-        color = "#6c6f75"
-        label = f"· {rvol:.1f}× 💤"
+        msg = "Extremely light volume. Nothing meaningful is happening in this position — treat the move as noise."
+        color = "#9aa0a6"
+        label = f"{rvol:.1f}× 💤"
 
-    tip = (
-        f"RVOL = today's volume / expected volume by this time of day. "
-        f"{tier}."
-    ).replace('"', "&quot;")
-
+    tip = msg.replace('"', "&quot;")
     return (
-        f'<span title="{tip}" style="color:{color}; cursor: help;">'
-        f"{label}</span>"
+        f'<span title="{tip}" style="color:{color}; cursor: help; '
+        f'font-size:0.85rem;">{label}</span>'
     )
-
 
 def _render_top_movers(df: pd.DataFrame) -> None:
     st.markdown("#### Top Movers")
+    if _market_is_open():
+        st.caption("Showing live intraday data.")
+    else:
+        st.caption("Market closed — showing last session's close.")
+
     st.caption(
-        "Ranked by dollar impact on your portfolio. "
+        "RVOL = today's volume ÷ expected volume by this time of day. "
         "RVOL ≥ 2× means the move has real volume behind it."
+        "RVOL stands for Relative Volume Factor - how intense the trading volume is relative to normal."
     )
 
+    c1, c2 = st.columns([1, 6])
+    with c1:
+        st.markdown(
+            '<div style="padding-top:0.5rem; font-weight:600;">Rank by:</div>',
+            unsafe_allow_html=True,
+        )
+    with c2:
+        view_mode = st.radio(
+            "Rank by:",
+            options=["Percentage Change", "Portfolio Impact"],
+            index=0,
+            horizontal=True,
+            key="movers_view_mode",
+            label_visibility="collapsed",
+        )
+
     with st.spinner("Computing movers…"):
-        gainers, losers, summary = _top_movers(df, n=7)
+        gainers, losers, summary = _top_movers(df, n=7, rank_by=view_mode)
 
     if not gainers and not losers:
         st.info("No mover data available (yfinance may be down or tickers unlisted).")
@@ -732,8 +850,8 @@ def _hero_strip(df: pd.DataFrame) -> None:
         else 0.0
     )
 
-    # Seven cards, one row.
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    # ---- Row 1: composition ----
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric("Portfolio Value", _fmt_compact(total_value))
     c2.metric("Cost Basis", _fmt_compact(total_basis))
@@ -746,34 +864,75 @@ def _hero_strip(df: pd.DataFrame) -> None:
         help_text="Unrealized gain on current holdings: Portfolio Value − Cost Basis.",
     ), unsafe_allow_html=True)
 
-    c4.markdown(_metric_html(
-        "Total ROR",
-        f"{total_ror * 100:+.1f}%" if total_ror is not None else "n/a",
-        help_text=(
-            "(Portfolio Value − Net Deposits) / Net Deposits. "
-            "Add data/portfolio_capital.json to enable."
-            if total_ror is None else
-            "Your actual return on all invested capital since inception."
-        ),
-    ), unsafe_allow_html=True)
-
-    c5.markdown(_metric_html(
-        "Annualized Return",
-        f"{annualized * 100:+.1f}%" if annualized is not None else "n/a",
-        help_text="Compounded annual return derived from Total ROR and holding period.",
-    ), unsafe_allow_html=True)
-
-    # Today's Change — colored UP / DOWN
     if today_dollars > 0:
-        t_delta, t_color = "UP", "normal"
+        t_color = "normal"
     elif today_dollars < 0:
-        t_delta, t_color = "DOWN", "inverse"
+        t_color = "inverse"
     else:
-        t_delta, t_color = "FLAT", "off"
+        t_color = "off"
 
-    c6.metric("Today's Change", _fmt_compact(today_dollars), delta=f"{today_pct:+.2f}%", delta_color="normal" if today_dollars >= 0 else "inverse")
+    c4.metric(
+        "Today's Change",
+        _fmt_compact(today_dollars),
+        delta=f"{today_pct:+.2f}%",
+        delta_color=t_color,
+    )
+    c5.metric("Positions", f"{len(equities)}")
 
-    c7.metric("Positions", f"{len(equities)}")
+    # ---- Row 2: performance ----
+    st.markdown("#### Performance")
+    p1, p2, p3, p4, p5 = st.columns(5)
+
+    p1.markdown(_metric_html(
+        "Total ROR",
+        f"{total_ror * 100:+,.1f}%" if total_ror is not None else "n/a",
+        help_text="Lifetime cumulative return: (Portfolio Value − Net Deposits) / Net Deposits.",
+    ), unsafe_allow_html=True)
+
+    p2.markdown(_metric_html(
+        "Annualized",
+        f"{annualized * 100:+.2f}%" if annualized is not None else "n/a",
+        help_text="Compound annual growth rate from inception to today.",
+    ), unsafe_allow_html=True)
+
+    try:
+        returns = _portfolio_returns(df, windows=(10, 5, 3))
+    except Exception:
+        returns = {}
+
+    def _ret_col(col, label: str, w: int) -> None:
+        r = returns.get(w, {})
+        cagr = r.get("cagr")
+        n_in = r.get("n_included", 0)
+        n_tot = r.get("n_total", 0)
+        cov_basis = r.get("coverage_basis", 0.0)
+        tot_basis = r.get("total_basis", 0.0)
+
+        if cagr is None or n_in == 0:
+            col.markdown(_metric_html(
+                label, "n/a",
+                help_text=f"No holdings with at least {w} years of history.",
+            ), unsafe_allow_html=True)
+            return
+
+        basis_pct = (cov_basis / tot_basis * 100) if tot_basis > 0 else 0
+        sub = f"{n_in}/{n_tot} · {basis_pct:.0f}% basis"
+
+        col.markdown(_metric_html(
+            label,
+            f"{cagr * 100:+.2f}%",
+            sub=sub,
+            sub_color="#9aa0a6",
+            help_text=(
+                f"Cost-basis-weighted CAGR of positions with at least {w} years "
+                f"of price history. Weighted by what you paid, not current value. "
+                f"Covers {n_in} of {n_tot} positions ({basis_pct:.0f}% of your cost basis)."
+            ),
+        ), unsafe_allow_html=True)
+
+    _ret_col(p3, "10-Year", 10)
+    _ret_col(p4, "5-Year", 5)
+    _ret_col(p5, "3-Year", 3)
 
 def _account_breakdown(df: pd.DataFrame) -> None:
     st.markdown("#### Account Breakdown")

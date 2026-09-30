@@ -144,6 +144,7 @@ def _color_pass(val: float | None) -> str:
     return "background-color: #4b1e1e; color: #f0b6b6;"
 
 
+
 def _render_big5_table(big5: Big5Result) -> None:
     df = big5.as_dataframe()
 
