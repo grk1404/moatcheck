@@ -17,6 +17,325 @@ CSV_CANDIDATES = [
     DATA_DIR / "fidelity_positions.csv",
 ]
 
+def _market_is_open() -> bool:
+    """Return True if US equity markets are currently open (ET, Mon–Fri, 9:30–16:00)."""
+    from datetime import datetime, time as dtime
+    from zoneinfo import ZoneInfo
+
+    try:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return False
+
+    if now_et.weekday() >= 5:          # Sat / Sun
+        return False
+    open_t = dtime(9, 30)
+    close_t = dtime(16, 0)
+    return open_t <= now_et.time() <= close_t
+
+def _fetch_mover_data(symbol: str, quantity: float, position_value: float) -> dict | None:
+    """Fetch OHLCV and compute mover metrics for one symbol.
+
+    Returns None if the symbol can't be fetched or has no usable data.
+    """
+    from data_provider import get_ticker
+    import math
+
+    try:
+        hist = get_ticker(symbol).history(period="30d")
+    except Exception:
+        return None
+
+    if hist is None or len(hist) < 2:
+        return None
+
+    # Which bar to use for "today"?
+    # - If market is open, today's partial bar is the current session.
+    # - Otherwise, the last complete bar (yesterday) is what matters.
+    # We use the last row either way — yfinance returns the most recent bar.
+    today = hist.iloc[-1]
+    yesterday = hist.iloc[-2]
+
+    prev_close = float(yesterday["Close"])
+    current = float(today["Close"])
+    if prev_close <= 0:
+        return None
+
+    pct_change = (current - prev_close) / prev_close * 100.0
+    dollar_impact = position_value * pct_change / 100.0
+
+    # RVOL: today's volume so far vs. what we'd expect by now.  During the session, we scale the 20-day average by the fraction of
+    # the trading day that has elapsed. Without this, every stock looks like RVOL 0.4–0.6 until 4 PM.
+    rvol = 1.0
+    try:
+        vol_today = float(today["Volume"])
+        tail = hist["Volume"].iloc[-21:-1]
+        vol_avg = float(tail.mean()) if len(tail) > 0 else 0.0
+        elapsed = _elapsed_session_fraction()
+        vol_expected = vol_avg * elapsed if vol_avg > 0 else 0.0
+        if vol_expected > 0 and vol_today > 0:
+            rvol = vol_today / vol_expected
+    except Exception:
+        pass
+
+    # RVOL multiplier: normalized log, floors at 0.5 for very thin volume
+    # ln(rvol + 1) / ln(2) maps rvol=1 to 1.0, rvol=2 to ~1.58, rvol=5 to ~2.58
+    rvol_mult = max(0.5, math.log(rvol + 1.0) / math.log(2.0)) if rvol > 0 else 1.0
+
+    # Freshness: where is the current price within today's range?
+    # For gainers, near the high = fresh; for losers, near the low = fresh.
+    high = float(today["High"])
+    low = float(today["Low"])
+    rng = high - low
+    if rng > 0:
+        pos_in_range = (current - low) / rng            # 0 = at low, 1 = at high
+    else:
+        pos_in_range = 0.5
+
+    if pct_change >= 0:
+        freshness = 0.5 + pos_in_range                  # [0.5, 1.5]
+    else:
+        freshness = 1.5 - pos_in_range                  # [0.5, 1.5]
+    freshness = max(0.5, min(1.5, freshness))
+
+    # Composite score
+    score = pct_change * rvol_mult * freshness
+
+    return {
+        "Symbol": symbol,
+        "Quantity": quantity,
+        "Value": position_value,
+        "Pct": pct_change,
+        "Dollar": dollar_impact,
+        "RVOL": rvol,
+        "Freshness": freshness,
+        "Score": score,
+        "AtHigh": pct_change >= 0 and pos_in_range >= 0.9,
+        "AtLow": pct_change < 0 and pos_in_range <= 0.1,
+    }
+
+def _top_movers(df: pd.DataFrame, n: int = 7) -> tuple[list[dict], list[dict], dict]:
+    """Rank positions by mover score, aggregated across accounts.
+
+    Returns (gainers, losers, summary). Each mover is a dict with
+    Symbol, Pct, Dollar, RVOL, Freshness, Score, AtHigh, AtLow, Accounts.
+    """
+    # Only real equity symbols with non-zero value
+    view = df[
+        df["Symbol"].str.match(r"^[A-Z]{1,5}$", na=False)
+        & (df["_value"] > 0)
+        & (df["Quantity"] > 0)
+    ]
+
+    if view.empty:
+        return [], [], {}
+
+    # Aggregate across accounts: NVDA in Rollover + Roth is one row
+    agg: dict[str, dict] = {}
+    for _, r in view.iterrows():
+        sym = str(r["Symbol"])
+        qty = float(r["Quantity"]) if r["Quantity"] == r["Quantity"] else 0.0
+        val = float(r["_value"])
+        if sym not in agg:
+            agg[sym] = {"qty": 0.0, "value": 0.0, "accounts": []}
+        agg[sym]["qty"] += qty
+        agg[sym]["value"] += val
+        agg[sym]["accounts"].append(str(r["Account name"]))
+
+    # Fetch + score
+    rows = []
+    for sym, info in agg.items():
+        m = _fetch_mover_data(sym, info["qty"], info["value"])
+        if m is None:
+            continue
+        m["Accounts"] = info["accounts"]
+        rows.append(m)
+
+    if not rows:
+        return [], [], {}
+
+    movers = pd.DataFrame(rows)
+
+    gainers = (
+        movers[movers["Pct"] > 0]
+        .sort_values("Dollar", ascending=False)
+        .head(n)
+        .to_dict("records")
+    )
+    losers = (
+        movers[movers["Pct"] < 0]
+        .sort_values("Dollar", ascending=True)
+        .head(n)
+        .to_dict("records")
+    )
+
+    total_value = float(movers["Value"].sum())
+    net_dollar = float(movers["Dollar"].sum())
+    net_pct = (net_dollar / (total_value - net_dollar) * 100.0) if total_value > 0 else 0.0
+
+    summary = {
+        "net_dollar": net_dollar,
+        "net_pct": net_pct,
+        "n_up": int((movers["Pct"] > 0).sum()),
+        "n_down": int((movers["Pct"] < 0).sum()),
+        "bar_source": "today" if _market_is_open() else "yesterday's close",
+    }
+    return gainers, losers, summary
+
+def _elapsed_session_fraction() -> float:
+    """Fraction of the 6.5-hour US trading session that has elapsed (0.0–1.0).
+
+    Returns 1.0 outside market hours (so the calc falls back to full-day
+    comparison on weekends, after-hours, and pre-market).
+    """
+    from datetime import datetime, time as dtime
+    from zoneinfo import ZoneInfo
+
+    try:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return 1.0
+
+    if now_et.weekday() >= 5:
+        return 1.0
+
+    t = now_et.time()
+    if t < dtime(9, 30):
+        return 1.0          # pre-market — treat as full day (yesterday's close)
+    if t >= dtime(16, 0):
+        return 1.0          # after hours — full day
+
+    # Minutes since 9:30 ET
+    minutes = (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30)
+    minutes = max(0, min(int(6.5 * 60), minutes))
+    return max(0.05, minutes / (6.5 * 60))
+
+
+def _rvol_html(rvol: float) -> str:
+    """Format the RVOL cell with a hover tooltip explaining the badge."""
+    if rvol >= 2.0:
+        tier = "High conviction — trading well above normal volume"
+        color = "#FFA726"
+        label = f"· RVOL {rvol:.1f}×"
+    elif rvol >= 1.5:
+        tier = "Elevated volume — move has participation"
+        color = "#9aa0a6"
+        label = f"· RVOL {rvol:.1f}×"
+    elif rvol >= 0.6:
+        tier = "Normal volume range"
+        color = "#6c6f75"
+        label = f"· {rvol:.1f}×"
+    else:
+        tier = "Light volume — move has little participation, treat as noise"
+        color = "#6c6f75"
+        label = f"· {rvol:.1f}× 💤"
+
+    tip = (
+        f"RVOL = today's volume / expected volume by this time of day. "
+        f"{tier}."
+    ).replace('"', "&quot;")
+
+    return (
+        f'<span title="{tip}" style="color:{color}; cursor: help;">'
+        f"{label}</span>"
+    )
+
+
+def _render_top_movers(df: pd.DataFrame) -> None:
+    st.markdown("#### Top Movers")
+    st.caption(
+        "Ranked by dollar impact on your portfolio. "
+        "RVOL ≥ 2× means the move has real volume behind it."
+    )
+
+    with st.spinner("Computing movers…"):
+        gainers, losers, summary = _top_movers(df, n=7)
+
+    if not gainers and not losers:
+        st.info("No mover data available (yfinance may be down or tickers unlisted).")
+        return
+
+    left, mid, right = st.columns([2, 1, 2])
+
+    def _card(row: dict) -> str:
+        pct = row["Pct"]
+        dollar = row["Dollar"]
+        color = "#4CAF50" if pct >= 0 else "#EF5350"
+        arrow = "▲" if pct >= 0 else "▼"
+
+        rvol_html = _rvol_html(row["RVOL"])
+
+        fresh = ""
+        if row.get("AtHigh"):
+            fresh = ' <span style="color:#00E676; font-size:0.7rem;">HOD</span>'
+        elif row.get("AtLow"):
+            fresh = ' <span style="color:#EF5350; font-size:0.7rem;">LOD</span>'
+
+        accounts = row.get("Accounts", [])
+        acct_txt = accounts[0][:22] if accounts else ""
+
+        return f"""
+        <div style="padding:0.4rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+            <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                <div style="font-weight:600;">{row['Symbol']}{fresh}</div>
+                <div style="color:{color}; font-weight:600;">{arrow} {pct:+.2f}%</div>
+            </div>
+            <div style="display:flex; justify-content:space-between;
+                        font-size:0.72rem; color:#9aa0a6; margin-top:0.15rem;">
+                <div>{acct_txt}</div>
+                <div>${dollar:+,.0f} {rvol_html}</div>
+            </div>
+        </div>
+        """
+
+    with left:
+        st.markdown(
+            '<div style="font-weight:600; color:#4CAF50; margin-bottom:0.4rem;">🟢 Top Gainers</div>',
+            unsafe_allow_html=True,
+        )
+        if gainers:
+            for g in gainers:
+                st.markdown(_card(g), unsafe_allow_html=True)
+        else:
+            st.caption("No gainers today.")
+
+    with mid:
+        net = summary.get("net_dollar", 0.0)
+        net_pct = summary.get("net_pct", 0.0)
+        color = "#4CAF50" if net >= 0 else "#EF5350"
+        st.markdown(
+            f"""
+            <div style="text-align:center; padding:1.25rem 0.5rem;
+                        border:1px solid rgba(255,255,255,0.08); border-radius:10px;">
+                <div style="font-size:0.7rem; color:#9aa0a6;
+                            text-transform:uppercase; letter-spacing:0.05em;">
+                    Net Portfolio Move
+                </div>
+                <div style="font-size:1.9rem; font-weight:700; color:{color}; margin-top:0.5rem;">
+                    ${net:+,.0f}
+                </div>
+                <div style="font-size:1.1rem; color:{color};">
+                    {net_pct:+.2f}%
+                </div>
+                <div style="font-size:0.72rem; color:#9aa0a6; margin-top:0.7rem;">
+                    {summary.get('n_up', 0)} up · {summary.get('n_down', 0)} down
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown(
+            '<div style="font-weight:600; color:#EF5350; margin-bottom:0.4rem;">🔴 Top Losers</div>',
+            unsafe_allow_html=True,
+        )
+        if losers:
+            for l in losers:
+                st.markdown(_card(l), unsafe_allow_html=True)
+        else:
+            st.caption("No losers today.")
+
 def _money(v) -> str:
     """Compact dollar formatter: $2.52M, $12.1K, $45.00."""
     if v is None or v != v:
@@ -39,17 +358,28 @@ def _pct_num(v) -> str:
     return f"{v:+.1f}%" if v is not None and v == v else "—"
 
 def _color_vs_intrinsic(v):
-    """Green when Price is above Intrinsic (expensive), red when below (cheap)."""
+    """Color the vs Intrinsic cell.
+
+    Convention: negative = price below fair value = cheap = GREEN.
+                positive = price above fair value = expensive = RED.
+
+    Thresholds are on the absolute gap:
+      <= -15%  bright green  (clearly undervalued)
+      <=  -5%  green         (modest discount)
+      -5..+5%  grey          (near fair value)
+      >=  +5%  orange        (modest premium)
+      >= +15%  red           (clearly overvalued)
+    """
     if v is None or v != v:
         return ""
-    if v >= 0.15:
-        return "color: #00E676;"   # bright green — clearly above fair value
-    if v >= 0.05:
-        return "color: #4CAF50;"   # green — modest premium
     if v <= -0.15:
-        return "color: #EF5350;"   # red — clearly below fair value
+        return "color: #00E676;"   # bright green — undervalued
     if v <= -0.05:
-        return "color: #FFA726;"   # orange — modest discount
+        return "color: #4CAF50;"   # green — modest discount
+    if v >= 0.15:
+        return "color: #EF5350;"   # red — overvalued
+    if v >= 0.05:
+        return "color: #FFA726;"   # orange — modest premium
     return "color: #9AA0A6;"       # grey — near fair value
 
 
@@ -679,6 +1009,9 @@ def render_my_investments() -> None:
     df = _derive(raw)
 
     _hero_strip(df)
+    st.divider()
+
+    _render_top_movers(df)          # <-- new Top Movers
     st.divider()
 
     c1, c2 = st.columns([1, 4])
