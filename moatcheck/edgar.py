@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
+import numpy as np
 import pandas as pd
 import requests
 
@@ -29,6 +29,56 @@ _CACHE_DIR = Path.home() / ".moat_cache"
 _TICKERS_TTL = 30 * 24 * 3600  # 30 days
 _FACTS_TTL = 24 * 3600         # 1 day
 
+IFRS_CONCEPTS: dict[str, list[str]] = {
+    "revenue": [
+        "Revenue",
+        "RevenueFromContractsWithCustomers",
+        "RevenueFromSaleOfGoods",
+        "RevenueFromRenderingOfServices",
+    ],
+    "net_income": [
+        "ProfitLoss",
+        "ProfitLossAttributableToOwnersOfParent",
+    ],
+    "eps": [
+        "DilutedEarningsLossPerShare",
+        "BasicEarningsLossPerShare",
+        "EarningsPerShareDiluted",
+        "EarningsPerShareBasic",
+    ],
+    "shares": [
+        "NumberOfSharesOutstanding",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfOrdinarySharesOutstanding",
+    ],
+    "equity": [
+        "Equity",
+        "EquityAttributableToOwnersOfParent",
+    ],
+    "long_term_debt": [
+        "NoncurrentPortionOfLongtermBorrowings",
+        "LongtermBorrowings",
+    ],
+    "ocf": [
+        "CashFlowsFromUsedInOperatingActivities",
+        "CashFlowsFromUsedInOperatingActivitiesContinuingOperations",
+    ],
+    "capex": [
+        "PurchaseOfPropertyPlantAndEquipment",
+        "AcquisitionOfPropertyPlantAndEquipment",
+        "PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwill",
+    ],
+    "ebit": [
+        "ProfitLossFromOperatingActivities",
+    ],
+    "tax_provision": [
+        "IncomeTaxExpenseContinuingOperations",
+        "TaxExpenseIncome",
+    ],
+    "pretax_income": [
+        "ProfitLossBeforeTax",
+    ],
+}
 
 CONCEPTS: dict[str, list[str]] = {
     "revenue": [
@@ -161,6 +211,8 @@ class EdgarData:
     ebit: pd.Series
     tax_rate: pd.Series
     years_available: int = 0
+    currency: str = "USD"          # reporting currency detected from XBRL units
+    taxonomy: str = "us-gaap"      # "us-gaap" or "ifrs-full"
     raw: dict = field(default_factory=dict)
 
 
@@ -246,29 +298,29 @@ def _load_facts(cik: int) -> dict:
     return data
 
 
-def _series_for_concepts(gaap: dict, concepts: list[str]) -> pd.Series:
+def _series_for_concepts(
+    taxonomy: dict,
+    concepts: list[str],
+    form_prefixes: tuple[str, ...] = ("10-K",),
+    unit_priority: tuple[str, ...] = ("USD", "USD/shares", "shares", "pure"),
+) -> pd.Series:
     """Merge multiple XBRL concepts into one year-indexed pandas Series.
 
-    Strategy:
-      - For each concept, look at annual 10-K entries (fp='FY', form starts with '10-K').
-      - Bucket entries by the *year of their 'end' date* (fiscal-year end), not by 'fy'
-        — because a later 10-K restates prior years under a different 'fy' label.
-      - Within a bucket, keep the entry with the latest 'filed' date (most recent restatement).
-      - Merge concepts left-to-right in the list; later concepts do NOT overwrite
-        earlier ones for a given year — the FIRST concept in the list wins if it has
-        data, which lets callers prioritize (e.g. ASC-606 concept before old Revenues).
+    form_prefixes: which SEC form types count as "annual" for this taxonomy.
+        US GAAP filers use 10-K. IFRS filers use 20-F.
+    unit_priority: preferred unit keys, in order. Falls back to the first
+        available unit if none of these match.
     """
-    year_value: dict[int, tuple[str, float]] = {}  # year -> (filed_date, value)
+    year_value: dict[int, tuple[str, float]] = {}
 
     for concept in concepts:
-        node = gaap.get(concept)
+        node = taxonomy.get(concept)
         if not node or "units" not in node:
             continue
 
-        # Prefer USD, but fall back to any single-unit set (EPS uses USD/shares, shares uses "shares").
         units = node["units"]
         unit_key = None
-        for key in ("USD", "USD/shares", "shares", "pure"):
+        for key in unit_priority:
             if key in units:
                 unit_key = key
                 break
@@ -278,12 +330,11 @@ def _series_for_concepts(gaap: dict, concepts: list[str]) -> pd.Series:
             continue
 
         for entry in units[unit_key]:
-            # Allow 'FY' or missing/empty fp tags on 10-K forms
             fp = entry.get("fp")
             if fp and fp != "FY":
                 continue
             form = str(entry.get("form", ""))
-            if not form.startswith("10-K"):
+            if not any(form.startswith(p) for p in form_prefixes):
                 continue
             end = entry.get("end")
             if not end:
@@ -301,9 +352,6 @@ def _series_for_concepts(gaap: dict, concepts: list[str]) -> pd.Series:
             if year not in year_value:
                 year_value[year] = (filed, float(val))
             else:
-                # Same year already recorded — keep the entry from the later filing.
-                # Break ties in favor of the concept we saw first (earlier in list),
-                # which is what the outer loop naturally gives us.
                 prev_filed, _ = year_value[year]
                 if filed > prev_filed:
                     year_value[year] = (filed, float(val))
@@ -311,29 +359,80 @@ def _series_for_concepts(gaap: dict, concepts: list[str]) -> pd.Series:
     if not year_value:
         return pd.Series(dtype=float)
 
-    s = pd.Series(
-        {y: v for y, (_, v) in year_value.items()},
-        dtype=float,
-    ).sort_index()
-    return s
+    return pd.Series({y: v for y, (_, v) in year_value.items()}, dtype=float,).sort_index()
 
 
 def fetch_edgar(ticker: str) -> EdgarData:
-    """Pull 10-K annual facts for a US ticker from SEC EDGAR."""
+    """Pull annual facts (10-K US GAAP or 20-F IFRS) for a ticker from SEC EDGAR."""
     if not ticker or not ticker.strip():
         raise EdgarError("Please provide a ticker symbol.")
 
     cik, name = _resolve_ticker(ticker.strip().upper())
     facts = _load_facts(cik)
-    gaap = facts.get("facts", {}).get("us-gaap")
-    if not gaap:
-        raise EdgarError(f"CIK {cik} has no us-gaap facts (likely non-standard filer).")
+    all_facts = facts.get("facts", {})
 
-    revenue = _series_for_concepts(gaap, CONCEPTS["revenue"])
-    net_income = _series_for_concepts(gaap, CONCEPTS["net_income"])
-    eps = _series_for_concepts(gaap, CONCEPTS["eps"])
-    shares = _series_for_concepts(gaap, CONCEPTS["shares"])
-    equity = _series_for_concepts(gaap, CONCEPTS["equity"])
+    gaap = all_facts.get("us-gaap")
+    ifrs = all_facts.get("ifrs-full")
+
+    # Dual filers (Toyota, some Chinese ADRs) often have a token us-gaap
+    # section that's just cover-page facts. Prefer the richer one.
+    if gaap and ifrs and len(ifrs) > len(gaap) * 2:
+        gaap = None
+
+    if gaap:
+        taxonomy, concepts = gaap, CONCEPTS
+        form_prefixes = ("10-K",)
+        unit_priority = ("USD", "USD/shares", "shares", "pure")
+        taxonomy_name = "us-gaap"
+    elif ifrs:
+        taxonomy, concepts = ifrs, IFRS_CONCEPTS
+        form_prefixes = ("20-F",)
+        unit_priority = (
+            "EUR", "USD", "GBP", "JPY", "CHF", "CAD",
+            "EUR/shares", "USD/shares", "GBP/shares", "JPY/shares", "CHF/shares",
+            "shares", "pure",
+        )
+        taxonomy_name = "ifrs-full"
+    else:
+        raise EdgarError(
+            f"CIK {cik} has neither us-gaap nor ifrs-full facts."
+        )
+
+    # Detect the reporting currency from the first unit key we find in the
+    # taxonomy. For US GAAP filers this is "USD". For IFRS filers it's the
+    # home currency (EUR for Ferrari, JPY for Toyota, GBP for Shell, etc.).
+    _currency = "USD" if taxonomy_name == "us-gaap" else None
+    for _node in taxonomy.values():
+        _units = (_node or {}).get("units") or {}
+        for _k in _units:
+            if len(_k) == 3 and _k.isalpha() and _k.isupper():
+                _currency = _k
+                break
+        if _currency:
+            break
+    _currency = _currency or "USD"
+
+    def _series(key: str) -> pd.Series:
+        return _series_for_concepts(
+            taxonomy, concepts[key],
+            form_prefixes=form_prefixes,
+            unit_priority=unit_priority,
+        )
+
+    revenue = _series("revenue")
+    net_income = _series("net_income")
+    eps = _series("eps")
+    shares = _series("shares")
+    equity = _series("equity")
+
+    # Fallback: derive EPS from net income / shares when the filer doesn't
+    # tag it directly. Shell files ProfitLoss but no EPS concept.
+    if eps.empty and not net_income.empty and not shares.empty:
+        aligned_eps = pd.concat([net_income, shares], axis=1, join="inner")
+        aligned_eps.columns = ["ni", "sh"]
+        aligned_eps = aligned_eps[aligned_eps["sh"] > 0]
+        eps = aligned_eps["ni"] / aligned_eps["sh"]
+
     if not equity.empty and not shares.empty:
         aligned_bvps = pd.concat([equity, shares], axis=1, join="inner")
         aligned_bvps.columns = ["equity", "shares"]
@@ -341,14 +440,14 @@ def fetch_edgar(ticker: str) -> EdgarData:
         bvps = aligned_bvps["equity"] / aligned_bvps["shares"]
     else:
         bvps = pd.Series(dtype=float)
-    long_term_debt = _series_for_concepts(gaap, CONCEPTS["long_term_debt"])
-    ocf = _series_for_concepts(gaap, CONCEPTS["ocf"])
-    capex = _series_for_concepts(gaap, CONCEPTS["capex"])
-    ebit = _series_for_concepts(gaap, CONCEPTS["ebit"])
-    tax_provision = _series_for_concepts(gaap, CONCEPTS["tax_provision"])
-    pretax_income = _series_for_concepts(gaap, CONCEPTS["pretax_income"])
 
-    # Derived: FCF = OCF - |CapEx|
+    long_term_debt = _series("long_term_debt")
+    ocf = _series("ocf")
+    capex = _series("capex")
+    ebit = _series("ebit")
+    tax_provision = _series("tax_provision")
+    pretax_income = _series("pretax_income")
+
     if not ocf.empty and not capex.empty:
         aligned = pd.concat([ocf, capex], axis=1, join="inner")
         aligned.columns = ["ocf", "capex"]
@@ -356,7 +455,6 @@ def fetch_edgar(ticker: str) -> EdgarData:
     else:
         fcf = pd.Series(dtype=float)
 
-    # Derived: effective tax rate, clipped to [0, 0.5]
     if not tax_provision.empty and not pretax_income.empty:
         aligned = pd.concat([tax_provision, pretax_income], axis=1, join="inner")
         aligned.columns = ["tax", "pretax"]
@@ -366,7 +464,9 @@ def fetch_edgar(ticker: str) -> EdgarData:
         tax_rate = pd.Series(dtype=float)
 
     if revenue.empty and net_income.empty and equity.empty:
-        raise EdgarError(f"No usable us-gaap facts extracted for {ticker} (CIK {cik}).")
+        raise EdgarError(
+            f"No usable {taxonomy_name} facts extracted for {ticker} (CIK {cik})."
+        )
 
     return EdgarData(
         ticker=ticker.upper(),
@@ -384,5 +484,7 @@ def fetch_edgar(ticker: str) -> EdgarData:
         fcf=fcf,
         ebit=ebit,
         tax_rate=tax_rate,
-        years_available=int(revenue.shape[0]) if not revenue.empty else int(net_income.shape[0]),
+        years_available=(int(revenue.shape[0]) if not revenue.empty else int(net_income.shape[0]) if not net_income.empty else 0),
+        currency=_currency,
+        taxonomy=taxonomy_name,
     )

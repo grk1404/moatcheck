@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import json
 import warnings
 from data_provider import get_ticker
+from investments import render_my_investments
 
 from trade_manager import (
     compute_target_shares,
@@ -2769,6 +2770,9 @@ def render_tqqq_sqqq_signals():
 # Page wrappers — each defines its own header, then calls the render fn
 # ---------------------------------------------------------------------- #
 
+def page_my_investments() -> None:
+    render_my_investments()
+
 def page_home() -> None:
     st.markdown(
         """
@@ -2876,6 +2880,7 @@ _pages = [
     st.Page(page_screener,  title="Stock Screener",    icon="📊"),
     st.Page(page_technical, title="Technical Analysis",icon="📈"),
     st.Page(page_tqqq,      title="TQQQ/SQQQ Signals", icon="🤖"),
+    st.Page(page_my_investments, title="My Investments", icon="📁"),
 ]
 
 _nav = st.navigation(_pages, position="sidebar")
