@@ -9,6 +9,7 @@ import time
 import pandas as pd
 import streamlit as st
 from data_provider import get_ticker
+from datetime import datetime, timedelta
 
 from moatcheck import compute_big5, fetch, value_price
 from moatcheck.fetcher import FetchError
@@ -21,10 +22,62 @@ from moatcheck.tickerlist import (
 
 import json
 from pathlib import Path
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 SCREENER_CACHE = Path("data/screener_results.json")
 SCREENER_TTL = 7 * 24 * 3600  # 7 days
+UNIVERSE_CACHE = Path("data/screener_universe_cache.csv")
+UNIVERSE_CACHE_TTL = timedelta(days=7)
 
+
+def _build_universe_cache(force: bool = False) -> pd.DataFrame:
+    """Build or refresh the screener universe cache with yfinance metadata.
+
+    Fetches sector, industry, exchange, and market cap for every ticker in
+    the SEC universe. Saves to CSV. Takes ~10-15 minutes on a cold run.
+    """
+    if not force and UNIVERSE_CACHE.exists():
+        age = datetime.now() - datetime.fromtimestamp(UNIVERSE_CACHE.stat().st_mtime)
+        if age < UNIVERSE_CACHE_TTL:
+            return pd.read_csv(UNIVERSE_CACHE)
+
+    from data_provider import get_ticker
+
+    with st.spinner("📊 Loading raw ticker list from SEC..."):
+        raw = get_us_stock_universe()
+        if isinstance(raw, pd.DataFrame):
+            tickers = raw["ticker"].tolist() if "ticker" in raw.columns else raw.iloc[:, 0].tolist()
+        else:
+            tickers = list(raw)
+
+    st.info(f"Building universe cache for {len(tickers):,} tickers. This takes 10–15 minutes on first run.")
+    progress = st.progress(0.0, text="Fetching metadata…")
+
+    rows = []
+    for i, sym in enumerate(tickers):
+        progress.progress((i + 1) / len(tickers), text=f"Fetching {sym} ({i+1}/{len(tickers)})")
+        try:
+            info = get_ticker(sym).info or {}
+            rows.append({
+                "ticker": sym,
+                "company": info.get("longName") or info.get("shortName") or sym,
+                "exchange": info.get("exchange") or "",
+                "sector": info.get("sector") or "",
+                "industry": info.get("industry") or "",
+                "market_cap": info.get("marketCap") or 0,
+            })
+        except Exception:
+            rows.append({
+                "ticker": sym, "company": sym, "exchange": "",
+                "sector": "", "industry": "", "market_cap": 0,
+            })
+
+    progress.empty()
+    df = pd.DataFrame(rows)
+    UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(UNIVERSE_CACHE, index=False)
+    st.success(f"✅ Cached {len(df):,} tickers → {UNIVERSE_CACHE}")
+    return df
 
 def _load_screener_cache() -> dict[str, dict]:
     if not SCREENER_CACHE.exists():
@@ -167,13 +220,9 @@ def fmt_money(v: float | None, ticker: str = "") -> str:
 
 # ==================== LOAD UNIVERSE (NO API KEY) ====================
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_stock_universe() -> list[str]:
-    """Load stock universe from moatcheck (no API key needed)."""
-    with st.spinner("📊 Loading stock universe..."):
-        df = get_us_stock_universe()
-        tickers = df["ticker"].tolist()
-        st.success(f"✅ Loaded **{len(tickers):,}** stocks")
-        return tickers
+def load_stock_universe() -> pd.DataFrame:
+    """Load the enriched stock universe (with sector/exchange/market cap)."""
+    return _build_universe_cache(force=False)
 
 # ==================== DEEP ANALYSIS ====================
 def big5_eps_growth(big5) -> float | None:
@@ -539,6 +588,27 @@ def style_screener_table(df: pd.DataFrame):
 
     return df.style.apply(style_row, axis=1)
 
+def _render_aggrid(df: pd.DataFrame) -> None:
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(
+        filter=True,
+        sortable=True,
+        resizable=True,
+        floatingFilter=True,
+    )
+    gb.configure_column("Ticker", pinned="left", width=100)
+    gb.configure_column("Company", pinned="left", width=200)
+    gb.configure_column("Verdict", width=130)
+
+    grid_options = gb.build()
+    AgGrid(
+        df,
+        gridOptions=grid_options,
+        height=600,
+        theme="streamlit",
+        update_mode=GridUpdateMode.NO_UPDATE,
+        allow_unsafe_jscode=False,
+    )
 
 def display_screener_stats(rows: list[ScreenerRow]):
     col1, col2, col3, col4 = st.columns(4)
@@ -556,55 +626,6 @@ def display_screener_stats(rows: list[ScreenerRow]):
         st.metric("Buy Candidates", buys)
     with col4:
         st.metric("Bargain Buys", bargain_buys)
-
-
-def apply_filters(
-    rows: list[ScreenerRow], 
-    min_score: float, 
-    verdict_filter: list, 
-    sector_filter: list,
-    exchange_filter: list,
-    ticker_search: str, 
-    show_full_table: bool,
-    mcap_min: float = 0,
-    mcap_max: float = float("inf"),
-) -> list[ScreenerRow]:
-    """Apply filters to the results."""
-    filtered = rows.copy()
-    
-    # Filter by score
-    if min_score > 0:
-        filtered = [r for r in filtered if r.score is not None and r.score >= min_score]
-    
-    # Filter by verdict
-    if verdict_filter:
-        filtered = [r for r in filtered if r.verdict in verdict_filter]
-    
-    # Filter by sector (multi-select)
-    if sector_filter:
-        filtered = [r for r in filtered if r.sector in sector_filter]
-    
-    # Filter by exchange (multi-select)
-    if exchange_filter:
-        filtered = [r for r in filtered if r.exchange in exchange_filter]
-
-    # Market cap filter (applied at display time)
-    if mcap_min > 0:
-        filtered = [r for r in filtered if r.market_cap is not None and r.market_cap >= mcap_min]
-    if mcap_max < float("inf"):
-        filtered = [r for r in filtered if r.market_cap is not None and r.market_cap <= mcap_max]
-        
-    # Filter by search term
-    if ticker_search:
-        search = ticker_search.upper()
-        filtered = [r for r in filtered if search in r.ticker.upper() or search in r.company.upper()]
-    
-    # Filter out errors
-    if not show_full_table:
-        filtered = [r for r in filtered if r.error is None]
-    
-    return filtered
-
 
 # ==================== MAIN SCREENER UI ====================
 def render_stock_screener() -> None:
@@ -682,6 +703,11 @@ def render_stock_screener() -> None:
             value=False,
             help="Ignore all cached results and re-analyze every ticker from scratch."
         )
+        
+        if st.button("🔨 Rebuild universe cache", help="Refresh sector/exchange metadata. Takes ~10 min."):
+            _build_universe_cache(force=True)
+            st.cache_data.clear()
+            st.rerun()
 
         # --- Big 5 growth thresholds ---
         with st.expander("📊 Big 5 growth thresholds", expanded=False):
@@ -824,9 +850,51 @@ def render_stock_screener() -> None:
             if SCREENER_CACHE.exists():
                 SCREENER_CACHE.unlink()          # Disk cache
         
-        all_tickers = get_combined_tickers(include_us=True, include_india=include_india)
+        # ---- Pre-scan filter: only analyze tickers that pass the settings filters ----
+        universe_df = load_stock_universe()   # cached DataFrame with sector/exchange/mcap
+
+        if not include_india:
+            universe_df = universe_df[
+                ~universe_df["ticker"].str.endswith((".NS", ".BO"), na=False)
+            ]
+        if include_india:
+            try:
+                india_tickers = get_indian_stock_tickers()
+                india_df = pd.DataFrame({
+                    "ticker": india_tickers,
+                    "exchange": [
+                        "NSE" if t.endswith(".NS") else "BSE"
+                        for t in india_tickers
+                    ],
+                    "sector": [""] * len(india_tickers),
+                    "market_cap": [0] * len(india_tickers),
+                })
+                universe_df = pd.concat([universe_df, india_df], ignore_index=True)
+            except Exception:
+                pass  # if India fetch fails, continue with US only
+
+        if sector_filter:
+            universe_df = universe_df[universe_df["sector"].isin(sector_filter)]
+
+        if exchange and exchange != "All Exchanges":
+            universe_df = universe_df[universe_df["exchange"] == exchange]
+
+        if min_mcap > 0:
+            universe_df = universe_df[universe_df["market_cap"] >= min_mcap]
+        if max_mcap < float("inf"):
+            universe_df = universe_df[universe_df["market_cap"] <= max_mcap]
+
+        all_tickers = universe_df["ticker"].tolist()
         region = "US + India" if include_india else "US"
-        st.info(f"📊 **Universe:** {len(all_tickers):,} {region}-listed stocks — running full scan")
+
+        if not all_tickers:
+            st.warning("No tickers match the current Company Size / Exchange / Sector filters.")
+            st.stop()
+
+        st.info(
+            f"📊 **Universe after pre-filters:** {len(all_tickers):,} {region}-listed stocks "
+            f"— running scan on the filtered set"
+        )
 
         results = deep_analyze_batch(
             all_tickers,
@@ -853,93 +921,17 @@ def render_stock_screener() -> None:
 
     # Stats
     display_screener_stats(rows)
+    
+    # All filtering is handled by the results table itself (column filters)
+    filtered_rows = rows
 
-    # ========== FILTER SECTION (AUTO-APPLY, NO BUTTON) ==========
-    st.markdown("### 🔍 Filter Results")
-    st.caption("Adjust filters below - results update automatically")
-    
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    
-    with filter_col1:
-        min_score = st.slider(
-            "Minimum Wonderfulness Score",
-            min_value=0.0,
-            max_value=10.0,
-            value=0.0,
-            step=0.5,
-            help="Only show stocks with score >= this value"
-        )
-        
-        # Multi-select for verdicts
-        verdict_filter = st.multiselect(
-            "Verdict",
-            options=["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown", "Error"],
-            default=["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown", "Error"],
-            help="Select which verdicts to show"
-        )
-    
-    with filter_col2:
-        # Multi-select for sectors in results
-        available_sectors = sorted(set([r.sector for r in rows if r.sector]))
-        
-        sector_result_filter = st.multiselect(
-            "Sector",
-            options=available_sectors,
-            default=[],
-            help="Filter by sector. Leave empty for all sectors.",
-            placeholder="All Sectors",
-        )
-        
-        # Multi-select for exchanges in results
-        available_exchanges = sorted(set([r.exchange for r in rows if r.exchange]))
-        
-        exchange_result_filter = st.multiselect(
-            "Exchange",
-            options=available_exchanges,
-            default=[],
-            help="Filter by exchange. Leave empty for all exchanges.",
-            placeholder="All Exchanges",
-        )
-    
-    with filter_col3:
-        ticker_search = st.text_input(
-            "Search Ticker/Company",
-            placeholder="e.g., AAPL or Apple",
-            help="Search by ticker or company name"
-        )
-        
-        # Show full table toggle
-        show_full_table = st.checkbox(
-            "Show all results (including errors)",
-            value=True,
-            help="When unchecked, hides stocks that failed analysis"
-        )
-
-    # Auto-apply filters (no button needed!)
-    filtered_rows = apply_filters(
-        rows, 
-        min_score, 
-        verdict_filter, 
-        sector_result_filter, 
-        exchange_result_filter,
-        ticker_search, 
-        show_full_table,
-        mcap_min=min_mcap,
-        mcap_max=max_mcap,
-    )
-    
     # Show count
     st.caption(f"📊 Showing **{len(filtered_rows)}** of **{len(rows)}** results")
     
     # Display filtered results
     if filtered_rows:
         df_filtered = rows_to_dataframe(filtered_rows)
-        st.dataframe(
-            style_screener_table(df_filtered),
-            use_container_width=True,
-            hide_index=True,
-            height=600,
-        )
+        _render_aggrid(df_filtered)
     else:
         st.warning("No results match your filters. Try adjusting the criteria above.")
         df_filtered = pd.DataFrame()

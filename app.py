@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import json
 import warnings
 from data_provider import get_ticker
-from investments import render_my_investments
+from investments import _metric_html, render_my_investments
 
 from trade_manager import (
     compute_target_shares,
@@ -602,7 +602,52 @@ def render_analyzer() -> None:
     top2.metric("Market Cap", _fmt_money(fin.market_cap, fin.exchange, fin.ticker))
     top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange or "USD"))
     top4.metric("TTM P/E", f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "n/a")
-    top5.metric("Div Yield", _fmt_pct(fin.dividend_yield))
+
+    # Long-term debt with health coloring
+    _ltd_ttm = float(fin.long_term_debt.iloc[-1]) if not fin.long_term_debt.empty else None
+    _fcf_ttm = float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None
+
+    if _ltd_ttm is None:
+        _debt_value = "n/a"
+        _debt_color = "#9AA0A6"
+        _debt_sub = ""
+    elif _ltd_ttm <= 0:
+        _debt_value = "$0"
+        _debt_color = "#9AA0A6"
+        _debt_sub = "debt-free"
+    elif _fcf_ttm is None:
+        _debt_value = _fmt_money(_ltd_ttm, fin.exchange, fin.ticker)
+        _debt_color = "#9AA0A6"
+        _debt_sub = "no FCF data"
+    elif _fcf_ttm <= 0:
+        # Worst case: negative free cash flow means no operating cash to
+        # service the debt. There's no meaningful "years to pay off" number —
+        # the ratio is undefined. Show the debt amount and make it clear this
+        # is more severe than any ratio can express.
+        _debt_value = _fmt_money(_ltd_ttm, fin.exchange, fin.ticker)
+        _debt_color = "#EF5350"
+        _debt_sub = "⚠ SEVERE · negative FCF"
+    else:
+        _years_to_pay = _ltd_ttm / _fcf_ttm
+        _debt_value = _fmt_money(_ltd_ttm, fin.exchange, fin.ticker)
+        if _years_to_pay > 5:
+            _debt_color = "#EF5350"
+            _debt_sub = f"{_years_to_pay:.1f}× FCF · Heavy"
+        elif _years_to_pay > 3:
+            _debt_color = "#FFC107"   # amber
+            _debt_sub = f"{_years_to_pay:.1f}× FCF · Elevated"
+        else:
+            _debt_color = "#00E676"
+            _debt_sub = f"{_years_to_pay:.1f}× FCF · Healthy"
+
+    top5.markdown(_metric_html("LT Debt", _debt_value, sub=_debt_sub, sub_color=_debt_color,
+        help_text=(
+            "Long-term debt ÷ TTM free cash flow, shown as 'years to pay off'. "
+            "Green ≤ 3×, yellow 3–5×, red > 5×. Negative FCF is the worst case — "
+            "no operating cash to service the debt."
+        ),
+    ), unsafe_allow_html=True)
+
     top6.metric("BVPS", _fmt_money(fin.book_value_per_share, fin.exchange, fin.ticker))
     top7.metric("Years of data", str(fin.years_available))
 
