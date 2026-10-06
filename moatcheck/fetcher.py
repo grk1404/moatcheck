@@ -72,7 +72,11 @@ class Financials:
     data_source: str = "yfinance"           # "edgar+yfinance" or "yfinance"
     data_source_note: str = ""              # UI-facing message about data source
     raw: dict[str, Any] = field(default_factory=dict)
-    exchange: str = ""                      # "NSE", "BSE", "NYSE", etc. 
+    exchange: str = ""                      # "NSE", "BSE", "NYSE", etc.
+    week52_high: float | None = None
+    week52_low: float | None = None
+    company_summary: str = ""
+    company_sector: str = ""
 
     @property
     def years_available(self) -> int:
@@ -351,6 +355,10 @@ def fetch(ticker: str) -> Financials:
     analyst_target_high = None
     analyst_target_low = None
     info_exchange = ""
+    week52_high = None
+    week52_low = None
+    company_summary = ""
+    company_sector = ""
 
     try:
         info = yft.info or {}
@@ -358,7 +366,17 @@ def fetch(ticker: str) -> Financials:
         info_exchange = info.get("exchange", "") or info.get("fullExchangeName", "")
         if info_exchange:
             exchange = info_exchange
+        
+        _w52_high = info.get("fiftyTwoWeekHigh")
+        _w52_low = info.get("fiftyTwoWeekLow")
+        if _w52_high is not None:
+            week52_high = float(_w52_high)
+        if _w52_low is not None:
+            week52_low = float(_w52_low)
 
+        company_summary = info.get("longBusinessSummary") or ""
+        company_sector = info.get("sector") or ""
+        
         if current_price is None:
             current_price = info.get("currentPrice") or info.get("regularMarketPrice")
             if current_price is not None:
@@ -501,4 +519,8 @@ def fetch(ticker: str) -> Financials:
             "candidate_tried": [c[0] for c in candidates],
         },
         exchange=exchange,
+        week52_high=week52_high,
+        week52_low=week52_low,
+        company_summary=company_summary,
+        company_sector=company_sector,
     )

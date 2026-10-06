@@ -31,6 +31,14 @@ from technical_indicators import TechnicalIndicatorAnalyzer
 # Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
 
+def _first_n_sentences(text: str, n: int = 2) -> str:
+    """Return the first N sentences from text, or the whole text if fewer."""
+    if not text:
+        return ""
+    import re
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return " ".join(parts[:n])
+
 def clear_analyzer_cache():
     """Clear all cached data and reset analyzer state."""
     st.cache_data.clear()
@@ -114,7 +122,9 @@ def _fmt_money(v: float | None, exchange: str = "", ticker: str = "") -> str:
         return "n/a"
 
     currency = get_currency_symbol(exchange, ticker)
-    
+
+    if abs(v) >= 1e12:
+        return f"{currency}{v / 1e12:.2f}T"
     if abs(v) >= 1e9:
         return f"{currency}{v / 1e9:.2f}B"
     if abs(v) >= 1e6:
@@ -388,8 +398,9 @@ def render_etf_dashboard(symbol: str, yft) -> None:
                 <div style="display:flex; justify-content:space-between; color:#9aa0a6; font-size:0.85rem;">
                     <span>${_low:,.2f}</span><span>${_high:,.2f}</span>
                 </div>
-                <div style="position:relative; height:8px; background:rgba(255,255,255,0.08); border-radius:4px; margin-top:0.4rem;">
-                    <div style="position:absolute; left:{_pos_pct:.1f}%; top:-4px; width:3px; height:16px; background:#4CAF50; border-radius:2px;"></div>
+                <div style="position:relative; height:8px; background:rgba(255,255,255,0.08); border-radius:4px; margin-top:0.5rem; overflow:hidden;">
+                    <div style="position:absolute; left:0; top:0; width:{_pos_pct:.1f}%; height:100%; background:#4DABF7; border-radius:4px 0 0 4px;"></div>
+                    <div style="position:absolute; left:{_pos_pct:.1f}%; top:-4px; width:3px; height:16px; background:#00E676; border-radius:2px; transform:translateX(-50%);"></div>
                 </div>
                 <div style="color:#9aa0a6; font-size:0.75rem; margin-top:0.4rem;">
                     Current ${_last_price:,.2f} sits at {_pos_pct:.0f}% of the 52-week range.
@@ -590,14 +601,31 @@ def render_analyzer() -> None:
             st.error(f"Unexpected error fetching {symbol}: {e}")
             return
 
+    # Company Name Display 
     st.subheader(f"{fin.company_name} ({fin.ticker})")
+
+    # Company Summary
+    if fin.company_summary or fin.company_sector:
+        with st.expander("Company Summary:", expanded=True):
+            if fin.company_sector:
+                st.markdown(
+                    f'<div style="color:#9aa0a6; font-size:0.85rem; '
+                    f'text-transform:uppercase; letter-spacing:0.05em; '
+                    f'margin-bottom:0.5rem;">'
+                    f'Sector · {fin.company_sector}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            if fin.company_summary:
+                st.markdown(_first_n_sentences(fin.company_summary, 2))
+
     # ADD THIS LINE:
     if fin.exchange in ("NSE", "BSE"):
         st.caption(f"🇮🇳 Listed on {fin.exchange} (₹ INR)")
     elif fin.exchange:
         st.caption(f"US Listed on {fin.exchange}  ($ USD)")
     _eps_ttm = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
-    top1, top2, top3, top4, top5, top6, top7 = st.columns(7)
+    top1, top2, top3, top4, top5, top6, top7, top8 = st.columns(8)
     top1.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
     top2.metric("Market Cap", _fmt_money(fin.market_cap, fin.exchange, fin.ticker))
     top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange or "USD"))
@@ -650,6 +678,40 @@ def render_analyzer() -> None:
 
     top6.metric("BVPS", _fmt_money(fin.book_value_per_share, fin.exchange, fin.ticker))
     top7.metric("Years of data", str(fin.years_available))
+
+    if fin.week52_high and fin.week52_low and fin.week52_high > fin.week52_low:
+        _w52_pct = (
+            (fin.current_price - fin.week52_low)
+            / (fin.week52_high - fin.week52_low) * 100
+            if fin.current_price else None
+        )
+        _w52_sub = (
+            f"Current ${fin.current_price:,.2f} ({_w52_pct:.0f}%)"
+            if fin.current_price and _w52_pct is not None
+            else ""
+        )
+        top8.markdown(_metric_html(
+            "52-Week Range",
+            f"${fin.week52_low:,.0f} – ${fin.week52_high:,.0f}",
+            sub=_w52_sub,
+            sub_color="#9aa0a6",
+            help_text=(
+                f"52-week low ${fin.week52_low:,.2f}, "
+                f"high ${fin.week52_high:,.2f}."
+                + (
+                    f" Current price ${fin.current_price:,.2f} sits at "
+                    f"{_w52_pct:.0f}% of the range."
+                    if _w52_pct is not None else ""
+                )
+            ),
+        ), unsafe_allow_html=True)
+    elif fin.week52_high and fin.week52_low:
+        top8.markdown(_metric_html(
+            "52-Week Range",
+            f"${fin.week52_low:,.0f} – ${fin.week52_high:,.0f}",
+        ), unsafe_allow_html=True)
+    else:
+        top8.metric("52-Week Range", "n/a")
 
     # Data-source note is shown in the footer only — not up top. Split-artifact
     # flag is precomputed here and rendered alongside the footer note.
@@ -1939,6 +2001,45 @@ def render_technical_analysis():
                         f"technical rules flip to BUY."
                     )
 
+            # --- 52-week range ---
+            st.markdown("### 52-Week Range")
+            try:
+                _df = analyzer.stock_data
+                if _df is not None and len(_df) >= 200:
+                    _high_52 = float(_df["High"].tail(252).max())
+                    _low_52 = float(_df["Low"].tail(252).min())
+                    _cur = float(verdict_data["current_price"])
+
+                    if _high_52 > _low_52 and _cur == _cur:
+                        _pos_pct = max(0.0, min(100.0,
+                            (_cur - _low_52) / (_high_52 - _low_52) * 100))
+
+                        st.markdown(
+                            f"""
+                            <div style="margin: 0.5rem 0 1rem;">
+                                <div style="display:flex; justify-content:space-between;
+                                            color:#9aa0a6; font-size:0.85rem;">
+                                    <span>Low ${_low_52:,.2f}</span>
+                                    <span>Current <strong style="color:#e8eaed;">${_cur:,.2f}</strong></span>
+                                    <span>High ${_high_52:,.2f}</span>
+                                </div>
+                                <div style="position:relative; height:8px; background:rgba(255,255,255,0.08); border-radius:4px; margin-top:0.5rem; overflow:hidden;">
+                                    <div style="position:absolute; left:0; top:0; width:{_pos_pct:.1f}%; height:100%; background:#4DABF7; border-radius:4px 0 0 4px;"></div>
+                                    <div style="position:absolute; left:{_pos_pct:.1f}%; top:-4px; width:3px; height:16px; background:#00E676; border-radius:2px; transform:translateX(-50%);"></div>
+                                </div>
+                                <div style="color:#9aa0a6; font-size:0.75rem; margin-top:0.5rem;">
+                                    Current price is at {_pos_pct:.0f}% of the 52-week range.
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.caption("52-week range unavailable.")
+                else:
+                    st.caption("Not enough history for 52-week range.")
+            except Exception:
+                st.caption("52-week range unavailable.")
 
             # --- Signal Summary (matching Stock Analyzer table style) ---
             st.markdown("### Signal Summary")
@@ -2267,7 +2368,139 @@ def render_technical_analysis():
                     mime="text/csv"
                 )
 
+def _read_sleeve_positions() -> dict:
+    """Read TQQQ and SQQQ quantity + average cost basis from
+    data/sleeve_positions.csv (Fidelity positions export).
 
+    Reads with the csv module and addresses columns by index, because
+    Fidelity's header row has one fewer field than the data rows — this
+    causes pandas to misalign the columns. Returns:
+        {"TQQQ": {"qty": float, "avg_cost": float}, "SQQQ": {...}}
+    or {} if the file is missing or unreadable.
+    """
+    import csv
+    from pathlib import Path
+
+    path = Path("data/sleeve_positions.csv")
+    if not path.exists():
+        return {}
+
+    out: dict[str, dict] = {}
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            for i, row in enumerate(reader):
+                if i == 0:
+                    continue  # skip header
+                if not row or len(row) < 20:
+                    continue
+                sym = (row[2] or "").strip()
+                if sym not in ("TQQQ", "SQQQ"):
+                    continue
+
+                def _num(v):
+                    if v is None:
+                        return None
+                    try:
+                        return float(str(v).replace("$", "").replace(",", "").strip())
+                    except Exception:
+                        return None
+
+                qty = _num(row[18])
+                avg = _num(row[19])
+                if qty is not None and avg is not None:
+                    out[sym] = {"qty": qty, "avg_cost": avg}
+    except Exception:
+        return {}
+
+    return out
+
+def _compute_unrealized_pnl() -> dict:
+    """Compute unrealized P&L on the current TQQQ/SQQQ position.
+
+    Reads cost basis and quantity from data/sleeve_positions.csv (Fidelity's
+    authoritative numbers) when available. Falls back to the trade log's
+    running average cost otherwise.
+
+    Fidelity uses specific-lot accounting; the trade log uses running-average
+    accounting. They will never match exactly. Preferring the CSV makes the
+    app's number consistent with what you see in the Fidelity app.
+    """
+    from pathlib import Path
+    from data_provider import get_ticker
+    from trade_manager import load_position, compute_realized_pnl
+
+    pos = load_position()
+    tq_qty = float(pos.get("tqqq_shares", 0.0))
+    sq_qty = float(pos.get("sqqq_shares", 0.0))
+
+    tq_avg = None
+    sq_avg = None
+    source = "log"
+
+    # ---- Preferred: sleeve positions CSV from Fidelity ----
+        # ---- Preferred: sleeve positions CSV from Fidelity ----
+    sleeve = _read_sleeve_positions()
+    if "TQQQ" in sleeve and "SQQQ" in sleeve:
+        tq_avg = sleeve["TQQQ"]["avg_cost"]
+        sq_avg = sleeve["SQQQ"]["avg_cost"]
+        tq_qty = sleeve["TQQQ"]["qty"]
+        sq_qty = sleeve["SQQQ"]["qty"]
+        source = "sleeve_csv"
+
+    # ---- Fallback: trade log's running average ----
+    if tq_avg is None or sq_avg is None:
+        try:
+            trades = compute_realized_pnl()
+            if not trades.empty:
+                if tq_avg is None and "avg_cost_before" in trades.columns:
+                    _c = trades[trades["ticker"] == "TQQQ"]["avg_cost_before"].dropna()
+                    if not _c.empty:
+                        tq_avg = float(_c.iloc[-1])
+                if sq_avg is None and "avg_cost_before" in trades.columns:
+                    _c = trades[trades["ticker"] == "SQQQ"]["avg_cost_before"].dropna()
+                    if not _c.empty:
+                        sq_avg = float(_c.iloc[-1])
+        except Exception:
+            pass
+
+    # ---- Current prices (last close) ----
+    try:
+        tq_px = float(get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1])
+    except Exception:
+        tq_px = None
+    try:
+        sq_px = float(get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1])
+    except Exception:
+        sq_px = None
+
+    tq_unreal = (
+        (tq_px - tq_avg) * tq_qty
+        if tq_px is not None and tq_avg is not None else None
+    )
+    sq_unreal = (
+        (sq_px - sq_avg) * sq_qty
+        if sq_px is not None and sq_avg is not None else None
+    )
+
+    total = None
+    if tq_unreal is not None and sq_unreal is not None:
+        total = tq_unreal + sq_unreal
+    elif tq_unreal is not None:
+        total = tq_unreal
+    elif sq_unreal is not None:
+        total = sq_unreal
+
+    return {
+        "total": total,
+        "tqqq": tq_unreal,
+        "sqqq": sq_unreal,
+        "tqqq_avg": tq_avg,
+        "sqqq_avg": sq_avg,
+        "tqqq_qty": tq_qty,
+        "sqqq_qty": sq_qty,
+        "source": source,
+    }
 def render_tqqq_sqqq_signals():
     """TQQQ/SQQQ Multi-Strategy Signals tab — daily trading decisions"""
     st.header("🤖 TQQQ/SQQQ Multi-Strategy Signals")
@@ -2460,14 +2693,13 @@ def render_tqqq_sqqq_signals():
             )
             st.session_state["tqqq_capital"] = account_value
 
-        # --- Cumulative P&L banner ---
+        # --- Cumulative P&L banner (two cards: committed vs unrealized) ---
         _running = compute_running_pnl()
+        _unreal = _compute_unrealized_pnl()
 
         if _running["net_capital"] > 0 and _running["sleeve_value"] > 0:
             _pnl = _running["pnl_dollars"]
             _pnl_pct = _running["pnl_pct"]
-
-            # Green when positive, red when negative
             if _pnl > 0:
                 _pnl_color, _pnl_bg, _pnl_icon = "#00E676", "#1e4620", "📈"
             elif _pnl < 0:
@@ -2475,32 +2707,68 @@ def render_tqqq_sqqq_signals():
             else:
                 _pnl_color, _pnl_bg, _pnl_icon = "#9AA0A6", "#2a2a2a", "➖"
 
-            st.markdown(f"""
-            <div style="background-color:{_pnl_bg}; border:2px solid {_pnl_color};
-                        border-radius:10px; padding:1.5rem; margin:0.75rem 0;
-                        display:flex; align-items:center; justify-content:space-between;
-                        flex-wrap:wrap; gap:1rem;">
-                <div style="flex:1; min-width:220px;">
-                    <div style="color:#9aa0a6; font-size:0.75rem; text-transform:uppercase;
+            _colA, _colB = st.columns(2)
+
+            with _colA:
+                st.markdown(f"""
+                <div style="background-color:{_pnl_bg}; border:2px solid {_pnl_color};
+                            border-radius:10px; padding:1.25rem; margin:0.75rem 0;">
+                    <div style="color:#9aa0a6; font-size:0.7rem; text-transform:uppercase;
                                 letter-spacing:0.05em;">
-                        Cumulative P&amp;L vs committed capital
+                        P&amp;L vs committed capital
                     </div>
-                    <div style="color:{_pnl_color}; font-size:3rem; font-weight:700;
-                                line-height:1.05; margin-top:0.35rem;">
+                    <div style="color:{_pnl_color}; font-size:2rem; font-weight:700;
+                                line-height:1.1; margin-top:0.35rem;">
                         {_pnl_icon} ${_pnl:+,.2f}
                     </div>
-                    <div style="color:{_pnl_color}; font-size:1.1rem; font-weight:600;
-                                margin-top:0.25rem;">
+                    <div style="color:{_pnl_color}; font-size:1rem; font-weight:600;
+                                margin-top:0.15rem;">
                         {_pnl_pct:+.2f}%
                     </div>
+                    <div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.6rem;">
+                        Sleeve ${_running['sleeve_value']:,.2f} · Committed ${_running['net_capital']:,.2f}
+                    </div>
                 </div>
-                <div style="text-align:right; color:#9aa0a6; font-size:0.9rem;
-                            line-height:1.6;">
-                    <div>Sleeve value: <strong style="color:#e8eaed;">${_running['sleeve_value']:,.2f}</strong></div>
-                    <div>Committed: <strong style="color:#e8eaed;">${_running['net_capital']:,.2f}</strong></div>
+                """, unsafe_allow_html=True)
+
+            with _colB:
+                _u = _unreal.get("total")
+                if _u is None:
+                    _u_color, _u_bg, _u_icon = "#9AA0A6", "#2a2a2a", "➖"
+                    _u_text = "n/a"
+                elif _u > 0:
+                    _u_color, _u_bg, _u_icon = "#00E676", "#1e4620", "📈"
+                    _u_text = f"${_u:+,.2f}"
+                elif _u < 0:
+                    _u_color, _u_bg, _u_icon = "#EF5350", "#4b1e1e", "📉"
+                    _u_text = f"${_u:+,.2f}"
+                else:
+                    _u_color, _u_bg, _u_icon = "#9AA0A6", "#2a2a2a", "➖"
+                    _u_text = "$0.00"
+
+                _breakdown = ""
+                if _unreal.get("tqqq") is not None and _unreal.get("sqqq") is not None:
+                    _breakdown = (
+                        f"TQQQ ${_unreal['tqqq']:+,.2f} · "
+                        f"SQQQ ${_unreal['sqqq']:+,.2f}"
+                    )
+
+                st.markdown(f"""
+                <div style="background-color:{_u_bg}; border:2px solid {_u_color};
+                            border-radius:10px; padding:1.25rem; margin:0.75rem 0;">
+                    <div style="color:#9aa0a6; font-size:0.7rem; text-transform:uppercase;
+                                letter-spacing:0.05em;">
+                        Unrealized P&amp;L (open positions)
+                    </div>
+                    <div style="color:{_u_color}; font-size:2rem; font-weight:700;
+                                line-height:1.1; margin-top:0.35rem;">
+                        {_u_icon} {_u_text}
+                    </div>
+                    <div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.75rem;">
+                        {_breakdown}
+                    </div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
         else:
             st.info(
                 "Cumulative P&L will appear once capital and a current position are recorded."
@@ -2769,19 +3037,44 @@ def render_tqqq_sqqq_signals():
             total_volume = trades_df["total_value"].sum()
             total_realized = trades_df["cumulative_realized_pnl"].iloc[-1]
 
-            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            _unreal_hist = _compute_unrealized_pnl()
+            _unreal_val = _unreal_hist.get("total")
+            _net_pnl = (
+                total_realized + _unreal_val
+                if _unreal_val is not None else None
+            )
+
+            sc1, sc2, sc3, sc4, sc5, sc6, sc7 = st.columns(7)
             sc1.metric("Total trades", total_trades)
             sc2.metric("Buys", int(buy_count))
             sc3.metric("Sells", int(sell_count))
             sc4.metric("Total volume", f"${total_volume:,.2f}")
             sc5.metric(
-                "Cumulative realized P&L",
+                "Realized P&L",
                 f"${total_realized:+,.2f}",
                 delta_color="normal" if total_realized >= 0 else "inverse",
             )
+            sc6.metric(
+                "Unrealized P&L",
+                f"${_unreal_val:+,.2f}" if _unreal_val is not None else "n/a",
+                delta_color=(
+                    "normal" if _unreal_val is not None and _unreal_val >= 0
+                    else "inverse" if _unreal_val is not None and _unreal_val < 0
+                    else "off"
+                ),
+            )
+            sc7.metric(
+                "Net P&L",
+                f"${_net_pnl:+,.2f}" if _net_pnl is not None else "n/a",
+                delta_color=(
+                    "normal" if _net_pnl is not None and _net_pnl >= 0
+                    else "inverse" if _net_pnl is not None and _net_pnl < 0
+                    else "off"
+                ),
+            )
 
             # Display sorted by time descending so the newest trade is at the top
-            display_df = trades_df.sort_values("timestamp", ascending=True).copy()
+            display_df = trades_df.sort_values("timestamp", ascending=False).copy()
 
             # Format the new columns for readability
             display_df["realized_pnl_this_trade"] = display_df["realized_pnl_this_trade"].apply(

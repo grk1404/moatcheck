@@ -175,6 +175,8 @@ class ScreenerRow:
     verdict: str
     pe_ratio: float | None = None
     exchange: str | None = None
+    week52_high: float | None = None
+    week52_low: float | None = None
     sector: str | None = None
     industry: str | None = None
     market_cap: float | None = None
@@ -212,6 +214,8 @@ def fmt_money(v: float | None, ticker: str = "") -> str:
     if v is None:
         return "n/a"
     symbol = _currency_symbol(ticker)
+    if abs(v) >= 1e12:
+        return f"{symbol}{v / 1e12:.2f}T"
     if abs(v) >= 1e9:
         return f"{symbol}{v / 1e9:.2f}B"
     if abs(v) >= 1e6:

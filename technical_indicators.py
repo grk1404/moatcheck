@@ -61,31 +61,30 @@ class TechnicalIndicatorAnalyzer:
             return False
     
     def get_volume_signal_weight(self):
-        """
-        Return a multiplier (0.5x to 2.0x) that scales how much we trust
-        the current trading signal, based on volume.
+        """Return a multiplier (0.7x to 1.5x) that scales confidence based on volume.
+
+        The 20-day average is skewed upward by occasional spike days, so the
+        median daily volume is typically 0.6–0.8× the average. The neutral band
+        is therefore set at 0.5–1.2× so that normal days don't dampen confidence.
+        Only genuinely thin (<0.3×) or genuinely elevated (≥1.2×) volume moves
+        the number.
         """
         if not hasattr(self, "volume_metrics") or not self.volume_metrics:
             return 1.0
 
-        severity = self.volume_metrics["severity"]
-        direction = self.volume_metrics["price_direction"]
+        ratio = self.volume_metrics.get("volume_ratio", 1.0)
 
-        # Signal direction alignment check happens in the caller.
-        # Here we just return the confidence multiplier.
-        if severity == "extreme":
-            return 2.0
-        if severity == "spike":
-            return 1.5
-        if severity == "elevated":
-            return 1.2
-        if severity == "normal":
-            return 1.0
-        if severity == "low":
-            return 0.7
-        if severity == "very_low":
-            return 0.5
-        return 1.0
+        if ratio >= 3.0:
+            return 1.5      # extreme spike
+        if ratio >= 2.0:
+            return 1.3      # strong spike
+        if ratio >= 1.2:
+            return 1.1      # elevated
+        if ratio >= 0.5:
+            return 1.0      # normal band (the wide neutral zone)
+        if ratio >= 0.3:
+            return 0.85     # below average but not alarming
+        return 0.7          # very thin
     
     def calculate_all_indicators(self):
         """Calculate all technical indicators  (MACD uses 8, 17, 9)"""
@@ -260,166 +259,325 @@ class TechnicalIndicatorAnalyzer:
             'high': latest['High'],
             'low': latest['Low']
         }
-    
-    def get_trading_signals(self):
-        """
-        Generate trading signals based on technical indicators
+    # ============================================================
+    # Weighted scoring helpers — see TECHNICAL SCORING SPEC v1.0
+    # Each helper returns a float in [-1.00, +1.00].
+    # ============================================================
+
+    _W_SMA = 0.22
+    _W_MACD = 0.18
+    _W_RSI = 0.18
+    _W_STOCH = 0.22
+    _W_BB = 0.20
+
+    def _classify_regime(self):
+        """Return 'BULL', 'BEAR', or 'NEUTRAL' from price vs SMA50/SMA200."""
+        price = self.indicators.get("current_price")
+        sma50 = self.indicators.get("SMA_50")
+        sma200 = self.indicators.get("SMA_200")
+        if price is None or sma50 is None or sma200 is None:
+            return "NEUTRAL"
+        if price > sma50 > sma200:
+            return "BULL"
+        if price < sma50 < sma200:
+            return "BEAR"
+        return "NEUTRAL"
+
+    def _score_sma(self):
+        """SMA position score: -1..+1. One combined signal for SMA50+SMA200."""
+        price = self.indicators.get("current_price")
+        sma50 = self.indicators.get("SMA_50")
+        sma200 = self.indicators.get("SMA_200")
+        if price is None or sma50 is None or sma200 is None:
+            return 0.0, "SMA unavailable"
+        if price > sma50 and price > sma200:
+            return 1.00, f"Price ${price:.2f} above SMA50 (${sma50:.2f}) and SMA200 (${sma200:.2f}) — bullish"
+        if price < sma50 and price < sma200:
+            return -1.00, f"Price ${price:.2f} below SMA50 (${sma50:.2f}) and SMA200 (${sma200:.2f}) — bearish"
+        if price > sma50:
+            return 0.50, f"Price above SMA50 but below SMA200 — early recovery"
+        return -0.50, f"Price below SMA50 but above SMA200 — early breakdown"
+
+    def _score_macd(self):
+        """MACD score based on histogram magnitude, with fresh-crossover bonus."""
+        hist = self.indicators.get("MACD_Histogram")
+        price = self.indicators.get("current_price")
+        if hist is None or price is None or price <= 0:
+            return 0.0, "MACD unavailable"
+
+        raw = (hist / price) * 100 * 5
+        score = max(-1.0, min(1.0, raw))
+
+        # Fresh crossover bonus: check last 3 bars for MACD/Signal cross
+        try:
+            macd = self.stock_data["MACD"].dropna()
+            sig = self.stock_data["Signal_Line"].dropna()
+            if len(macd) >= 4 and len(sig) >= 4:
+                for i in range(-3, 0):
+                    crossed_up = macd.iloc[i] > sig.iloc[i] and macd.iloc[i-1] <= sig.iloc[i-1]
+                    crossed_dn = macd.iloc[i] < sig.iloc[i] and macd.iloc[i-1] >= sig.iloc[i-1]
+                    if crossed_up and score > 0:
+                        score = max(-1.0, min(1.0, score * 1.30))
+                        return score, f"MACD bullish crossover {abs(i)} bars ago, histogram {hist:+.3f}"
+                    if crossed_dn and score < 0:
+                        score = max(-1.0, min(1.0, score * 1.30))
+                        return score, f"MACD bearish crossover {abs(i)} bars ago, histogram {hist:+.3f}"
+        except Exception:
+            pass
+
+        direction = "positive" if score > 0 else ("negative" if score < 0 else "flat")
+        return score, f"MACD histogram {hist:+.3f} ({direction} momentum)"
+
+    def _score_rsi(self, regime):
+        """RSI score with regime awareness and direction modifier."""
+        rsi = self.indicators.get("RSI")
+        if rsi is None:
+            return 0.0, "RSI unavailable"
+
+        if regime == "BULL":
+            if rsi < 30:
+                base, reason = 1.00, f"RSI {rsi:.1f} — oversold in bull regime (buy the dip)"
+            elif rsi < 40:
+                base, reason = 0.50, f"RSI {rsi:.1f} — recovering from oversold"
+            elif rsi <= 60:
+                base, reason = 0.00, f"RSI {rsi:.1f} — neutral"
+            elif rsi <= 70:
+                base, reason = 0.00, f"RSI {rsi:.1f} — elevated, ignored in bull regime"
+            else:
+                base, reason = -0.30, f"RSI {rsi:.1f} — overbought but trend intact (mild caution)"
+        elif regime == "BEAR":
+            if rsi < 30:
+                base, reason = 0.30, f"RSI {rsi:.1f} — oversold but downtrend (half credit)"
+            elif rsi <= 70:
+                base, reason = 0.00, f"RSI {rsi:.1f} — neutral"
+            else:
+                base, reason = -1.00, f"RSI {rsi:.1f} — overbought in bear regime (sell)"
+        else:
+            if rsi < 30:
+                base, reason = 0.70, f"RSI {rsi:.1f} — oversold"
+            elif rsi < 40:
+                base, reason = 0.30, f"RSI {rsi:.1f} — approaching oversold"
+            elif rsi <= 60:
+                base, reason = 0.00, f"RSI {rsi:.1f} — neutral"
+            elif rsi <= 70:
+                base, reason = -0.30, f"RSI {rsi:.1f} — approaching overbought"
+            else:
+                base, reason = -0.70, f"RSI {rsi:.1f} — overbought"
+
+        # Direction modifier over last 3 bars
+        try:
+            rsi_series = self.stock_data["RSI"].dropna()
+            if len(rsi_series) >= 4:
+                if rsi_series.iloc[-1] > rsi_series.iloc[-4]:
+                    base += 0.10
+                    reason += " (rising)"
+                elif rsi_series.iloc[-1] < rsi_series.iloc[-4]:
+                    base -= 0.10
+                    reason += " (falling)"
+        except Exception:
+            pass
+
+        return max(-1.0, min(1.0, base)), reason
+
+    def _score_stoch(self, regime):
+        """Stochastic score from %K level, crossover bonus, regime adjustment."""
+        k = self.indicators.get("Stoch_%K")
+        d = self.indicators.get("Stoch_%D")
+        if k is None or d is None:
+            return 0.0, "Stochastic unavailable"
+
+        # Base from %K level
+        if k < 20:
+            base, reason = 0.80, f"%K {k:.1f} — oversold"
+        elif k < 50:
+            base, reason = 0.20, f"%K {k:.1f} — lower half"
+        elif k < 80:
+            base, reason = -0.20, f"%K {k:.1f} — upper half"
+        else:
+            base, reason = -0.80, f"%K {k:.1f} — overbought"
+
+        # Crossover bonus (last 3 bars)
+        try:
+            k_series = self.stock_data["%K"].dropna()
+            d_series = self.stock_data["%D"].dropna()
+            if len(k_series) >= 4 and len(d_series) >= 4:
+                for i in range(-3, 0):
+                    k_up = k_series.iloc[i] > d_series.iloc[i] and k_series.iloc[i-1] <= d_series.iloc[i-1]
+                    k_dn = k_series.iloc[i] < d_series.iloc[i] and k_series.iloc[i-1] >= d_series.iloc[i-1]
+                    if k_up and k < 30:
+                        base += 0.40
+                        reason += " · fresh bullish crossover from oversold"
+                        break
+                    if k_dn and k > 70:
+                        base -= 0.40
+                        reason += " · fresh bearish crossover from overbought"
+                        break
+        except Exception:
+            pass
+
+        # Regime adjustment: halve signals that fight the trend
+        if regime == "BULL" and base < 0:
+            base *= 0.5
+            reason += " (halved — bull regime)"
+        elif regime == "BEAR" and base > 0:
+            base *= 0.5
+            reason += " (halved — bear regime)"
+
+        return max(-1.0, min(1.0, base)), reason
+
+    def _score_bollinger(self, regime):
+        """Bollinger position score with regime adjustment."""
+        price = self.indicators.get("current_price")
+        upper = self.indicators.get("BB_Upper")
+        lower = self.indicators.get("BB_Lower")
+        if price is None or upper is None or lower is None or upper <= lower:
+            return 0.0, "Bollinger unavailable"
+
+        pos = (price - lower) / (upper - lower)  # 0..1
+
+        if pos < 0.10:
+            base, reason = 0.80, f"At lower Bollinger Band ({pos*100:.0f}%) — oversold"
+        elif pos < 0.30:
+            base, reason = 0.40, f"Lower-mid band ({pos*100:.0f}%)"
+        elif pos < 0.70:
+            base, reason = 0.00, f"Mid-band ({pos*100:.0f}%)"
+        elif pos < 0.90:
+            base, reason = -0.40, f"Upper-mid band ({pos*100:.0f}%)"
+        else:
+            base, reason = -0.80, f"At upper Bollinger Band ({pos*100:.0f}%) — overbought"
+
+        if regime == "BULL" and base < 0:
+            base *= 0.5
+            reason += " (halved — bull regime)"
+        elif regime == "BEAR" and base > 0:
+            base *= 0.5
+            reason += " (halved — bear regime)"
+
+        # 52-week high proximity — regime-conditional
+        try:
+            high_52w = self.stock_data["High"].rolling(252, min_periods=200).max().iloc[-1]
+            if high_52w and price >= high_52w * 0.98:
+                if regime == "BULL":
+                    base += 0.15
+                    reason += " · near 52w high (bull regime, confirmation)"
+                elif regime == "NEUTRAL":
+                    base -= 0.10
+                    reason += " · near 52w high (neutral regime, extended)"
+                # In BEAR regime, ignore — 52w high in a bear market is unusual
+        except Exception:
+            pass
         
-        Returns:
-        --------
-        dict: Contains buy/sell signals with confidence levels
+        return max(-1.0, min(1.0, base)), reason
+        
+    def get_trading_signals(self):
+        """Generate trading signals using the weighted composite scoring model.
+
+        Composite = SMA×0.22 + MACD×0.18 + RSI×0.18 + Stoch×0.22 + BB×0.20
+        Each sub-score is in [-1, +1], so composite is in [-1, +1].
         """
         if not self.indicators:
             return {'error': 'No indicators calculated'}
-        
-        signals = {
-            'buy_signals': [],
-            'sell_signals': [],
-            'neutral_signals': [],
-            'volume_details': [],
-            'buy_count': 0,
-            'sell_count': 0,
-            'total_signals': 0,
-            'recommendation': 'NEUTRAL',
-            'confidence': 0
-        }
-        
-        price = self.indicators['current_price']
-        
-        # 1. Moving Average Signals
-        if self.indicators['SMA_50'] and self.indicators['SMA_200']:
-            if price > self.indicators['SMA_50'] and price > self.indicators['SMA_200']:
-                signals['buy_signals'].append('Price above 50 & 200 SMA - Bullish trend')
-                signals['buy_count'] += 1
-            elif price < self.indicators['SMA_50'] and price < self.indicators['SMA_200']:
-                signals['sell_signals'].append('Price below 50 & 200 SMA - Bearish trend')
-                signals['sell_count'] += 1
-            else:
-                signals['neutral_signals'].append('Mixed MA signals - Sideways trend')
-        
-        # 2. MACD Signal
-        if self.indicators['MACD'] > self.indicators['Signal_Line']:
-            if self.indicators['MACD_Histogram'] > 0:
-                signals['buy_signals'].append('MACD bullish crossover with positive momentum')
-                signals['buy_count'] += 1
-            else:
-                signals['neutral_signals'].append('MACD above signal but losing momentum')
-        else:
-            if self.indicators['MACD_Histogram'] < 0:
-                signals['sell_signals'].append('MACD bearish crossover with negative momentum')
-                signals['sell_count'] += 1
-            else:
-                signals['neutral_signals'].append('MACD below signal but gaining momentum')
-        
-        # 3. Stochastic Oscillator (Buy <20, Sell >80)
-        if self.indicators['Stoch_%K'] < 20 and self.indicators['Stoch_%D'] < 20:
-            if self.indicators['Stoch_%K'] > self.indicators['Stoch_%D']:
-                signals['buy_signals'].append('Stochastic oversold with bullish crossover')
-                signals['buy_count'] += 1
-            else:
-                signals['neutral_signals'].append('Stochastic oversold - waiting for crossover')
-        elif self.indicators['Stoch_%K'] > 80 and self.indicators['Stoch_%D'] > 80:
-            if self.indicators['Stoch_%K'] < self.indicators['Stoch_%D']:
-                signals['sell_signals'].append('Stochastic overbought with bearish crossover')
-                signals['sell_count'] += 1
-            else:
-                signals['neutral_signals'].append('Stochastic overbought - waiting for crossover')
-        else:
-            signals['neutral_signals'].append(f'Stochastic at {self.indicators["Stoch_%K"]:.1f} - Neutral zone')
-        
-        # 4. RSI ( Buy <30, Sell >70)
-        if self.indicators['RSI'] < 30:
-            signals['buy_signals'].append(f'RSI oversold at {self.indicators["RSI"]:.1f}')
-            signals['buy_count'] += 1
-        elif self.indicators['RSI'] > 70:
-            signals['sell_signals'].append(f'RSI overbought at {self.indicators["RSI"]:.1f}')
-            signals['sell_count'] += 1
-        else:
-            signals['neutral_signals'].append(f'RSI at {self.indicators["RSI"]:.1f} - Neutral')
-        
-        # 5. Bollinger Bands ( Buy near lower, Sell near upper)
-        bb_position = ((price - self.indicators['BB_Lower']) / 
-                      (self.indicators['BB_Upper'] - self.indicators['BB_Lower'])) * 100
-        
-        if bb_position < 20:
-            signals['buy_signals'].append(f'Price near lower Bollinger Band ({bb_position:.1f}%)')
-            signals['buy_count'] += 1
-        elif bb_position > 80:
-            signals['sell_signals'].append(f'Price near upper Bollinger Band ({bb_position:.1f}%)')
-            signals['sell_count'] += 1
-        else:
-            signals['neutral_signals'].append(f'Price at {bb_position:.1f}% of BB range - Neutral')
-        
-        # Calculate totals and recommendation
-                # Calculate totals and recommendation
-        signals['total_signals'] = signals['buy_count'] + signals['sell_count'] + len(signals['neutral_signals'])
 
-        # --- Level 3: Volume weighting ---
+        regime = self._classify_regime()
+
+        sma_s, sma_r = self._score_sma()
+        macd_s, macd_r = self._score_macd()
+        rsi_s, rsi_r = self._score_rsi(regime)
+        stoch_s, stoch_r = self._score_stoch(regime)
+        bb_s, bb_r = self._score_bollinger(regime)
+
+        composite = (
+            sma_s * self._W_SMA
+            + macd_s * self._W_MACD
+            + rsi_s * self._W_RSI
+            + stoch_s * self._W_STOCH
+            + bb_s * self._W_BB
+        )
+
+        if composite >= 0.60:
+            recommendation = "STRONG BUY"
+        elif composite >= 0.20:
+            recommendation = "BUY"
+        elif composite >= 0.10:
+            recommendation = "LEAN BUY"
+        elif composite <= -0.60:
+            recommendation = "STRONG SELL"
+        elif composite <= -0.20:
+            recommendation = "SELL"
+        elif composite <= -0.10:
+            recommendation = "LEAN SELL"
+        else:
+            recommendation = "WAIT"
+        
+        # Route each sub-score into buy / sell / neutral buckets by sign
+        buy_signals, sell_signals, neutral_signals = [], [], []
+        for score, reason, weight in (
+            (sma_s, sma_r, self._W_SMA),
+            (macd_s, macd_r, self._W_MACD),
+            (rsi_s, rsi_r, self._W_RSI),
+            (stoch_s, stoch_r, self._W_STOCH),
+            (bb_s, bb_r, self._W_BB),
+        ):
+            contribution = score * weight
+            tagged = f"{reason} · weight {weight:.2f} · contribution {contribution:+.3f}"
+            if score > 0.05:
+                buy_signals.append(tagged)
+            elif score < -0.05:
+                sell_signals.append(tagged)
+            else:
+                neutral_signals.append(tagged)
+
+        # Volume affects confidence only, not the verdict
         volume_weight = self.get_volume_signal_weight()
-        signals['volume_weight'] = volume_weight
+        # Composite is in [-1, +1]; scale so that the BUY/SELL threshold (0.20)
+        # maps to 50% and the STRONG threshold (0.60) maps to 90%.
+        # Formula: confidence = min(100, |composite| / 0.60 × 90)
 
-        # Adjust buy/sell counts by volume weight
-        weighted_buys = signals['buy_count'] * volume_weight
-        weighted_sells = signals['sell_count'] * volume_weight
-        weighted_total = weighted_buys + weighted_sells + len(signals['neutral_signals'])
+        base_confidence = min(100.0, abs(composite) / 0.60 * 90.0)
+        confidence = max(0.0, min(100.0, base_confidence * volume_weight))
 
-        # Use weighted counts for the verdict
-        if weighted_total > 0:
-            buy_pct = (weighted_buys / weighted_total) * 100
-            sell_pct = (weighted_sells / weighted_total) * 100
-        else:
-            buy_pct = sell_pct = 0
+        # Volume note
+        volume_details = []
+        if hasattr(self, "volume_metrics") and self.volume_metrics:
+            vm = self.volume_metrics
+            if volume_weight > 1.05:
+                volume_details.append({
+                    'type': 'positive',
+                    'text': f"Elevated volume ({vm['volume_ratio']:.2f}× average) — confidence ×{volume_weight:.2f}",
+                })
+            elif volume_weight < 0.9:
+                volume_details.append({
+                    'type': 'caution',
+                    'text': f"Thin volume ({vm['volume_ratio']:.2f}× average) — confidence ×{volume_weight:.2f}",
+                })
+            else:
+                volume_details.append({
+                    'type': 'neutral',
+                    'text': f"Normal volume ({vm['volume_ratio']:.2f}× average)",
+                })
 
-        if buy_pct >= 60:
-            signals['recommendation'] = 'STRONG BUY'
-            signals['confidence'] = min(100, buy_pct)
-        elif buy_pct >= 40:
-            signals['recommendation'] = 'BUY'
-            signals['confidence'] = min(100, buy_pct)
-        elif sell_pct >= 60:
-            signals['recommendation'] = 'STRONG SELL'
-            signals['confidence'] = min(100, sell_pct)
-        elif sell_pct >= 40:
-            signals['recommendation'] = 'SELL'
-            signals['confidence'] = min(100, sell_pct)
-        else:
-            signals['recommendation'] = 'WAIT'
-            signals['confidence'] = 50
+        signals = {
+            'recommendation': recommendation,
+            'confidence': confidence,
+            'composite': composite,
+            'regime': regime,
+            'indicator_scores': {
+                'sma': sma_s,
+                'macd': macd_s,
+                'rsi': rsi_s,
+                'stoch': stoch_s,
+                'bollinger': bb_s,
+            },
+            'buy_signals': buy_signals,
+            'sell_signals': sell_signals,
+            'neutral_signals': neutral_signals,
+            'volume_details': volume_details,
+            'volume_weight': volume_weight,
+            'buy_count': sum(s for s in (sma_s, macd_s, rsi_s, stoch_s, bb_s) if s > 0),
+            'sell_count': sum(-s for s in (sma_s, macd_s, rsi_s, stoch_s, bb_s) if s < 0),
+            'total_signals': 5,
+        }
 
-        # Add a volume note to signals details
-        if volume_weight > 1.2:
-            signals['volume_details'].append({
-                'type': 'positive',
-                'text': f"High volume ({self.volume_metrics['classification']}) strengthens the signal",
-            })
-        elif volume_weight < 0.8:
-            signals['volume_details'].append({
-                'type': 'caution',
-                'text': f"Low volume ({self.volume_metrics['classification']}) weakens the signal",
-            })
-        else:
-            signals['volume_details'].append({
-                'type': 'neutral',
-                'text': f"Volume at {self.volume_metrics['volume_ratio']:.2f}× average — no signal impact",
-            })
-        
-        # Determine recommendation with confidence
-        if signals['buy_count'] >= 3:
-            signals['recommendation'] = 'STRONG BUY'
-            signals['confidence'] = min(100, (signals['buy_count'] / signals['total_signals']) * 100)
-        elif signals['buy_count'] >= 2:
-            signals['recommendation'] = 'BUY'
-            signals['confidence'] = min(100, (signals['buy_count'] / signals['total_signals']) * 100)
-        elif signals['sell_count'] >= 3:
-            signals['recommendation'] = 'STRONG SELL'
-            signals['confidence'] = min(100, (signals['sell_count'] / signals['total_signals']) * 100)
-        elif signals['sell_count'] >= 2:
-            signals['recommendation'] = 'SELL'
-            signals['confidence'] = min(100, (signals['sell_count'] / signals['total_signals']) * 100)
-        else:
-            signals['recommendation'] = 'WAIT'
-            signals['confidence'] = 50
-        
         self.signals = signals
         return signals
     
@@ -1142,6 +1300,8 @@ class TechnicalIndicatorAnalyzer:
                 'sma_200': ind['SMA_200']
             },
              'volume_metrics': getattr(self, 'volume_metrics', {}),
+            'composite': signals.get('composite'),
+            'regime': signals.get('regime'),
         }
         
         return analysis_details

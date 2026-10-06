@@ -455,10 +455,14 @@ def _render_top_movers(df: pd.DataFrame) -> None:
             st.caption("No losers today.")
 
 def _money(v) -> str:
-    """Compact dollar formatter: $2.52M, $12.1K, $45.00."""
+    """Compact dollar formatter: $1.23T, $2.52M, $12.1K, $45.00."""
     if v is None or v != v:
         return "—"
     av = abs(v)
+    if av >= 1e12:
+        return f"${v / 1e12:.2f}T"
+    if av >= 1e9:
+        return f"${v / 1e9:.2f}B"
     if av >= 1e6:
         return f"${v / 1e6:.2f}M"
     if av >= 1e3:
