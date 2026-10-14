@@ -67,14 +67,20 @@ def load_position() -> dict:
         return {"tqqq_shares": 0.0, "sqqq_shares": 0.0, "updated": None}
 
 
-def save_position(tqqq_shares: float, sqqq_shares: float) -> None:
-    """Persist the current position to disk."""
-    POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    POSITION_FILE.write_text(json.dumps({
+def save_position(tqqq_shares: float, sqqq_shares: float, tqqq_avg_cost: float = None, sqqq_avg_cost: float = None) -> None:
+    """ Persist the current position to disk. If avg cost is provided, it's saved so _compute_unrealized_pnl can use it
+    instead of reading from the stale sleeve CSV after every trade.
+    """
+    data = {
         "tqqq_shares": float(tqqq_shares),
         "sqqq_shares": float(sqqq_shares),
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }, indent=2))
+    }
+    if tqqq_avg_cost is not None:
+        data["tqqq_avg_cost"] = float(tqqq_avg_cost)
+    if sqqq_avg_cost is not None:
+        data["sqqq_avg_cost"] = float(sqqq_avg_cost)
+    POSITION_FILE.write_text(json.dumps(data, indent=2))
 
 def compute_running_pnl() -> dict:
     """
@@ -246,9 +252,37 @@ def compute_rebalance(current_tqqq_shares: float,
 def log_trade(ticker: str, action: str, shares: float, price: float,
               signal: str, tqqq_target_pct: float,
               account_value: float, notes: str = "") -> None:
-    """Append a trade to the CSV log with total_value computed from shares × price."""
+    """Append a trade to the CSV log with total_value computed from shares × price.
+
+    Robust against:
+      - Missing trailing newline in the existing file — writes one before appending,
+        so the new row never gets concatenated onto the previous row.
+      - Fields containing commas — csv.DictWriter quotes them automatically.
+      - Concurrent writes — each write is a single atomic operation.
+    """
+    import os
+
     TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
     exists = TRADES_FILE.exists()
+
+    # --- GUARD: ensure the file ends with a newline before appending ---
+    # csv.writer writes the line terminator at the END of each row. If the
+    # last row in the file has no trailing newline (which can happen from a
+    # manual edit or a previous write that didn't include one), the next
+    # append would be concatenated onto that row.
+    needs_leading_newline = False
+    if exists:
+        try:
+            with open(TRADES_FILE, "rb") as f:
+                f.seek(0, 2)          # seek to end
+                size = f.tell()
+                if size > 0:
+                    f.seek(-1, 2)     # last byte
+                    last = f.read(1)
+                    if last not in (b"\n", b"\r"):
+                        needs_leading_newline = True
+        except (OSError, ValueError):
+            pass
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -264,18 +298,105 @@ def log_trade(ticker: str, action: str, shares: float, price: float,
         "notes": notes,
     }
 
-    with open(TRADES_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
+    with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
+        if needs_leading_newline:
+            f.write("\n")
+        writer = csv.DictWriter(
+            f, fieldnames=TRADE_COLUMNS, lineterminator="\r\n"
+        )
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())   # force the write to disk before returning
 
+def repair_trade_log() -> int:
+    """Detect and split concatenated rows in the trade log.
+
+    Reads raw lines, finds any line with more than one timestamp-like
+    token, and splits it into multiple lines at each timestamp boundary.
+    Returns the number of rows repaired.
+    """
+    import re
+
+    if not TRADES_FILE.exists():
+        print("[repair] No trade log to repair.")
+        return 0
+
+    with open(TRADES_FILE, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    lines = raw.splitlines()
+    if not lines:
+        return 0
+
+    # A row starts with YYYY-MM-DD HH:MM:SS followed by a comma
+    timestamp_re = re.compile(r"(?=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},)")
+
+    repaired = 0
+    out_lines = []
+    for line in lines:
+        # Count how many timestamp markers appear in the line
+        positions = [m.start() for m in timestamp_re.finditer(line)]
+        if len(positions) <= 1:
+            out_lines.append(line)
+            continue
+
+        # Split at each timestamp position
+        pieces = []
+        for i, pos in enumerate(positions):
+            end = positions[i + 1] if i + 1 < len(positions) else len(line)
+            piece = line[pos:end].rstrip(",")
+            pieces.append(piece)
+        out_lines.extend(pieces)
+        repaired += len(positions) - 1
+
+    if repaired:
+        # Back up the original
+        backup = TRADES_FILE.with_suffix(".csv.pre_repair")
+        TRADES_FILE.rename(backup)
+        print(f"[repair] Backed up original to {backup}")
+
+        # Write the repaired file
+        with open(TRADES_FILE, "w", encoding="utf-8", newline="") as f:
+            for line in out_lines:
+                f.write(line + "\r\n")
+        print(f"[repair] Repaired {repaired} concatenated row(s).")
+
+    return repaired
 
 def load_trades() -> pd.DataFrame:
-    """Load the trade log as a DataFrame (empty if no file yet)."""
+    """Load the trade log as a DataFrame (empty if no file yet).
+
+    Tolerates malformed rows by skipping them rather than crashing the app.
+    Prints a warning when a row is skipped so the corruption is visible.
+    """
     if not TRADES_FILE.exists():
         return pd.DataFrame(columns=TRADE_COLUMNS)
-    return pd.read_csv(TRADES_FILE)
+
+    # Strict parse first. If it fails, fall back to a tolerant parse that
+    # skips bad rows instead of raising.
+    try:
+        df = pd.read_csv(
+            TRADES_FILE,
+            engine="python",
+            on_bad_lines="error",
+        )
+    except pd.errors.ParserError as e:
+        print(f"[trades] Malformed rows detected in {TRADES_FILE}: {e}")
+        print("[trades] Falling back to tolerant parse — bad rows will be skipped.")
+        df = pd.read_csv(
+            TRADES_FILE,
+            engine="python",
+            on_bad_lines="skip",
+        )
+
+    # Ensure every expected column exists (in case the header was damaged)
+    for col in TRADE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    return df
 
 
 def clear_trades() -> None:

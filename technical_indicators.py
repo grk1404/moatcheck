@@ -1200,7 +1200,20 @@ class TechnicalIndicatorAnalyzer:
             range=[data.index[0], data.index[-1]],
             row=4, col=1,
         )
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        # Auto-scale price y-axis to the visible data range so short
+        # lookback windows show meaningful differences
+        _px = data["Close"].dropna()
+        if not _px.empty:
+            _lo = float(_px.min())
+            _hi = float(_px.max())
+            _pad = max((_hi - _lo) * 0.05, _hi * 0.01)   # 5% padding, min 1%
+            fig.update_yaxes(
+                title_text="Price ($)",
+                range=[_lo - _pad, _hi + _pad],
+                row=1, col=1,
+            )
+        else:
+            fig.update_yaxes(title_text="Price ($)", row=1, col=1)
         fig.update_yaxes(title_text="MACD", row=2, col=1)
         fig.update_yaxes(title_text="Stochastic", row=3, col=1)
         fig.update_yaxes(title_text="Volume", row=4, col=1)

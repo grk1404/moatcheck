@@ -93,7 +93,7 @@ def _edgar_reporting_currency(edgar) -> str | None:
                     return key
     return None
 
-def fetch(ticker: str) -> Financials:
+def fetch(ticker: str) -> Financials:    
     """Return a Financials object combining EDGAR history + yfinance snapshot.
 
     Behavior:
@@ -106,7 +106,8 @@ def fetch(ticker: str) -> Financials:
     """
     import numpy as np
     import pandas as pd
-
+    
+    
     # ---- Snapshot: yfinance first, then a minimal .info fallback ----
     snapshot: Financials | None = None
     snapshot_err: Exception | None = None
@@ -167,7 +168,7 @@ def fetch(ticker: str) -> Financials:
     try:
         edgar = fetch_edgar(ticker)
     except EdgarError as e:
-        edgar_err = e
+        edgar_err = e    
 
     # ---- Both sources failed ----
     if snapshot is None and edgar is None:
@@ -256,6 +257,41 @@ def fetch(ticker: str) -> Financials:
 
     # ---- EDGAR-only (yfinance snapshot genuinely unavailable) ----
     if edgar is not None and snapshot is None:
+        # Snapshot failed (likely a foreign filer with no US-GAAP income
+        # statements on Yahoo). yf_fetch raised, but we can still pull the
+        # basic info dict — sector, industry, country, summary, and even
+        # price/market cap — directly from yfinance.
+        _info: dict = {}
+        try:
+            from data_provider import get_ticker
+            _info = get_ticker(ticker).info or {}
+        except Exception:
+            _info = {}
+
+        _price = None
+        try:
+            _p = _info.get("currentPrice") or _info.get("regularMarketPrice")
+            if _p is not None:
+                _price = float(_p)
+        except Exception:
+            pass
+
+        _cap = None
+        try:
+            _c = _info.get("marketCap")
+            if _c is not None:
+                _cap = float(_c)
+        except Exception:
+            pass
+
+        _pe = None
+        try:
+            _p_ = _info.get("trailingPE")
+            if _p_ is not None:
+                _pe = float(_p_)
+        except Exception:
+            pass
+
         return Financials(
             ticker=edgar.ticker,
             revenue=edgar.revenue,
@@ -269,16 +305,30 @@ def fetch(ticker: str) -> Financials:
             long_term_debt=edgar.long_term_debt,
             tax_rate=edgar.tax_rate,
             ebit=edgar.ebit,
-            current_price=None,
-            market_cap=None,
-            pe_ratio_ttm=None,
+            current_price=_price,
+            market_cap=_cap,
+            pe_ratio_ttm=_pe,
             analyst_5yr_growth=None,
-            company_name=edgar.entity_name,
+            week52_high=(
+                float(_info["fiftyTwoWeekHigh"])
+                if _info.get("fiftyTwoWeekHigh") is not None else None
+            ),
+            week52_low=(
+                float(_info["fiftyTwoWeekLow"])
+                if _info.get("fiftyTwoWeekLow") is not None else None
+            ),
+            company_name=(
+                _info.get("longName") or _info.get("shortName") or edgar.entity_name
+            ),
+            company_summary=_info.get("longBusinessSummary") or "",
+            company_sector=_info.get("sector") or "",
+            company_industry=_info.get("industry") or "",
+            company_country=_info.get("country") or "",
+            exchange=_info.get("exchange") or _info.get("fullExchangeName") or "",
             data_source="edgar",
             data_source_note=(
-                f"Data: SEC EDGAR only ({edgar.years_available} yrs). "
-                f"Yahoo Finance snapshot unavailable — valuation metrics needing "
-                f"current price/EPS may be missing."
+                f"Data: SEC EDGAR only ({edgar.years_available} yrs) "
+                f"+ Yahoo Finance metadata (sector, summary, price)."
             ),
         )
 

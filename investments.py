@@ -17,6 +17,94 @@ CSV_CANDIDATES = [
     DATA_DIR / "fidelity_positions.csv",
 ]
 
+def _scan_52w_highs(df: pd.DataFrame) -> list[dict]:
+    """Scan equity positions for those trading near their 52-week high.
+
+    Returns a list of dicts: {Symbol, Current, High52, PctOfHigh, Account}.
+    Uses yfinance's info dict for the 52-week high (same source as the tile).
+    """
+    from data_provider import get_ticker
+
+    view = df[
+        df["Symbol"].str.match(r"^[A-Z]{1,5}$", na=False)
+        & (df["_value"] > 0)
+        & (df["Quantity"] > 0)
+    ]
+    if view.empty:
+        return []
+
+    # Aggregate quantity by symbol across accounts
+    agg = view.groupby("Symbol").agg(
+        value=("_value", "sum"),
+        accounts=("Account name", lambda s: list(s.unique())),
+    )
+
+    hits = []
+    for sym, row in agg.iterrows():
+        try:
+            info = get_ticker(sym).info or {}
+            high = info.get("fiftyTwoWeekHigh")
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            if high is None or price is None:
+                continue
+            high = float(high)
+            price = float(price)
+            if high <= 0:
+                continue
+            # "At or near the high" = within 2%
+            pct_of_high = price / high
+            if pct_of_high >= 0.98:
+                hits.append({
+                    "Symbol": sym,
+                    "Current": price,
+                    "High52": high,
+                    "PctOfHigh": pct_of_high,
+                    "Account": row["accounts"][0] if row["accounts"] else "",
+                })
+        except Exception:
+            continue
+
+    # Sort by proximity to high (closest first)
+    hits.sort(key=lambda h: h["PctOfHigh"], reverse=True)
+    return hits
+
+def _render_52w_alert(df: pd.DataFrame) -> None:
+    """Check for positions near their 52-week high and display a prominent alert."""
+    with st.spinner("Checking 52-week highs…"):
+        hits = _scan_52w_highs(df)
+
+    if not hits:
+        return
+
+    # Build the message body
+    lines = [f"52-Week High Alert — {len(hits)} position(s)"]
+    for h in hits:
+        pct = h["PctOfHigh"] * 100
+        lines.append(f"  {h['Symbol']}: ${h['Current']:.2f} ({(pct):.1f}% of 52w high ${h['High52']:.2f})")
+    message = "\n".join(lines)
+
+    st.error(
+        f"🚨 **52-Week High Alert** — {len(hits)} position(s) at or above 98% of their 52-week high"
+    )
+
+    # Table of hits
+    hits_df = pd.DataFrame([
+        {
+            "Symbol": h["Symbol"],
+            "Current": f"${h['Current']:.2f}",
+            "52W High": f"${h['High52']:.2f}",
+            "% of High": f"{h['PctOfHigh'] * 100:.1f}%",
+            "Account": h["Account"],
+        }
+        for h in hits
+    ])
+    st.dataframe(hits_df, width="stretch", hide_index=True)
+
+    # Copy-to-clipboard convenience (Streamlit's code block has a built-in copy button)
+    with st.expander("📋 Copy alert text"):
+        st.code(message, language=None)
+    st.divider()  
+
 def _market_is_open() -> bool:
     """Return True if US equity markets are currently open (ET, Mon–Fri, 9:30–16:00)."""
     from datetime import datetime, time as dtime
@@ -1171,9 +1259,8 @@ def render_my_investments() -> None:
 
     df = _derive(raw)
 
-    _hero_strip(df)
-    st.divider()
-
+    _hero_strip(df)                 # Hero Strip
+    _render_52w_alert(df)           # 52-week high stock alerts    
     _render_top_movers(df)          # <-- new Top Movers
     st.divider()
 

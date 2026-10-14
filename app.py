@@ -605,19 +605,39 @@ def render_analyzer() -> None:
     st.subheader(f"{fin.company_name} ({fin.ticker})")
 
     # Company Summary
-    if fin.company_summary or fin.company_sector:
+    if fin.company_summary or fin.company_sector or fin.company_industry or fin.company_country:
         with st.expander("Company Summary:", expanded=True):
-            if fin.company_sector:
+            # Prefer the more specific "industry" over the broad "sector".
+            # Fall back to sector if industry is missing. Always append the
+            # country, normalizing US variants to a consistent "USA" label.
+            _label_parts = []
+            _label_parts.append(fin.company_industry or fin.company_sector)
+            if fin.company_country:
+                _country_display = {
+                    "United States": "USA",
+                    "USA": "USA",
+                    "US": "USA",
+                }.get(fin.company_country, fin.company_country)
+                _label_parts.append(_country_display)
+            _label = " · ".join(p for p in _label_parts if p)
+
+            if _label:
                 st.markdown(
                     f'<div style="color:#9aa0a6; font-size:0.85rem; '
                     f'text-transform:uppercase; letter-spacing:0.05em; '
                     f'margin-bottom:0.5rem;">'
-                    f'Sector · {fin.company_sector}'
+                    f'{_label}'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
             if fin.company_summary:
                 st.markdown(_first_n_sentences(fin.company_summary, 2))
+            else:
+                st.caption(
+                    "Detailed summary unavailable for this ticker "
+                    "(common for foreign filers and small caps)."
+                )
 
     # ADD THIS LINE:
     if fin.exchange in ("NSE", "BSE"):
@@ -2077,7 +2097,7 @@ def render_technical_analysis():
             selected_period = st.radio(
                 "Chart period:",
                 options=list(period_labels.keys()),
-                index=5,
+                index=3,
                 horizontal=True,
                 key="chart_period",
                 label_visibility="collapsed",
@@ -2418,53 +2438,36 @@ def _read_sleeve_positions() -> dict:
 def _compute_unrealized_pnl() -> dict:
     """Compute unrealized P&L on the current TQQQ/SQQQ position.
 
-    Reads cost basis and quantity from data/sleeve_positions.csv (Fidelity's
-    authoritative numbers) when available. Falls back to the trade log's
-    running average cost otherwise.
+    Prefers avg cost from data/current_position.json — which is kept up to date
+    as you log trades. Falls back to the sleeve CSV only if the JSON fields
+    are missing (e.g., first run before any trade is logged).
 
-    Fidelity uses specific-lot accounting; the trade log uses running-average
-    accounting. They will never match exactly. Preferring the CSV makes the
-    app's number consistent with what you see in the Fidelity app.
+    Uses yfinance's last close for the current price.
     """
-    from pathlib import Path
     from data_provider import get_ticker
-    from trade_manager import load_position, compute_realized_pnl
+    from trade_manager import load_position
 
     pos = load_position()
     tq_qty = float(pos.get("tqqq_shares", 0.0))
     sq_qty = float(pos.get("sqqq_shares", 0.0))
+    tq_avg = pos.get("tqqq_avg_cost")
+    sq_avg = pos.get("sqqq_avg_cost")
 
-    tq_avg = None
-    sq_avg = None
-    source = "log"
+    source = "json"
 
-    # ---- Preferred: sleeve positions CSV from Fidelity ----
-        # ---- Preferred: sleeve positions CSV from Fidelity ----
-    sleeve = _read_sleeve_positions()
-    if "TQQQ" in sleeve and "SQQQ" in sleeve:
-        tq_avg = sleeve["TQQQ"]["avg_cost"]
-        sq_avg = sleeve["SQQQ"]["avg_cost"]
-        tq_qty = sleeve["TQQQ"]["qty"]
-        sq_qty = sleeve["SQQQ"]["qty"]
-        source = "sleeve_csv"
-
-    # ---- Fallback: trade log's running average ----
+    # Fall back to the sleeve CSV only if avg cost isn't in the JSON yet
     if tq_avg is None or sq_avg is None:
-        try:
-            trades = compute_realized_pnl()
-            if not trades.empty:
-                if tq_avg is None and "avg_cost_before" in trades.columns:
-                    _c = trades[trades["ticker"] == "TQQQ"]["avg_cost_before"].dropna()
-                    if not _c.empty:
-                        tq_avg = float(_c.iloc[-1])
-                if sq_avg is None and "avg_cost_before" in trades.columns:
-                    _c = trades[trades["ticker"] == "SQQQ"]["avg_cost_before"].dropna()
-                    if not _c.empty:
-                        sq_avg = float(_c.iloc[-1])
-        except Exception:
-            pass
+        sleeve = _read_sleeve_positions()
+        if tq_avg is None and "TQQQ" in sleeve:
+            tq_avg = sleeve["TQQQ"]["avg_cost"]
+            tq_qty = sleeve["TQQQ"]["qty"]
+        if sq_avg is None and "SQQQ" in sleeve:
+            sq_avg = sleeve["SQQQ"]["avg_cost"]
+            sq_qty = sleeve["SQQQ"]["qty"]
+        if tq_avg is not None and sq_avg is not None:
+            source = "sleeve_csv"
 
-    # ---- Current prices (last close) ----
+    # ---- Current prices (last close, consistent with sleeve value) ----
     try:
         tq_px = float(get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1])
     except Exception:
@@ -2475,11 +2478,11 @@ def _compute_unrealized_pnl() -> dict:
         sq_px = None
 
     tq_unreal = (
-        (tq_px - tq_avg) * tq_qty
+        (tq_px - float(tq_avg)) * tq_qty
         if tq_px is not None and tq_avg is not None else None
     )
     sq_unreal = (
-        (sq_px - sq_avg) * sq_qty
+        (sq_px - float(sq_avg)) * sq_qty
         if sq_px is not None and sq_avg is not None else None
     )
 
@@ -2501,6 +2504,7 @@ def _compute_unrealized_pnl() -> dict:
         "sqqq_qty": sq_qty,
         "source": source,
     }
+
 def render_tqqq_sqqq_signals():
     """TQQQ/SQQQ Multi-Strategy Signals tab — daily trading decisions"""
     st.header("🤖 TQQQ/SQQQ Multi-Strategy Signals")
@@ -2656,26 +2660,33 @@ def render_tqqq_sqqq_signals():
             "The calculator tells you exactly how many fractional shares to buy or sell."
         )
 
-        # --- Capital baseline strip (from data/capital.json) ---
+        # --- Read capital state ---
         _cap = load_capital()
         starting = _cap.get("starting_capital", 0.0)
         deposits = sum(x["amount"] for x in _cap.get("deposits", []))
         withdrawals = sum(x["amount"] for x in _cap.get("withdrawals", []))
         net_cap = starting + deposits - withdrawals
 
-        st.markdown("**Capital committed to this strategy**")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Starting capital", f"${starting:,.2f}")
-        c2.metric("Net deposits", f"${deposits - withdrawals:+,.2f}")
-        c3.metric("Total committed", f"${net_cap:,.2f}")
-
         if "tqqq_capital" not in st.session_state:
             st.session_state["tqqq_capital"] = net_cap
 
-        colA, colB = st.columns([1, 1])
-        with colA:
+        # Fetch prices BEFORE rendering the row so everything lands on one line
+        try:
+            tqqq_price = float(get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1])
+            sqqq_price = float(get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1])
+        except Exception as e:
+            st.error(f"Could not fetch prices: {e}")
+            tqqq_price = 0.0
+            sqqq_price = 0.0
+
+        # --- Single row: capital stats + sleeve value + prices ---
+        c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1.5, 1, 1])
+        c1.metric("Starting capital", f"${starting:,.2f}")
+        c2.metric("Net deposits", f"${deposits - withdrawals:+,.2f}")
+        c3.metric("Total committed", f"${net_cap:,.2f}")
+        with c4:
             account_value = st.number_input(
-                "Current sleeve value — TQQQ + SQQQ from Fidelity Market Value ($)",
+                "Sleeve value ($)",
                 min_value=100.0,
                 max_value=1_000_000.0,
                 value=float(st.session_state["tqqq_capital"]),
@@ -2683,15 +2694,17 @@ def render_tqqq_sqqq_signals():
                 key="tqqq_capital_input",
                 help=(
                     "Open Fidelity → Accounts & Trade → Portfolio → Positions. "
-                    "Add ONLY the Market Value of your TQQQ and SQQQ rows. "
-                    "Do not include cash, ACLS, EVVTY, INTC, LCID, or any other holding."
+                    "Add ONLY the Market Value of your TQQQ and SQQQ rows."
                 ),
             )
-            st.caption(
-                "📋 Enter only TQQQ + SQQQ market value. "
-                "Cash and other positions are **not** part of this sleeve."
-            )
             st.session_state["tqqq_capital"] = account_value
+        c5.metric("TQQQ price", f"${tqqq_price:.2f}")
+        c6.metric("SQQQ price", f"${sqqq_price:.2f}")
+
+        st.caption(
+            "📋 Enter only TQQQ + SQQQ market value. "
+            "Cash and other positions are **not** part of this sleeve."
+        )
 
         # --- Cumulative P&L banner (two cards: committed vs unrealized) ---
         _running = compute_running_pnl()
@@ -2736,6 +2749,7 @@ def render_tqqq_sqqq_signals():
                 if _u is None:
                     _u_color, _u_bg, _u_icon = "#9AA0A6", "#2a2a2a", "➖"
                     _u_text = "n/a"
+                    _u_pct_text = ""
                 elif _u > 0:
                     _u_color, _u_bg, _u_icon = "#00E676", "#1e4620", "📈"
                     _u_text = f"${_u:+,.2f}"
@@ -2745,6 +2759,21 @@ def render_tqqq_sqqq_signals():
                 else:
                     _u_color, _u_bg, _u_icon = "#9AA0A6", "#2a2a2a", "➖"
                     _u_text = "$0.00"
+
+                # Compute unrealized % relative to the cost basis of current positions
+                _u_pct_text = ""
+                try:
+                    _tq_qty = _unreal.get("tqqq_qty")
+                    _tq_avg = _unreal.get("tqqq_avg")
+                    _sq_qty = _unreal.get("sqqq_qty")
+                    _sq_avg = _unreal.get("sqqq_avg")
+                    if _u is not None and all(v is not None for v in (_tq_qty, _tq_avg, _sq_qty, _sq_avg)):
+                        _cost_basis = float(_tq_qty) * float(_tq_avg) + float(_sq_qty) * float(_sq_avg)
+                        if _cost_basis > 0:
+                            _u_pct = _u / _cost_basis * 100.0
+                            _u_pct_text = f"{_u_pct:+.2f}%"
+                except Exception:
+                    pass
 
                 _breakdown = ""
                 if _unreal.get("tqqq") is not None and _unreal.get("sqqq") is not None:
@@ -2764,7 +2793,11 @@ def render_tqqq_sqqq_signals():
                                 line-height:1.1; margin-top:0.35rem;">
                         {_u_icon} {_u_text}
                     </div>
-                    <div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.75rem;">
+                    <div style="color:{_u_color}; font-size:1rem; font-weight:600;
+                                margin-top:0.15rem;">
+                        {_u_pct_text}
+                    </div>
+                    <div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.6rem;">
                         {_breakdown}
                     </div>
                 </div>
@@ -2783,16 +2816,6 @@ def render_tqqq_sqqq_signals():
                 f"{pnl_pct:+.2f}%",
                 delta_color="normal" if pnl >= 0 else "inverse",
             )
-        with colB:
-            try:
-                tqqq_price = get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
-                sqqq_price = get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
-                st.metric("TQQQ Price", f"${tqqq_price:.2f}")
-                st.metric("SQQQ Price", f"${sqqq_price:.2f}")
-            except Exception as e:
-                st.error(f"Could not fetch prices: {e}")
-                tqqq_price = 0.0
-                sqqq_price = 0.0
 
         # --- Cross-check: entered sleeve value vs saved position ---
         if tqqq_price > 0 and sqqq_price > 0:
@@ -2950,19 +2973,33 @@ def render_tqqq_sqqq_signals():
                             account_value=account_value,
                         )
 
-                        # 2. Update the position file with the new TQQQ total
+                        # 2. Update position file — quantity AND blended avg cost
                         _pos = load_position()
                         _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
                         _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
-                        _new_tqqq = (
-                            _cur_tqqq + abs(actual_tqqq_fill)
-                            if action == "BUY"
-                            else _cur_tqqq - abs(actual_tqqq_fill)
-                        )
-                        _new_tqqq = max(0.0, _new_tqqq)   # never go negative
-                        save_position(_new_tqqq, _cur_sqqq)
+                        _cur_tq_avg = float(_pos.get("tqqq_avg_cost", 0.0))
+                        _cur_sq_avg = float(_pos.get("sqqq_avg_cost", 0.0))
 
-                        # 3. Queue widget updates for the NEXT run.
+                        if action == "BUY":
+                            _new_tqqq = _cur_tqqq + abs(actual_tqqq_fill)
+                            if _new_tqqq > 0:
+                                _new_tq_avg = (
+                                    (_cur_tqqq * _cur_tq_avg)
+                                    + (abs(actual_tqqq_fill) * tqqq_price)
+                                ) / _new_tqqq
+                            else:
+                                _new_tq_avg = 0.0
+                        else:  # SELL
+                            _new_tqqq = max(0.0, _cur_tqqq - abs(actual_tqqq_fill))
+                            _new_tq_avg = _cur_tq_avg
+
+                        save_position(
+                            _new_tqqq, _cur_sqqq,
+                            tqqq_avg_cost=_new_tq_avg,
+                            sqqq_avg_cost=_cur_sq_avg,
+                        )
+
+                        # 3. Queue widget updates for the NEXT run
                         st.session_state["_pending_cur_tqqq"] = _new_tqqq
                         st.session_state["_pending_cur_sqqq"] = _cur_sqqq
                         st.session_state["_pending_actual_tqqq"] = 0.0
@@ -2985,6 +3022,7 @@ def render_tqqq_sqqq_signals():
                         delta = rebalance["sqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
 
+                        # 1. Append to the trade log
                         log_trade(
                             ticker="SQQQ", action=action,
                             shares=abs(actual_sqqq_fill),
@@ -2994,17 +3032,33 @@ def render_tqqq_sqqq_signals():
                             account_value=account_value,
                         )
 
+                        # 2. Update position file — quantity AND blended avg cost
                         _pos = load_position()
                         _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
                         _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
-                        _new_sqqq = (
-                            _cur_sqqq + abs(actual_sqqq_fill)
-                            if action == "BUY"
-                            else _cur_sqqq - abs(actual_sqqq_fill)
-                        )
-                        _new_sqqq = max(0.0, _new_sqqq)
-                        save_position(_cur_tqqq, _new_sqqq)
+                        _cur_tq_avg = float(_pos.get("tqqq_avg_cost", 0.0))
+                        _cur_sq_avg = float(_pos.get("sqqq_avg_cost", 0.0))
 
+                        if action == "BUY":
+                            _new_sqqq = _cur_sqqq + abs(actual_sqqq_fill)
+                            if _new_sqqq > 0:
+                                _new_sq_avg = (
+                                    (_cur_sqqq * _cur_sq_avg)
+                                    + (abs(actual_sqqq_fill) * sqqq_price)
+                                ) / _new_sqqq
+                            else:
+                                _new_sq_avg = 0.0
+                        else:  # SELL
+                            _new_sqqq = max(0.0, _cur_sqqq - abs(actual_sqqq_fill))
+                            _new_sq_avg = _cur_sq_avg
+
+                        save_position(
+                            _cur_tqqq, _new_sqqq,
+                            tqqq_avg_cost=_cur_tq_avg,
+                            sqqq_avg_cost=_new_sq_avg,
+                        )
+
+                        # 3. Queue widget updates for the NEXT run
                         st.session_state["_pending_cur_tqqq"] = _cur_tqqq
                         st.session_state["_pending_cur_sqqq"] = _new_sqqq
                         st.session_state["_pending_actual_sqqq"] = 0.0
@@ -3111,6 +3165,300 @@ def render_tqqq_sqqq_signals():
 
 def page_my_investments() -> None:
     render_my_investments()
+
+def page_backtest() -> None:
+    render_backtest()
+
+def render_backtest() -> None:
+    """Back Test page — run historical simulations of trading strategies."""
+    st.header("🧪 Back Test")
+    st.markdown(
+        "Compare three long-or-cash strategies on historical TQQQ data. "
+        "All use QQQ for signal generation and execute at next-day open."
+    )
+    st.markdown(
+        "- **Buy and Hold** — fully invested in TQQQ the entire window. The passive baseline.\n"
+        "- **7-Step TQQQ** — trades the live regime-aware framework. Goes to cash in bear/neutral regimes to dodge drawdowns.\n"
+        "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close."
+    )
+
+    # ---------- Import lazily so the page only loads its deps when opened ----------
+    try:
+        from backtest import load_backtest_data, run_backtest
+        import backtest_strategies as bs
+    except Exception as e:
+        st.error(f"Could not load backtest modules: {e}")
+        return
+
+    # ---------- Input row ----------
+    # Set to False to lock the ticker input to TQQQ. Flip to True later
+    # to allow backtesting arbitrary tickers.
+    TICKER_EDITABLE = False
+
+    c0, c1, c2, c3 = st.columns([1.5, 1.5, 1.5, 1.0])
+    with c0:
+        ticker_input = st.text_input("Ticker", value="TQQQ", disabled=not TICKER_EDITABLE, key="backtest_ticker")
+        backtest_ticker = ticker_input.strip().upper() if TICKER_EDITABLE else "TQQQ"
+    with c1:
+        period_label = st.selectbox("Period", options=["1y", "2y", "3y", "5y", "8y", "10y", "20y", "Max"], index=3)
+    with c2:
+        starting_cash = st.number_input("Starting cash ($)", min_value=1000.0, max_value=10_000_000.0, value=10_000.0, step=1000.0)
+    with c3:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        _btn_slot = st.empty()
+        if not st.session_state.get("backtest_running"):
+            run_clicked = _btn_slot.button("▶ Run All", type="primary", use_container_width=True, key="backtest_btn")
+            if run_clicked:
+                st.session_state["backtest_running"] = True
+                st.rerun()
+        else:
+            run_clicked = False
+            _btn_slot.markdown(
+                '<div style="display:flex; align-items:center; justify-content:center; '
+                'height:38px; background:#2a2a2a; border-radius:8px; color:#9aa0a6; '
+                'font-size:0.9rem;">'
+                '<span style="display:inline-block; width:16px; height:16px; '
+                'border:2px solid #4DABF7; border-top-color:transparent; '
+                'border-radius:50%; animation:spin 0.8s linear infinite; '
+                'margin-right:0.5rem;"></span>'
+                'Running…</div>'
+                '<style>@keyframes spin { to { transform: rotate(360deg); } }</style>',
+                unsafe_allow_html=True,
+            )
+    # ---------- Convert period label to a start date ----------
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    period_days = {
+        "1y": 365, "2y": 730, "3y": 1095, "5y": 1825,
+        "8y": 2920, "10y": 3650, "20y": 7300, "Max": 9999,
+    }
+    start_date = (today - timedelta(days=period_days[period_label])).isoformat()
+    end_date = today.isoformat()
+
+    # ---------- Do the work when the spinner is showing ----------
+    if st.session_state.get("backtest_running"):
+        try:
+            with st.spinner("Loading historical prices…"):
+                try:
+                    prices = load_backtest_data(start_date, end_date)
+                except Exception as e:
+                    st.error(f"Could not load price data: {e}")
+                    st.session_state["backtest_running"] = False
+                    return
+
+            if prices.empty or len(prices) < 60:
+                st.warning(f"Not enough data for a {period_label} backtest — got {len(prices)} bars.")
+                st.session_state["backtest_running"] = False
+                return
+
+            qqq_close = prices["QQQ_close"]
+            tqqq_close = prices["TQQQ_close"]
+
+            import inspect
+            results = {}
+            for name, fn in bs.STRATEGIES.items():
+                _params = inspect.signature(fn).parameters
+                if "progress_callback" in _params:
+                    signal = fn(qqq_close, tqqq_close, progress_callback=None)
+                else:
+                    signal = fn(qqq_close, tqqq_close)
+                results[name] = run_backtest(prices, signal, starting_cash=starting_cash, warmup_days=30, progress_callback=None)
+
+            st.session_state["backtest_results"] = results
+            st.session_state["backtest_prices"] = prices
+
+        except Exception as e:
+            st.error(f"Backtest error: {e}")
+        finally:
+            st.session_state["backtest_running"] = False
+
+        st.rerun()
+
+    # ---------- Display results ----------
+    results = st.session_state.get("backtest_results")
+    prices = st.session_state.get("backtest_prices")
+    if results is None or prices is None:
+        st.info("Choose a period and starting cash, then click **Run All**.")
+        return
+
+    first = next(iter(results.values()))
+    st.caption(
+        f"Window: **{first.start_date.date()} → {first.end_date.date()}** "
+        f"({(first.end_date - first.start_date).days} days) · "
+        f"Starting cash: **${first.starting_cash:,.0f}**"
+    )
+
+    # ---------- Strategy comparison table ----------
+    st.markdown("#### Strategy Comparison")
+
+    rows = []
+    for name, r in results.items():
+        calmar = r.cagr / r.max_drawdown if r.max_drawdown > 0 else 0.0
+        end_cash = r.starting_cash * (1 + r.total_return)
+        rows.append({
+            "Strategy": name,
+            "Total Return": f"{r.total_return*100:+.2f}%",
+            "CAGR": f"{r.cagr*100:+.2f}%",
+            "Max Drawdown": f"{r.max_drawdown*100:.2f}%",
+            "Total Capital": f"${end_cash:,.0f}",
+            "Sharpe *": f"{r.sharpe:.2f}",
+            "Calmar **": f"{calmar:.2f}",
+            "Trades": f"{r.num_trades}",
+            "Win Rate": f"{r.win_rate*100:.0f}%",
+        })
+
+    comparison_df = pd.DataFrame(rows)
+
+    # Column-level color coding for Total Return and Max Drawdown
+    def _style_comparison(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for i, (_, r) in enumerate(results.items()):
+            ret = r.total_return
+            dd = r.max_drawdown
+            styles.loc[i, "Total Return"] = "color: #00E676;" if ret >= 0 else "color: #EF5350;"
+            styles.loc[i, "Max Drawdown"] = "color: #EF5350;" if dd >= 0.30 else "color: #FFA726;" if dd >= 0.15 else "color: #00E676;"
+            styles.loc[i, "Total Capital"] = ("color: #00E676; font-weight: 600;" if ret >= 0 else "color: #EF5350; font-weight: 600;")
+            styles.loc[i, "Strategy"] = "font-weight: 600;"
+        return styles
+
+    st.dataframe(
+        comparison_df.style.apply(_style_comparison, axis=None),
+        use_container_width=True,
+        hide_index=True,
+    )
+    
+    st.caption(
+        "\\* **Sharpe** = CAGR ÷ annualized volatility. Measures return per unit of "
+        "day-to-day risk. Higher is better. Realistic range is 0.5 - 2.0 where 2 is excellent. Anything greater than 2 is Very Rare and should be treated with caution.\n\n"
+        "\\*\\* **Calmar** = CAGR ÷ Max Drawdown. Measures return per unit of "
+        "worst-case loss. Higher is better. Realistic range is 0.5 - 1.0 (Good). Between 1-2 is Very good but very rare.\n\n"
+        "\\^ **TASC** = Technical Analysis of Stock Charts. a monthly magazine that has been published since 1982. The 1% per week strategy is inspired by its teachings."
+    )    
+
+    # ---------- Benchmarks ----------
+    st.markdown("#### Buy & Hold Benchmarks")
+    bc1, bc2 = st.columns(2)
+    bc1.metric("TQQQ Buy & Hold", f"{first.tqqq_buy_hold_return*100:+.2f}%", delta=f"${first.starting_cash * (1 + first.tqqq_buy_hold_return):,.0f}", delta_color="normal" if first.tqqq_buy_hold_return >= 0 else "inverse")
+    bc2.metric("QQQ Buy & Hold", f"{first.qqq_buy_hold_return*100:+.2f}%", delta=f"${first.starting_cash * (1 + first.qqq_buy_hold_return):,.0f}", delta_color="normal" if first.qqq_buy_hold_return >= 0 else "inverse")
+
+    # ---------- Equity curve — all strategies on one chart ----------
+    st.markdown("#### Equity Curves")
+    import plotly.graph_objects as go
+    fig = go.Figure()
+
+    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726"]
+    for i, (name, r) in enumerate(results.items()):
+        color = strategy_colors[i % len(strategy_colors)]
+        fig.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=name, line=dict(color=color, width=2.5)))
+
+    # Add TQQQ buy-and-hold as a dashed reference line
+    fig.add_trace(go.Scatter(x=first.benchmark_tqqq.index, y=first.benchmark_tqqq, name="TQQQ Buy & Hold", line=dict(color="#9AA0A6", width=1.5, dash="dot")))
+
+    fig.update_layout(
+        height=440,
+        template="plotly_dark",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis_title="Portfolio Value ($)",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---------- 15% Swing Analysis ----------
+    st.markdown("#### 15% Swing Analysis")
+    st.caption(
+        "Peak-to-trough and trough-to-peak moves of at least the threshold "
+        "below. Shows how often large swings occur and how much time "
+        "separates them."
+    )
+
+    from swing_analysis import find_swings
+    tqqq_series = prices["TQQQ_close"]
+
+    _thr_col1, _thr_col2 = st.columns([1, 4])
+    with _thr_col1:
+        threshold_pct = st.number_input(
+            "Swing threshold (%)",
+            min_value=1.0,
+            max_value=100.0,
+            value=15.0,
+            step=1.0,
+            format="%.1f",
+            key="swing_threshold_pct",
+        )
+    swings = find_swings(tqqq_series, threshold=threshold_pct / 100.0)
+
+    if swings.empty:
+        st.info("No 15% moves found in this window.")
+    else:
+        ups = swings[swings["direction"] == "UP"]
+        downs = swings[swings["direction"] == "DOWN"]
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Up moves ≥15%", f"{len(ups)}")
+        s2.metric("Down moves ≥15%", f"{len(downs)}")
+
+        if len(ups) > 1:
+            _avg_up = ups["days_since_prior"].dropna().mean()
+            s3.metric("Avg gap between up moves", f"{_avg_up:.0f} days")
+        else:
+            s3.metric("Avg gap between up moves", "—")
+
+        if len(downs) > 1:
+            _avg_dn = downs["days_since_prior"].dropna().mean()
+            s4.metric("Avg gap between down moves", f"{_avg_dn:.0f} days")
+        else:
+            s4.metric("Avg gap between down moves", "—")
+
+        # Table of moves
+        display = swings.copy()
+        display["date"] = display["date"].dt.strftime("%Y-%m-%d")
+        display["from_date"] = display["from_date"].dt.strftime("%Y-%m-%d")
+        display["direction"] = display["direction"].map(lambda d: "🟢 UP" if d == "UP" else "🔴 DOWN")
+        display["from_price"] = display["from_price"].map(lambda v: f"${v:,.2f}")
+        display["to_price"] = display["to_price"].map(lambda v: f"${v:,.2f}")
+        display["move_pct"] = display["move_pct"].map(lambda v: f"{v*100:+.2f}%")
+        display["days_since_prior"] = display["days_since_prior"].map(lambda v: "—" if pd.isna(v) else f"{int(v)}")
+        display = display.rename(columns={"date": "Date", "direction": "Direction", "from_date": "From Date", "from_price": "From $", "to_price": "To $", "move_pct": "Move", "days_since_prior": "Days since prior"})
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        # Chart with markers
+        import plotly.graph_objects as go
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=tqqq_series.index, y=tqqq_series, name="TQQQ", line=dict(color="#4DABF7", width=2)))
+
+        ups_dates = [pd.Timestamp(d) for d in swings.loc[swings["direction"] == "UP", "date"]]
+        ups_y = [float(tqqq_series.loc[d]) for d in ups_dates if d in tqqq_series.index]
+        downs_dates = [pd.Timestamp(d) for d in swings.loc[swings["direction"] == "DOWN", "date"]]
+        downs_y = [float(tqqq_series.loc[d]) for d in downs_dates if d in tqqq_series.index]
+
+        fig2.add_trace(go.Scatter(x=ups_dates, y=ups_y, mode="markers", name="Up ≥15%", marker=dict(color="#00E676", size=10, symbol="triangle-up")))
+        fig2.add_trace(go.Scatter(x=downs_dates, y=downs_y, mode="markers", name="Down ≥15%", marker=dict(color="#EF5350", size=10, symbol="triangle-down")))
+
+        fig2.update_layout(height=380, template="plotly_dark", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), yaxis_title="TQQQ Price ($)", margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ---------- Trade logs — one expander per strategy ----------
+    for name, r in results.items():
+        with st.expander(f"📋 {name} — {r.num_trades} trades"):
+            if r.trades.empty:
+                st.caption("No trades in this window.")
+                continue
+            display = r.trades.copy()
+            display["entry_date"] = pd.to_datetime(display["entry_date"]).dt.strftime("%Y-%m-%d")
+            display["exit_date"] = pd.to_datetime(display["exit_date"]).dt.strftime("%Y-%m-%d")
+            display["entry_price"] = display["entry_price"].map(lambda v: f"${v:,.2f}")
+            display["exit_price"] = display["exit_price"].map(lambda v: f"${v:,.2f}")
+            display["shares"] = display["shares"].map(lambda v: f"{v:.4f}")
+            display["pnl"] = display["pnl"].map(lambda v: f"${v:+,.2f}")
+            display["return_pct"] = display["return_pct"].map(lambda v: f"{v*100:+.2f}%")
+            display = display.rename(columns={"entry_date": "Entry", "exit_date": "Exit", "entry_price": "Entry $", "exit_price": "Exit $", "shares": "Shares", "pnl": "P&L", "return_pct": "Return", "days_held": "Days"})
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "Backtest is hypothetical. Past performance does not guarantee future "
+        "results. No transaction costs, slippage, or taxes are modeled."
+    )
 
 def page_home() -> None:
     st.markdown(
@@ -3220,6 +3568,7 @@ _pages = [
     st.Page(page_technical, title="Technical Analysis",icon="📈"),
     st.Page(page_tqqq,      title="TQQQ/SQQQ Signals", icon="🤖"),
     st.Page(page_my_investments, title="My Investments", icon="📁"),
+    st.Page(page_backtest,        title="Back Test",           icon="🧪"),
 ]
 
 _nav = st.navigation(_pages, position="sidebar")

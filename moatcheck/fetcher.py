@@ -77,6 +77,8 @@ class Financials:
     week52_low: float | None = None
     company_summary: str = ""
     company_sector: str = ""
+    company_industry: str = ""
+    company_country: str = ""
 
     @property
     def years_available(self) -> int:
@@ -359,6 +361,8 @@ def fetch(ticker: str) -> Financials:
     week52_low = None
     company_summary = ""
     company_sector = ""
+    company_industry = ""
+    company_country = ""
 
     try:
         info = yft.info or {}
@@ -376,6 +380,8 @@ def fetch(ticker: str) -> Financials:
 
         company_summary = info.get("longBusinessSummary") or ""
         company_sector = info.get("sector") or ""
+        company_industry = info.get("industry") or ""
+        company_country = info.get("country") or ""
         
         if current_price is None:
             current_price = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -523,4 +529,6 @@ def fetch(ticker: str) -> Financials:
         week52_low=week52_low,
         company_summary=company_summary,
         company_sector=company_sector,
+        company_industry=company_industry,
+        company_country=company_country,
     )
