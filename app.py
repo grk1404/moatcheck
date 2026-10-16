@@ -3195,7 +3195,7 @@ def render_backtest() -> None:
     # to allow backtesting arbitrary tickers.
     TICKER_EDITABLE = False
 
-    c0, c1, c2, c3 = st.columns([1.5, 1.5, 1.5, 1.0])
+    c0, c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.2, 1.0])
     with c0:
         ticker_input = st.text_input("Ticker", value="TQQQ", disabled=not TICKER_EDITABLE, key="backtest_ticker")
         backtest_ticker = ticker_input.strip().upper() if TICKER_EDITABLE else "TQQQ"
@@ -3204,6 +3204,18 @@ def render_backtest() -> None:
     with c2:
         starting_cash = st.number_input("Starting cash ($)", min_value=1000.0, max_value=10_000_000.0, value=10_000.0, step=1000.0)
     with c3:
+        swing_pct = st.number_input(
+            "Swing %",
+            min_value=1.0,
+            max_value=50.0,
+            value=15.0,
+            step=1.0,
+            format="%.1f",
+            help="For the Swing strategy: buy when price drops this % below the running high; "
+                 "sell when up this % from entry. Ignored by other strategies.",
+            key="backtest_swing_pct",
+        )
+    with c4:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         _btn_slot = st.empty()
         if not st.session_state.get("backtest_running"):
@@ -3258,10 +3270,18 @@ def render_backtest() -> None:
             results = {}
             for name, fn in bs.STRATEGIES.items():
                 _params = inspect.signature(fn).parameters
+
+                # Per-strategy extra kwargs. Only the Swing strategy uses
+                # the UI's swing_pct input; every other strategy keeps its
+                # own defaults untouched.
+                extra_kwargs = {}
+                if "Swing" in name:
+                    extra_kwargs["threshold"] = swing_pct / 100.0
+
                 if "progress_callback" in _params:
-                    signal = fn(qqq_close, tqqq_close, progress_callback=None)
+                    signal = fn(qqq_close, tqqq_close, progress_callback=None, **extra_kwargs)
                 else:
-                    signal = fn(qqq_close, tqqq_close)
+                    signal = fn(qqq_close, tqqq_close, **extra_kwargs)
                 results[name] = run_backtest(prices, signal, starting_cash=starting_cash, warmup_days=30, progress_callback=None)
 
             st.session_state["backtest_results"] = results
@@ -3295,8 +3315,17 @@ def render_backtest() -> None:
     for name, r in results.items():
         calmar = r.cagr / r.max_drawdown if r.max_drawdown > 0 else 0.0
         end_cash = r.starting_cash * (1 + r.total_return)
+        display_name = name
+        if "Swing" in name:
+            # Registry key looks like "Swing - 20-day window".
+            # Extract the descriptive suffix after the dash and re-attach it
+            # after the current threshold so the row reads
+            # "Swing 20% - 20-day window".
+            parts = name.split(" - ", 1)
+            suffix = parts[1] if len(parts) == 2 else ""
+            display_name = f"Swing {swing_pct:.0f}% - {suffix}".rstrip(" -")
         rows.append({
-            "Strategy": name,
+            "Strategy": display_name,
             "Total Return": f"{r.total_return*100:+.2f}%",
             "CAGR": f"{r.cagr*100:+.2f}%",
             "Max Drawdown": f"{r.max_drawdown*100:.2f}%",
@@ -3440,7 +3469,12 @@ def render_backtest() -> None:
 
     # ---------- Trade logs — one expander per strategy ----------
     for name, r in results.items():
-        with st.expander(f"📋 {name} — {r.num_trades} trades"):
+        _display = name
+        if "Swing" in name:
+            _parts = name.split(" - ", 1)
+            _suffix = _parts[1] if len(_parts) == 2 else ""
+            _display = f"Swing {swing_pct:.0f}% - {_suffix}".rstrip(" -")
+        with st.expander(f"📋 {_display} — {r.num_trades} trades"):
             if r.trades.empty:
                 st.caption("No trades in this window.")
                 continue

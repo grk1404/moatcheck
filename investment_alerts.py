@@ -16,6 +16,13 @@ Install as Windows Service with NSSM (see README).
 """
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r".*yfinance_cache.*",
+)
+
 import json
 import time
 from datetime import datetime, timedelta
@@ -73,6 +80,21 @@ SIGNALS_CACHE = Path("data/investments_signals.json")
 
 # Where we persist which alerts we've already sent
 STATE_FILE = Path("data/.alert_state.json")
+
+import socket, time
+
+def wait_for_network(hosts=("query1.finance.yahoo.com", "api.callmebot.com"), timeout=180):
+    """Block until DNS resolves at least one host, or timeout. Returns bool."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for h in hosts:
+            try:
+                socket.getaddrinfo(h, 443)
+                return True
+            except socket.gaierror:
+                continue
+        time.sleep(5)
+    return False
 
 def _in_signal_window() -> bool:
     """Return True if we're currently within the target daily window for
@@ -182,10 +204,9 @@ def check_bnf_setups(df: pd.DataFrame) -> list[dict]:
             a.calculate_all_indicators()
             result = a.check_bnf_reversal_setup()
             if result.get("setup"):
-                hits.append({
-                    "symbol": sym,
-                    "price": float(result["current_price"]),
-                    "ma_25": float(result["ma_25"]),
+                print(f"[DEBUG BNF] {sym}: price={result['current_price']}, ma_25={result['ma_25']}, " f"dislocation={result['dislocation_pct']}, rsi={result['rsi']}, "
+                      f"bars={len(a.data) if hasattr(a, 'data') else '?'}")
+                hits.append({"symbol": sym, "price": float(result["current_price"]), "ma_25": float(result["ma_25"]),
                     "dislocation": float(result["dislocation_pct"]),
                     "rsi": float(result["rsi"]),
                 })
@@ -214,7 +235,8 @@ def check_52w_highs(df: pd.DataFrame, threshold: float) -> list[dict]:
                 continue
             high = float(high)
             price = float(price)
-            if high <= 0:
+            # Guard: never alert on missing/zero/nonsense prices.
+            if high <= 0 or price <= 0:
                 continue
             pct = price / high
             if pct >= threshold:
@@ -249,7 +271,8 @@ def check_52w_lows(df: pd.DataFrame, threshold: float) -> list[dict]:
                 continue
             low = float(low)
             price = float(price)
-            if low <= 0:
+            # Guard: never alert on missing/zero/nonsense prices.
+            if low <= 0 or price <= 0:
                 continue
             pct = (price - low) / low
             if pct <= threshold:
@@ -439,8 +462,8 @@ def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
             continue
         msg = (
             f"🚨 52-Week High Alert\n"
-            f"{sym}: ${hit['price']:.2f} "
-            f"({hit['pct']*100:.1f}% of 52w high ${hit['high']:.2f})"
+            f"{sym}: \\${hit['price']:.2f} "
+            f"({hit['pct']*100:.1f}% of 52w high \\${hit['high']:.2f})"
         )
         if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
             mark_alerted("HIGH", sym, state)
@@ -454,8 +477,8 @@ def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
             continue
         msg = (
             f"⚠️ 52-Week Low Alert\n"
-            f"{sym}: ${hit['price']:.2f} "
-            f"({hit['pct_above']*100:+.1f}% above 52w low ${hit['low']:.2f})"
+            f"{sym}: \\${hit['price']:.2f} "
+            f"({hit['pct_above']*100:+.1f}% above 52w low \\${hit['low']:.2f})"
         )
         if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
             mark_alerted("LOW", sym, state)
@@ -475,8 +498,8 @@ def _run_mos_check(df: pd.DataFrame, state: dict) -> int:
             continue
         msg = (
             f"🎯 MOS Buy Price Hit\n"
-            f"{sym}: ${hit['price']:.2f} ≤ MOS ${hit['mos_price']:.2f} "
-            f"(intrinsic ${hit['intrinsic']:.2f}, {hit['discount']*100:+.1f}%)"
+            f"{sym}: \\${hit['price']:.2f} ≤ MOS \\${hit['mos_price']:.2f} "
+            f"(intrinsic \\${hit['intrinsic']:.2f}, {hit['discount']*100:+.1f}%)"
         )
         if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
             mark_alerted("MOS", sym, state)
@@ -494,8 +517,8 @@ def _run_bnf_check(df: pd.DataFrame, state: dict) -> int:
             continue
         msg = (
             f"🔄 BNF Reversal Setup\n"
-            f"{sym}: ${hit['price']:.2f}\n"
-            f"Dislocation: {hit['dislocation']:.1f}% below MA25 (${hit['ma_25']:.2f})\n"
+            f"{sym}: \\${hit['price']:.2f}\n"
+            f"Dislocation: {hit['dislocation']:.1f}% below MA25 (\\${hit['ma_25']:.2f})\n"
             f"RSI: {hit['rsi']:.1f}"
         )
         if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
@@ -558,16 +581,16 @@ def check_tqqq_signal() -> dict | None:
         if tq_delta_pct < MIN_TRADE_PCT:
             tq_action = f"No action needed (delta {tq_delta_pct:.2f}%)"
         elif tq_delta > 0:
-            tq_action = f"BUY {tq_delta:.4f} shares TQQQ (~${abs(tq_delta) * tq_px:.2f})"
+            tq_action = f"BUY {tq_delta:.4f} shares TQQQ (~\\${abs(tq_delta) * tq_px:.2f})"
         else:
-            tq_action = f"SELL {abs(tq_delta):.4f} shares TQQQ (~${abs(tq_delta) * tq_px:.2f})"
+            tq_action = f"SELL {abs(tq_delta):.4f} shares TQQQ (~\\${abs(tq_delta) * tq_px:.2f})"
 
         if sq_delta_pct < MIN_TRADE_PCT:
             sq_action = f"No action needed (delta {sq_delta_pct:.2f}%)"
         elif sq_delta > 0:
-            sq_action = f"BUY {sq_delta:.4f} shares SQQQ (~${abs(sq_delta) * sq_px:.2f})"
+            sq_action = f"BUY {sq_delta:.4f} shares SQQQ (~\\${abs(sq_delta) * sq_px:.2f})"
         else:
-            sq_action = f"SELL {abs(sq_delta):.4f} shares SQQQ (~${abs(sq_delta) * sq_px:.2f})"
+            sq_action = f"SELL {abs(sq_delta):.4f} shares SQQQ (~\\${abs(sq_delta) * sq_px:.2f})"
 
         return {
             "signal": r["signal"],
@@ -607,7 +630,7 @@ def _run_tqqq_signal_check(state: dict) -> int:
         f"{action_icon} TQQQ Signal — {info['signal']}",
         f"Regime: {info['regime']}",
         f"Target: {info['target_tqqq_pct']:.2f}% TQQQ / {info['target_sqqq_pct']:.2f}% SQQQ",
-        f"Sleeve value: ${info['account_value']:.2f}",
+        f"Sleeve value: \\${info['account_value']:.2f}",
         "",
         f"TQQQ: {info['tqqq_action']}",
         f"SQQQ: {info['sqqq_action']}",
@@ -679,10 +702,18 @@ def main() -> None:
     print(f"[alerts] Low threshold:  {CONFIG['low_threshold']}")
 
     while True:
+        # Network gate: re-check before every cycle so wake-from-sleep
+        # doesn't immediately fail DNS on Yahoo / CallMeBot.
+        if not wait_for_network():
+            print("[alerts] Network not ready after 180s, skipping this cycle.")
+            time.sleep(CONFIG["check_interval_seconds"])
+            continue
+
         try:
             run_once()
         except Exception as e:
             print(f"[alerts] Cycle failed: {type(e).__name__}: {e}")
+
         time.sleep(CONFIG["check_interval_seconds"])
 
 

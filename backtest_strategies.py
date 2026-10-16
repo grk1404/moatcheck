@@ -166,7 +166,7 @@ def _vote_7step(ind: dict) -> float:
     return float(sum(votes) / len(votes))
 
 
-def signal_7step(qqq_close: pd.Series, tqqq_close: pd.Series, min_history: int = 200, threshold: float = 0.60) -> pd.Series:
+def signal_7step(qqq_close: pd.Series, tqqq_close: pd.Series, min_history: int = 200, threshold: float = 0.60, **params) -> pd.Series:
     """Run the 7-step framework day-by-day, return 0/1 signals.
 
     Parameters:
@@ -198,7 +198,7 @@ def signal_7step(qqq_close: pd.Series, tqqq_close: pd.Series, min_history: int =
 # STRATEGY 3 — One Percent A Week (TASC weekly swing)
 # ============================================================
 
-def signal_1pct_week(qqq_close: pd.Series, tqqq_close: pd.Series, dip_pct: float = 0.01, profit_pct: float = 0.01, breakeven_pct: float = 0.005) -> pd.Series:
+def signal_1pct_week(qqq_close: pd.Series, tqqq_close: pd.Series, dip_pct: float = 0.01, profit_pct: float = 0.01, breakeven_pct: float = 0.005, **params) -> pd.Series:
     """The TASC 'One Percent A Week' strategy, daily bar equivalent.
 
     Rules (simplified for daily bars):
@@ -275,23 +275,36 @@ def signal_1pct_week(qqq_close: pd.Series, tqqq_close: pd.Series, dip_pct: float
     return signals
 
 
-def signal_15pct_swing(qqq_close: pd.Series, tqqq_close: pd.Series, threshold: float = 0.15, **params) -> pd.Series:
+def signal_15pct_swing(
+    qqq_close: pd.Series,
+    tqqq_close: pd.Series,
+    threshold: float = 0.15,
+    lookback: int | None = None,
+    **params,
+) -> pd.Series:
     """Buy every 15% drop. Sell only when the position is +15% from entry.
 
-    Rules:
-      1. Track the running high of TQQQ. When price drops `threshold`
-         from that high, enter long at the next day's open.
-      2. Once in, exit only when the price is `threshold` above the
-         actual entry price. If price keeps falling, hold through it.
-      3. After exit, reset the running high reference to the exit price
-         and look for the next drop.
+    If `lookback` is None (default): the BUY reference is the running high
+    since the last exit — an unbounded swing high. This is the original
+    Design B behavior.
 
-    Signals are computed on TQQQ prices. Signals at day N apply to day N+1.
+    If `lookback` is an integer N: the BUY reference is the rolling max of
+    the last N closes. This is Design A. Use for parameter sweeps.
+
+    In both modes:
+      - SELL fires only when price is +threshold above the actual entry.
+      - No pyramiding: while long, further drops do not trigger new buys.
     """
     signals = pd.Series(0, index=tqqq_close.index, dtype=int)
     prices = tqqq_close.dropna()
     if len(prices) < 2:
         return signals
+
+    # Precompute rolling max if we're in Design A mode
+    if lookback is not None:
+        rolling_max = prices.rolling(lookback).max()
+    else:
+        rolling_max = None
 
     in_position = False
     entry_price = None
@@ -301,33 +314,45 @@ def signal_15pct_swing(qqq_close: pd.Series, tqqq_close: pd.Series, threshold: f
         px = float(px)
 
         if not in_position:
-            # Update the running high while flat
-            if px > running_high:
-                running_high = px
-            # Enter when price drops `threshold` below the running high
-            elif px <= running_high * (1 - threshold):
+            # Determine the reference high
+            if rolling_max is not None:
+                ref_high = rolling_max.loc[date]
+                if pd.isna(ref_high):
+                    signals.iloc[signals.index.get_loc(date)] = 0
+                    continue
+                ref_high = float(ref_high)
+            else:
+                # Running high: only rises while flat
+                if px > running_high:
+                    running_high = px
+                ref_high = running_high
+
+            # Enter when price drops `threshold` below the reference high
+            if px <= ref_high * (1 - threshold):
                 in_position = True
-                entry_price = px          # signal fires now; engine buys at next open
+                entry_price = px
         else:
-            # In position — exit only when we're +threshold from entry
+            # In position — exit only at +threshold from entry
             if entry_price is not None and px >= entry_price * (1 + threshold):
                 in_position = False
                 entry_price = None
-                # Reset the running high to the exit price so we look for a
-                # fresh 15% drop from here
-                running_high = px
+                # Reset running high to exit price (Design B only)
+                if rolling_max is None:
+                    running_high = px
 
         signals.iloc[signals.index.get_loc(date)] = 1 if in_position else 0
 
     return signals
 
+
 # ============================================================
 # STRATEGY REGISTRY
 # ============================================================
-
 STRATEGIES = {
     "Buy and Hold (baseline)": signal_buy_hold,
     "7-Step TQQQ (live)": signal_7step,
     "One Percent A Week (TASC^)": signal_1pct_week,
-    "15% Swing (buy dip / sell rip)": signal_15pct_swing,
+    "Swing - since last exit": signal_15pct_swing,
+    "Swing - 20-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=20, **p),
+    "Swing - 60-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=60, **p),
 }
