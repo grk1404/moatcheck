@@ -260,11 +260,12 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
                         shortfalls.append(thr["min"] - v)
                     else:
                         shortfalls.append(v - thr["max"])
-                        # ↓↓↓ THESE THREE LINES ARE THE BUG ↓↓↓
-                        avg_shortfall = sum(shortfalls) / len(vals) if shortfalls else 0.0
-                        bound_range = thr["max"] - thr["min"]
-                        score = max(0.0, (1.0 - (avg_shortfall / bound_range)) * 10.0) if bound_range > 0 else 0.0
-                        per_metric_consistency.append(score)
+                
+                # Calculate the score based on ALL shortfalls, not just above-max ones
+                avg_shortfall = sum(shortfalls) / len(vals) if shortfalls else 0.0
+                bound_range = thr["max"] - thr["min"]
+                score = max(0.0, (1.0 - (avg_shortfall / bound_range)) * 10.0) if bound_range > 0 else 0.0
+                per_metric_consistency.append(score)
                     # ↑↑↑ THEY'RE INSIDE THE `else`, SO THEY ONLY RUN FOR ABOVE-MAX FAILURES ↑↑↑
     consistency = (sum(per_metric_consistency) / len(per_metric_consistency)) if per_metric_consistency else 0.0
     # Human-readable consistency reason (based on the computed consistency score)
@@ -463,7 +464,17 @@ def _discount_to_fair_value(
     future_per_share = base * ((1 + g) ** 10) * terminal_multiple
     fair_value = future_per_share / ((1 + discount_rate) ** 10)
 
+    # Guardrail: If fair value is negative or absurdly tiny, the DCF is invalid.
+    if fair_value <= 0:
+        return None
+
     discount = (fair_value - fin.current_price) / fair_value
+    
+    # Guardrail: Clamp extreme values. A discount below -100% or above +500% 
+    # usually means a data glitch (e.g. near-zero earnings).
+    if discount < -1.0 or discount > 5.0:
+        return None
+        
     return float(discount)
 
 def _metric_from_cagr(label: str, series: pd.Series, threshold: dict[str, float]) -> MetricResult:

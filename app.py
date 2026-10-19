@@ -102,8 +102,8 @@ def _suggest_ticker(symbol: str) -> str | None:
 
 
 def _fmt_pct(v: float | None) -> str:
-    if v is None:
-        return "n/a"
+    if v is None or pd.isna(v):
+        return "no data"
     return f"{v * 100:.1f}%"
 
 def get_currency_symbol(exchange: str, ticker: str = "") -> str:
@@ -603,6 +603,14 @@ def render_analyzer() -> None:
 
     # Company Name Display 
     st.subheader(f"{fin.company_name} ({fin.ticker})")
+    # Guardrail: Yahoo sometimes returns absurd analyst growth rates (e.g., 247%) 
+    # for small caps or post-earnings anomalies. Cap it at 25% so it doesn't
+    # blow up the DCF and intrinsic value calculations into the millions.
+    if getattr(fin, "analyst_5yr_growth", None) is not None:
+        if fin.analyst_5yr_growth > 0.25:
+            fin.analyst_5yr_growth = 0.25
+        elif fin.analyst_5yr_growth < 0.0:
+            fin.analyst_5yr_growth = 0.0    
 
     # Company Summary
     if fin.company_summary or fin.company_sector or fin.company_industry or fin.company_country:
@@ -645,8 +653,164 @@ def render_analyzer() -> None:
     elif fin.exchange:
         st.caption(f"US Listed on {fin.exchange}  ($ USD)")
     _eps_ttm = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
+
+    # ============================================================
+    # CORE CALCULATIONS
+    # ============================================================
+    big5 = compute_big5(fin)
+    big5_eps_g = _big5_eps_growth(big5)
+
+    # --- EPS selection: prefer latest year, but fall back to a 3yr positive-EPS
+    # average when the latest year is negative (value Price and other formulas
+    # can't handle negative earnings). This surfaces to the user as an amber note.
+    _eps_ttm_raw = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
+    _normalized_eps = None
+    _normalized_years: list[int] = []
+    if _eps_ttm_raw is not None and _eps_ttm_raw <= 0 and not fin.eps.empty:
+        positive_history = fin.eps[fin.eps > 0]
+        if not positive_history.empty:
+            # Take the 3 most recent positive years (or fewer if less available).
+            recent_pos = positive_history.tail(3)
+            _normalized_eps = float(recent_pos.mean())
+            _normalized_years = [int(y) for y in recent_pos.index]
+
+    current_eps = _normalized_eps if _normalized_eps is not None else _eps_ttm_raw
+
+    if _normalized_eps is not None:
+        yrs_txt = ", ".join(str(y) for y in _normalized_years)
+        st.warning(
+            f":warning: Latest reported EPS is negative (${_eps_ttm_raw:.2f}). "
+            f"value Price and other formulas need positive EPS to work — the app "
+            f"has substituted a **normalized EPS of ${_normalized_eps:.2f}**, computed as the "
+            f"average of the last {len(_normalized_years)} positive years ({yrs_txt}). "
+            f"Treat these valuations as guidance about what this business *could* be worth "
+            f"if it returns to prior profitability, not what it's worth today."
+        )    
+
+    def _moat_conservative_growth() -> float | None:
+        """Return a conservative 15% growth rate for Buffett-style valuation."""
+        # Always return 15% - this is Buffett's standard conservative rate
+        return 0.15
+
+    def _valuation_growth_rate_label(mode: str) -> str:
+        if mode == "Value conservative":
+            rate = _moat_conservative_growth()
+            return f"Value conservative: {_fmt_pct(rate) if rate is not None else 'n/a'}"
+        if mode == "Big 5 EPS growth":
+            return f"Big 5 EPS growth: {_fmt_pct(big5_eps_g) if big5_eps_g is not None else 'n/a'}"
+        if mode == "Analyst 5Y growth":
+            return f"Analyst 5Y growth: {_fmt_pct(fin.analyst_5yr_growth) if fin.analyst_5yr_growth is not None else 'n/a'}"
+        if mode == "Custom":
+            return "Custom"
+            
+        return mode
+
+    def _valuation_growth_mode_options() -> list[str]:
+        options = ["Value conservative"]
+        if big5_eps_g is not None:
+            options.append("Big 5 EPS growth")
+        if fin.analyst_5yr_growth is not None:
+            options.append("Analyst 5Y growth")
+        options.append("Custom")
+        return options
+
+    def _compute_valuation_value(mode: str):
+        st.write(
+            "DEBUG COMPUTE:",
+            mode,
+            "analyst=",
+            fin.analyst_5yr_growth,
+            "custom=",
+            st.session_state.get("custom_growth_rate"),
+        )
+        if mode == "Custom":
+            custom_growth_pct = float(st.session_state.get("custom_growth_rate", 0) or 0)
+            if custom_growth_pct <= 0:
+                return None
+            custom_growth = custom_growth_pct / 100.0
+            return value_price(
+                current_eps=current_eps,
+                big5_eps_growth=None,
+                analyst_growth=None,
+                historical_pe=fin.pe_ratio_ttm,
+                custom_growth=custom_growth,
+            )
+
+        if mode == "Value conservative":
+            # --- FIX: Use the conservative growth function (returns 15%) ---
+            conservative_growth = _moat_conservative_growth()
+            if conservative_growth is None:
+                return None
+            return value_price(
+                current_eps=current_eps,
+                big5_eps_growth=None,           # Ignore Big5 growth
+                analyst_growth=None,            # Ignore analyst growth
+                historical_pe=fin.pe_ratio_ttm,
+                custom_growth=conservative_growth,  # Force 15%
+            )
+
+        if mode == "Big 5 EPS growth":
+            if big5_eps_g is None:
+                return None
+            return value_price(
+                current_eps=current_eps,
+                big5_eps_growth=big5_eps_g,
+                analyst_growth=None,
+                historical_pe=fin.pe_ratio_ttm,
+            )
+
+        if mode == "Analyst 5Y growth":
+            if fin.analyst_5yr_growth is None:
+                return None
+            return value_price(
+                current_eps=current_eps,
+                big5_eps_growth=None,
+                analyst_growth=fin.analyst_5yr_growth,
+                historical_pe=fin.pe_ratio_ttm,
+            )
+
+        return None
+
+    # Initialize Valuation State early so top metrics can use it
+    if "valuation_growth_result" not in st.session_state:
+        st.session_state["valuation_growth_result"] = None
+    if "custom_growth_rate" not in st.session_state:
+        st.session_state["custom_growth_rate"] = 0
+    if isinstance(st.session_state["custom_growth_rate"], float):
+        st.session_state["custom_growth_rate"] = int(round(st.session_state["custom_growth_rate"] * 100))
+
+    mode_options = _valuation_growth_mode_options()
+    if "valuation_growth_mode" not in st.session_state or st.session_state["valuation_growth_mode"] not in mode_options:
+        st.session_state["valuation_growth_mode"] = "Value conservative"
+    selected_growth_mode = st.session_state["valuation_growth_mode"]
+
+    val = st.session_state.get("valuation_growth_result")
+    if val is None:
+        val = _compute_valuation_value(selected_growth_mode)
+        st.session_state["valuation_growth_result"] = val
+
+    # ============================================================
+    # METRICS ROW
+    # ============================================================
+    _intrinsic_sub = ""
+    _intrinsic_color = "#9aa0a6"
+    if val and fin.current_price and val.value_price:
+        _upside = (val.value_price - fin.current_price) / fin.current_price
+        if _upside < 0:
+            _intrinsic_sub = f"{abs(_upside)*100:.1f}% above fair"
+            _intrinsic_color = "#FFA726" # Orange
+        else:
+            _intrinsic_sub = f"{_upside*100:.1f}% below fair"
+            _intrinsic_color = "#00E676" # Green
+
     top1, top2, top3, top4, top5, top6, top7, top8 = st.columns(8)
-    top1.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
+    # Replace top1.metric with the custom HTML version to support the colored sub-line
+    top1.markdown(_metric_html(
+        "Current Price", 
+        _fmt_money(fin.current_price, fin.exchange, fin.ticker), 
+        sub=_intrinsic_sub, 
+        sub_color=_intrinsic_color
+    ), unsafe_allow_html=True)
     top2.metric("Market Cap", _fmt_money(fin.market_cap, fin.exchange, fin.ticker))
     top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange or "USD"))
     top4.metric("TTM P/E", f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "n/a")
@@ -668,10 +832,6 @@ def render_analyzer() -> None:
         _debt_color = "#9AA0A6"
         _debt_sub = "no FCF data"
     elif _fcf_ttm <= 0:
-        # Worst case: negative free cash flow means no operating cash to
-        # service the debt. There's no meaningful "years to pay off" number —
-        # the ratio is undefined. Show the debt amount and make it clear this
-        # is more severe than any ratio can express.
         _debt_value = _fmt_money(_ltd_ttm, fin.exchange, fin.ticker)
         _debt_color = "#EF5350"
         _debt_sub = "⚠ SEVERE · negative FCF"
@@ -740,8 +900,9 @@ def render_analyzer() -> None:
         ratios = fin.eps.diff() / fin.eps.shift(1).abs()
         _show_split_warning = bool((ratios.abs() > 0.5).any())
 
-    big5 = compute_big5(fin)
-
+    # ============================================================
+    # BIG 5 TABLE
+    # ============================================================
     st.markdown(
         '### Big 5 Growth Rates — <span style="color: #00E676;">Is this a Wonderful Company?</span>',
         unsafe_allow_html=True,
@@ -801,7 +962,7 @@ def render_analyzer() -> None:
                     <div style="color:#9aa0a6; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;">Consistency</div>
                     <div style="font-size: 1.25rem; color: {_ws_color_hex};">{_ws.consistency:.1f}/10</div>
                     <div style="color:#9aa0a6; font-size: 0.7rem;">How stable growth is across four time windows</div>
-                    <div style="color:##FFFFFF; font-size: 0.7rem;">{_ws.consistency_reason}</div>                    
+                    <div style="color:#FFFFFF; font-size: 0.7rem;">{_ws.consistency_reason}</div>                    
                 </div>
             </div>
             <div style="margin-top: 0.9rem; font-size: 0.8rem; color: #c5c8cd;">
@@ -813,222 +974,10 @@ def render_analyzer() -> None:
         unsafe_allow_html=True,
     )
 
+    # ============================================================
+    # VALUATION (Intrinsic Value Section)
+    # ============================================================
     st.markdown("### Valuation")
-
-    # Compute Big 5 EPS growth FIRST so the DCF section can use it
-    big5_eps_g = _big5_eps_growth(big5)
-
-    # ============================================================
-    # DCF METHOD VALUATION
-    # ============================================================
-    st.markdown("#### DCF Method Valuation")
-    st.caption(
-        "Discounted Cash Flow — projects free cash flow forward and discounts "
-        "it back to today. Adjust the two assumptions below; only this section "
-        "reacts to the sliders."
-    )
-    dcf_col1, dcf_col2 = st.columns(2)
-    with dcf_col1:
-        dcf_discount = st.slider(
-            "DCF discount rate",
-            min_value=6.0,
-            max_value=15.0,
-            value=10.0,
-            step=0.5,
-            format="%.1f%%",
-            help="Required annual return. 10% = long-run S&P 500 average; 15% = Buffett's aggressive rate.",
-            key="dcf_discount_slider",
-        ) / 100
-    with dcf_col2:
-        dcf_terminal = st.slider(
-            "DCF terminal growth",
-            min_value=0.0,
-            max_value=4.0,
-            value=2.5,
-            step=0.5,
-            format="%.1f%%",
-            help="Perpetual growth rate after the fade period. Should be <= long-run GDP growth (~2.5-3%).",
-            key="dcf_terminal_slider",
-        ) / 100
-
-    st.caption(f"DEBUG: discount={dcf_discount:.4f}, terminal={dcf_terminal:.4f}")
-
-    # Run the two-stage DCF with these inputs
-    _fcf_ttm_dcf = float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None
-    _growth_dcf = big5_eps_g if big5_eps_g is not None else fin.analyst_5yr_growth
-    _dcf_val = dcf_two_stage(
-        fcf_ttm=_fcf_ttm_dcf,
-        shares_out=fin.shares_outstanding,
-        current_price=fin.current_price,
-        growth_rate=_growth_dcf,
-        discount_rate=dcf_discount,
-        terminal_growth=dcf_terminal,
-    )
-    st.caption(f"DEBUG: dcf fair_value={_dcf_val.fair_value if _dcf_val else None}")
-    if _dcf_val is None:
-        st.info("DCF not computable — needs positive TTM free cash flow and shares outstanding.")
-    else:
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            st.metric("DCF Fair Value", _fmt_money(_dcf_val.fair_value, fin.exchange, fin.ticker))
-        with d2:
-            st.metric("DCF MOS Buy Price", _fmt_money(_dcf_val.mos_price, fin.exchange, fin.ticker))
-        with d3:
-            st.metric(
-                "DCF Upside",
-                _fmt_pct(_dcf_val.upside_pct) if _dcf_val.upside_pct is not None else "n/a",
-            )
-        with d4:
-            st.metric("DCF Verdict", _dcf_val.verdict)
-
-        with st.expander("How the DCF was calculated"):
-            st.markdown(
-                f"""
-                **Inputs**
-                - TTM Free Cash Flow: **{_fmt_money(_fcf_ttm_dcf, fin.exchange, fin.ticker)}**
-                - Shares outstanding: **{fin.shares_outstanding:,.0f}** *(from yfinance)*
-                - Projection growth rate: **{_fmt_pct(_growth_dcf)}**
-                - Discount rate (WACC proxy): **{_fmt_pct(dcf_discount)}**
-                - Terminal growth: **{_fmt_pct(dcf_terminal)}**
-
-                **Method**
-                Two-stage DCF: FCF grows at the projection rate for a fade period,
-                then settles into perpetual terminal growth. All cash flows are
-                discounted at the required return rate. Fair value is divided by
-                shares outstanding to get a per-share price. MOS Buy Price applies
-                a 25% margin of safety.
-                """
-            )
-
-    st.markdown("---")
-
-    # --- EPS selection: prefer latest year, but fall back to a 3yr positive-EPS
-    # average when the latest year is negative (value Price and other formulas
-    # can't handle negative earnings). This surfaces to the user as an amber note.
-    _eps_ttm_raw = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
-    _normalized_eps = None
-    _normalized_years: list[int] = []
-    if _eps_ttm_raw is not None and _eps_ttm_raw <= 0 and not fin.eps.empty:
-        positive_history = fin.eps[fin.eps > 0]
-        if not positive_history.empty:
-            # Take the 3 most recent positive years (or fewer if less available).
-            recent_pos = positive_history.tail(3)
-            _normalized_eps = float(recent_pos.mean())
-            _normalized_years = [int(y) for y in recent_pos.index]
-
-    current_eps = _normalized_eps if _normalized_eps is not None else _eps_ttm_raw
-
-    if _normalized_eps is not None:
-        yrs_txt = ", ".join(str(y) for y in _normalized_years)
-        st.warning(
-            f":warning: Latest reported EPS is negative (${_eps_ttm_raw:.2f}). "
-            f"value Price and other formulas need positive EPS to work — the app "
-            f"has substituted a **normalized EPS of ${_normalized_eps:.2f}**, computed as the "
-            f"average of the last {len(_normalized_years)} positive years ({yrs_txt}). "
-            f"Treat these valuations as guidance about what this business *could* be worth "
-            f"if it returns to prior profitability, not what it's worth today."
-        )    
-
-    def _moat_conservative_growth() -> float | None:
-        """Return a conservative 15% growth rate for Buffett-style valuation."""
-        # Always return 15% - this is Buffett's standard conservative rate
-        return 0.15
-
-
-    def _valuation_growth_rate_label(mode: str) -> str:
-        if mode == "Value conservative":
-            rate = _moat_conservative_growth()
-            return f"Value conservative: {_fmt_pct(rate) if rate is not None else 'n/a'}"
-        if mode == "Big 5 EPS growth":
-            return f"Big 5 EPS growth: {_fmt_pct(big5_eps_g) if big5_eps_g is not None else 'n/a'}"
-        if mode == "Analyst 5Y growth":
-            return f"Analyst 5Y growth: {_fmt_pct(fin.analyst_5yr_growth) if fin.analyst_5yr_growth is not None else 'n/a'}"
-        if mode == "Custom":
-            return "Custom"
-            
-        return mode
-
-
-    def _valuation_growth_mode_options() -> list[str]:
-        options = ["Value conservative"]
-        if big5_eps_g is not None:
-            options.append("Big 5 EPS growth")
-        if fin.analyst_5yr_growth is not None:
-            options.append("Analyst 5Y growth")
-        options.append("Custom")
-        return options
-
-    mode_options = _valuation_growth_mode_options()
-    if "valuation_growth_mode" not in st.session_state or st.session_state["valuation_growth_mode"] not in mode_options:
-        st.session_state["valuation_growth_mode"] = "Value conservative"
-    selected_growth_mode = st.session_state["valuation_growth_mode"]
-
-    if "custom_growth_rate" not in st.session_state:
-        st.session_state["custom_growth_rate"] = 0
-
-
-    def _compute_valuation_value(mode: str):
-        st.write(
-            "DEBUG COMPUTE:",
-            mode,
-            "analyst=",
-            fin.analyst_5yr_growth,
-            "custom=",
-            st.session_state.get("custom_growth_rate"),
-        )
-        if mode == "Custom":
-            custom_growth_pct = float(st.session_state.get("custom_growth_rate", 0) or 0)
-            if custom_growth_pct <= 0:
-                return None
-            custom_growth = custom_growth_pct / 100.0
-            return value_price(
-                current_eps=current_eps,
-                big5_eps_growth=None,
-                analyst_growth=None,
-                historical_pe=fin.pe_ratio_ttm,
-                custom_growth=custom_growth,
-            )
-
-        if mode == "Value conservative":
-            # --- FIX: Use the conservative growth function (returns 15%) ---
-            conservative_growth = _moat_conservative_growth()
-            if conservative_growth is None:
-                return None
-            return value_price(
-                current_eps=current_eps,
-                big5_eps_growth=None,           # Ignore Big5 growth
-                analyst_growth=None,            # Ignore analyst growth
-                historical_pe=fin.pe_ratio_ttm,
-                custom_growth=conservative_growth,  # Force 15%
-            )
-
-        if mode == "Big 5 EPS growth":
-            if big5_eps_g is None:
-                return None
-            return value_price(
-                current_eps=current_eps,
-                big5_eps_growth=big5_eps_g,
-                analyst_growth=None,
-                historical_pe=fin.pe_ratio_ttm,
-            )
-
-        if mode == "Analyst 5Y growth":
-            if fin.analyst_5yr_growth is None:
-                return None
-            return value_price(
-                current_eps=current_eps,
-                big5_eps_growth=None,
-                analyst_growth=fin.analyst_5yr_growth,
-                historical_pe=fin.pe_ratio_ttm,
-            )
-
-        return None
-
-
-    # The valuation result is intentionally recomputed from the current selected
-    # growth source only after the user presses RE-VALUATE. A stale cached result
-    # would otherwise keep showing the old value price even after the radio
-    # selection changes.
 
     _VERDICT_TOOLTIPS = {
         "BARGAIN BUY": (
@@ -1162,23 +1111,6 @@ def render_analyzer() -> None:
             unsafe_allow_html=True,
         )
 
-
-    if "valuation_growth_result" not in st.session_state:
-        st.session_state["valuation_growth_result"] = None
-
-    if "custom_growth_rate" not in st.session_state:
-        st.session_state["custom_growth_rate"] = 0
-
-    # Custom growth rate is stored as a whole-number percentage for UI simplicity,
-    # but the valuation model expects a decimal fraction (e.g. 15 => 0.15).
-    if isinstance(st.session_state["custom_growth_rate"], float):
-        st.session_state["custom_growth_rate"] = int(round(st.session_state["custom_growth_rate"] * 100))
-
-    val = st.session_state.get("valuation_growth_result")
-    if val is None:
-        val = _compute_valuation_value(selected_growth_mode)
-        st.session_state["valuation_growth_result"] = val
-
     if val is None:
         st.info(
             "Cannot compute value Price — need positive current EPS and at least one "
@@ -1263,7 +1195,7 @@ def render_analyzer() -> None:
         with st.expander("How the value Price was calculated"):
             _big5_g_txt = _fmt_pct(big5_eps_g)
             _analyst_g_txt = _fmt_pct(fin.analyst_5yr_growth)
-            _hist_pe_txt = f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "n/a"
+            _hist_pe_txt = f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "no data"
             _default_pe = val.growth_rate * 100 * 2
             _mos_pct_int = int(round(100 * (1 - val.mos_price / val.value_price))) if val.value_price else 50
 
@@ -1299,6 +1231,95 @@ def render_analyzer() -> None:
     """.strip()
             )
 
+    st.markdown("---")
+
+    # ============================================================
+    # DCF METHOD VALUATION
+    # ============================================================
+    st.markdown("#### DCF Method Valuation")
+    st.caption(
+        "Discounted Cash Flow — projects free cash flow forward and discounts "
+        "it back to today. Adjust the two assumptions below; only this section "
+        "reacts to the sliders."
+    )
+    dcf_col1, dcf_col2 = st.columns(2)
+    with dcf_col1:
+        dcf_discount = st.slider(
+            "DCF discount rate",
+            min_value=6.0,
+            max_value=15.0,
+            value=10.0,
+            step=0.5,
+            format="%.1f%%",
+            help="Required annual return. 10% = long-run S&P 500 average; 15% = Buffett's aggressive rate.",
+            key="dcf_discount_slider",
+        ) / 100
+    with dcf_col2:
+        dcf_terminal = st.slider(
+            "DCF terminal growth",
+            min_value=0.0,
+            max_value=4.0,
+            value=2.5,
+            step=0.5,
+            format="%.1f%%",
+            help="Perpetual growth rate after the fade period. Should be <= long-run GDP growth (~2.5-3%).",
+            key="dcf_terminal_slider",
+        ) / 100
+
+    st.caption(f"DEBUG: discount={dcf_discount:.4f}, terminal={dcf_terminal:.4f}")
+
+    # Run the two-stage DCF with these inputs
+    _fcf_ttm_dcf = float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None
+    _growth_dcf = big5_eps_g if big5_eps_g is not None else fin.analyst_5yr_growth
+    _dcf_val = dcf_two_stage(
+        fcf_ttm=_fcf_ttm_dcf,
+        shares_out=fin.shares_outstanding,
+        current_price=fin.current_price,
+        growth_rate=_growth_dcf,
+        discount_rate=dcf_discount,
+        terminal_growth=dcf_terminal,
+    )
+    st.caption(f"DEBUG: dcf fair_value={_dcf_val.fair_value if _dcf_val else None}")
+    if _dcf_val is None:
+        st.info("DCF not computable — needs positive TTM free cash flow and shares outstanding.")
+    else:
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.metric("DCF Fair Value", _fmt_money(_dcf_val.fair_value, fin.exchange, fin.ticker))
+        with d2:
+            st.metric("DCF MOS Buy Price", _fmt_money(_dcf_val.mos_price, fin.exchange, fin.ticker))
+        with d3:
+            st.metric(
+                "DCF Upside",
+                _fmt_pct(_dcf_val.upside_pct) if _dcf_val.upside_pct is not None else "n/a",
+            )
+        with d4:
+            st.metric("DCF Verdict", _dcf_val.verdict)
+
+        with st.expander("How the DCF was calculated"):
+            st.markdown(
+                f"""
+                **Inputs**
+                - TTM Free Cash Flow: **{_fmt_money(_fcf_ttm_dcf, fin.exchange, fin.ticker)}**
+                - Shares outstanding: **{fin.shares_outstanding:,.0f}** *(from yfinance)*
+                - Projection growth rate: **{_fmt_pct(_growth_dcf)}**
+                - Discount rate (WACC proxy): **{_fmt_pct(dcf_discount)}**
+                - Terminal growth: **{_fmt_pct(dcf_terminal)}**
+
+                **Method**
+                Two-stage DCF: FCF grows at the projection rate for a fade period,
+                then settles into perpetual terminal growth. All cash flows are
+                discounted at the required return rate. Fair value is divided by
+                shares outstanding to get a per-share price. MOS Buy Price applies
+                a 25% margin of safety.
+                """
+            )
+
+    st.markdown("---")
+
+    # ============================================================
+    # OTHER INTRINSIC VALUE METHODS
+    # ============================================================
     # Assumptions for the other methods (Graham Formula and Lynch/Graham/PEG MOS)
     with st.expander("⚙️ Assumptions for the other methods", expanded=False):
         a_col1, a_col2 = st.columns(2)
@@ -3173,13 +3194,16 @@ def render_backtest() -> None:
     """Back Test page — run historical simulations of trading strategies."""
     st.header("🧪 Back Test")
     st.markdown(
-        "Compare three long-or-cash strategies on historical TQQQ data. "
+        "Compare multiple long-or-cash strategies on historical TQQQ data. "
         "All use QQQ for signal generation and execute at next-day open."
     )
     st.markdown(
         "- **Buy and Hold** — fully invested in TQQQ the entire window. The passive baseline.\n"
         "- **7-Step TQQQ** — trades the live regime-aware framework. Goes to cash in bear/neutral regimes to dodge drawdowns.\n"
-        "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close."
+        "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close.\n"
+        "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry. Resets the running high after every exit.\n"
+        "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high, and sells when it rallies *Swing %* from entry.\n"
+        "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high, and sells when it rallies *Swing %* from entry."
     )
 
     # ---------- Import lazily so the page only loads its deps when opened ----------
@@ -3619,4 +3643,4 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-_nav.run()
+_nav.run()                        
