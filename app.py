@@ -3470,19 +3470,55 @@ def render_backtest() -> None:
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         # Chart with markers
+        # Chart with markers
         import plotly.graph_objects as go
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=tqqq_series.index, y=tqqq_series, name="TQQQ", line=dict(color="#4DABF7", width=2)))
+        fig2.add_trace(go.Scatter(x=tqqq_series.index, y=tqqq_series, name="TQQQ Price", line=dict(color="#4DABF7", width=2)))
 
+        # 1. Historical Swing Events (Peak/Troughs)
         ups_dates = [pd.Timestamp(d) for d in swings.loc[swings["direction"] == "UP", "date"]]
         ups_y = [float(tqqq_series.loc[d]) for d in ups_dates if d in tqqq_series.index]
         downs_dates = [pd.Timestamp(d) for d in swings.loc[swings["direction"] == "DOWN", "date"]]
         downs_y = [float(tqqq_series.loc[d]) for d in downs_dates if d in tqqq_series.index]
 
-        fig2.add_trace(go.Scatter(x=ups_dates, y=ups_y, mode="markers", name="Up ≥15%", marker=dict(color="#00E676", size=10, symbol="triangle-up")))
-        fig2.add_trace(go.Scatter(x=downs_dates, y=downs_y, mode="markers", name="Down ≥15%", marker=dict(color="#EF5350", size=10, symbol="triangle-down")))
+        fig2.add_trace(go.Scatter(x=ups_dates, y=ups_y, mode="markers", name=f"Up ≥{threshold_pct}%", marker=dict(color="rgba(0, 230, 118, 0.4)", size=8, symbol="circle")))
+        fig2.add_trace(go.Scatter(x=downs_dates, y=downs_y, mode="markers", name=f"Down ≥{threshold_pct}%", marker=dict(color="rgba(239, 83, 80, 0.4)", size=8, symbol="circle")))
 
-        fig2.update_layout(height=380, template="plotly_dark", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), yaxis_title="TQQQ Price ($)", margin=dict(l=20, r=20, t=40, b=20))
+        # 2. Actual Strategy Trades (BUY / SELL)
+        # Find the specific swing result (we'll use the 'since last exit' version as the canonical one)
+        swing_res = None
+        for name, r in results.items():
+            if "Swing" in name and "since last exit" in name:
+                swing_res = r
+                break
+        
+        if swing_res and not swing_res.trades.empty:
+            # Get the exact prices at the entry and exit dates
+            buy_dates = swing_res.trades["entry_date"]
+            buy_prices = [float(tqqq_series.loc[d]) for d in buy_dates if d in tqqq_series.index]
+            
+            sell_dates = swing_res.trades["exit_date"]
+            sell_prices = [float(tqqq_series.loc[d]) for d in sell_dates if d in tqqq_series.index]
+
+            fig2.add_trace(go.Scatter(
+                x=buy_dates, y=buy_prices, 
+                mode="markers", name="BUY Trade", 
+                marker=dict(color="#00E676", size=14, symbol="triangle-up", line=dict(width=2, color="white"))
+            ))
+            fig2.add_trace(go.Scatter(
+                x=sell_dates, y=sell_prices, 
+                mode="markers", name="SELL Trade", 
+                marker=dict(color="#EF5350", size=14, symbol="triangle-down", line=dict(width=2, color="white"))
+            ))
+
+        fig2.update_layout(
+            height=440, 
+            template="plotly_dark", 
+            hovermode="x unified", 
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), 
+            yaxis_title="TQQQ Price ($)", 
+            margin=dict(l=20, r=20, t=40, b=20)
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
     # ---------- Trade logs — one expander per strategy ----------
