@@ -433,9 +433,13 @@ def _render_top_movers(df: pd.DataFrame) -> None:
         st.caption("Market closed — showing last session's close.")
 
     st.caption(
-        "RVOL = today's volume ÷ expected volume by this time of day. "
+        "**RVOL** = Relative Volume Factor (today's volume ÷ expected volume by this time of day). "
         "RVOL ≥ 2× means the move has real volume behind it."
-        "RVOL stands for Relative Volume Factor - how intense the trading volume is relative to normal."
+    )
+    st.caption(
+        "**HOD** = High of Day · **LOD** = Low of Day. "
+        "Stocks trading near their **HOD** show intraday bullish momentum, "
+        "while stocks near their **LOD** show intraday weakness."
     )
 
     c1, c2 = st.columns([1, 6])

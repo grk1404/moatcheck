@@ -715,14 +715,7 @@ def render_analyzer() -> None:
         return options
 
     def _compute_valuation_value(mode: str):
-        st.write(
-            "DEBUG COMPUTE:",
-            mode,
-            "analyst=",
-            fin.analyst_5yr_growth,
-            "custom=",
-            st.session_state.get("custom_growth_rate"),
-        )
+        # st.write("DEBUG COMPUTE:", mode, "analyst=", fin.analyst_5yr_growth, "custom=", st.session_state.get("custom_growth_rate"))
         if mode == "Custom":
             custom_growth_pct = float(st.session_state.get("custom_growth_rate", 0) or 0)
             if custom_growth_pct <= 0:
@@ -803,7 +796,8 @@ def render_analyzer() -> None:
             _intrinsic_sub = f"{_upside*100:.1f}% below fair"
             _intrinsic_color = "#00E676" # Green
 
-    top1, top2, top3, top4, top5, top6, top7, top8 = st.columns(8)
+    # Give Market Cap (col 2) a bit more room to breathe
+    top1, top2, top3, top4, top5, top6, top7, top8 = st.columns([1, 1.4, 1, 1, 1, 1, 1, 1.2])
     # Replace top1.metric with the custom HTML version to support the colored sub-line
     top1.markdown(_metric_html(
         "Current Price", 
