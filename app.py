@@ -3187,17 +3187,18 @@ def page_backtest() -> None:
 def render_backtest() -> None:
     """Back Test page — run historical simulations of trading strategies."""
     st.header("🧪 Back Test")
+    
     st.markdown(
-        "Compare multiple long-or-cash strategies on historical TQQQ data. "
-        "All use QQQ for signal generation and execute at next-day open."
+        "Compare multiple long-or-cash strategies on historical data. "
+        "All strategies execute at next-day open."
     )
     st.markdown(
-        "- **Buy and Hold** — fully invested in TQQQ the entire window. The passive baseline.\n"
-        "- **7-Step TQQQ** — trades the live regime-aware framework. Goes to cash in bear/neutral regimes to dodge drawdowns.\n"
+        "- **Buy and Hold** — fully invested in the target ticker the entire window. The passive baseline.\n"
+        "- **7-Step Strategy** — trades the live regime-aware framework (uses QQQ signals). Goes to cash in bear/neutral regimes.\n"
         "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close.\n"
-        "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry. Resets the running high after every exit.\n"
-        "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high, and sells when it rallies *Swing %* from entry.\n"
-        "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high, and sells when it rallies *Swing %* from entry."
+        "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry.\n"
+        "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high.\n"
+        "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high."
     )
 
     # ---------- Import lazily so the page only loads its deps when opened ----------
@@ -3209,18 +3210,18 @@ def render_backtest() -> None:
         return
 
     # ---------- Input row ----------
-    # Set to False to lock the ticker input to TQQQ. Flip to True later
-    # to allow backtesting arbitrary tickers.
-    TICKER_EDITABLE = False
-
     c0, c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.2, 1.0])
+    
     with c0:
-        ticker_input = st.text_input("Ticker", value="TQQQ", disabled=not TICKER_EDITABLE, key="backtest_ticker")
-        backtest_ticker = ticker_input.strip().upper() if TICKER_EDITABLE else "TQQQ"
+        ticker_input = st.text_input("Ticker", value="TQQQ", key="backtest_ticker")
+        backtest_ticker = ticker_input.strip().upper()
+        
     with c1:
         period_label = st.selectbox("Period", options=["1y", "2y", "3y", "5y", "8y", "10y", "20y", "Max"], index=3)
+        
     with c2:
         starting_cash = st.number_input("Starting cash ($)", min_value=1000.0, max_value=10_000_000.0, value=10_000.0, step=1000.0)
+        
     with c3:
         swing_pct = st.number_input(
             "Swing %",
@@ -3230,9 +3231,10 @@ def render_backtest() -> None:
             step=1.0,
             format="%.1f",
             help="For the Swing strategy: buy when price drops this % below the running high; "
-                 "sell when up this % from entry. Ignored by other strategies.",
+                 "sell when up this % from entry.",
             key="backtest_swing_pct",
         )
+        
     with c4:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         _btn_slot = st.empty()
@@ -3268,9 +3270,10 @@ def render_backtest() -> None:
     # ---------- Do the work when the spinner is showing ----------
     if st.session_state.get("backtest_running"):
         try:
-            with st.spinner("Loading historical prices…"):
+            with st.spinner(f"Loading historical prices for {backtest_ticker}…"):
                 try:
-                    prices = load_backtest_data(start_date, end_date)
+                    # Pass the user's chosen ticker to the loader
+                    prices = load_backtest_data(backtest_ticker, start_date, end_date)
                 except Exception as e:
                     st.error(f"Could not load price data: {e}")
                     st.session_state["backtest_running"] = False

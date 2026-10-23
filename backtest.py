@@ -61,11 +61,11 @@ class BacktestResult:
     fee_drag: float | None = None
 
 
-def load_backtest_data(start: str, end: str) -> pd.DataFrame:
-    """Fetch daily OHLC for TQQQ and QQQ.
+def load_backtest_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch daily OHLC for the target ticker and QQQ (for signals).
 
     Returns a DataFrame with columns:
-        TQQQ_open, TQQQ_close, QQQ_close
+        TQQQ_open (actually the target ticker's open), TQQQ_close (target close), QQQ_close
     indexed by date.
 
     Raises RuntimeError if either ticker has no data in the window.
@@ -73,7 +73,7 @@ def load_backtest_data(start: str, end: str) -> pd.DataFrame:
     from data_provider import get_ticker
 
     frames = {}
-    for sym in ("TQQQ", "QQQ"):
+    for sym in (ticker, "QQQ"):
         try:
             hist = get_ticker(sym).history(start=start, end=end)
         except Exception as e:
@@ -84,7 +84,9 @@ def load_backtest_data(start: str, end: str) -> pd.DataFrame:
         hist = hist.copy()
         hist.index = pd.to_datetime(hist.index).tz_localize(None)
 
-        if sym == "TQQQ":
+        if sym == ticker:
+            # We keep the column names as TQQQ_open/TQQQ_close so the backtest 
+            # engine doesn't need to be rewritten.
             frames["TQQQ_open"] = hist["Open"]
             frames["TQQQ_close"] = hist["Close"]
         else:
