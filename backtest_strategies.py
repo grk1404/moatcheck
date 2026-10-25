@@ -278,72 +278,155 @@ def signal_1pct_week(qqq_close: pd.Series, tqqq_close: pd.Series, dip_pct: float
 def signal_15pct_swing(
     qqq_close: pd.Series,
     tqqq_close: pd.Series,
-    threshold: float = 0.15,
+    tqqq_open: pd.Series = None,
     lookback: int | None = None,
+    threshold: float = 0.15,
     **params,
 ) -> pd.Series:
-    """Buy every 15% drop. Sell only when the position is +15% from entry.
-
-    If `lookback` is None (default): the BUY reference is the running high
-    since the last exit — an unbounded swing high. This is the original
-    Design B behavior.
-
-    If `lookback` is an integer N: the BUY reference is the rolling max of
-    the last N closes. This is Design A. Use for parameter sweeps.
-
-    In both modes:
-      - SELL fires only when price is +threshold above the actual entry.
-      - No pyramiding: while long, further drops do not trigger new buys.
-    """
+    """Buy every `threshold` drop. Sell only when +`threshold` from entry."""
     signals = pd.Series(0, index=tqqq_close.index, dtype=int)
     prices = tqqq_close.dropna()
     if len(prices) < 2:
         return signals
 
-    # Precompute rolling max if we're in Design A mode
     if lookback is not None:
         rolling_max = prices.rolling(lookback).max()
+        expanding_max = prices.expanding().max()
+        rolling_max = rolling_max.fillna(expanding_max)
     else:
         rolling_max = None
 
     in_position = False
     entry_price = None
     running_high = float(prices.iloc[0])
+    price_index = list(prices.index)
+    n_bars = len(prices)
 
-    for date, px in prices.iloc[1:].items():
-        px = float(px)
+    for i in range(n_bars):
+        date = price_index[i]
+        px = float(prices.iloc[i])
+        idx = signals.index.get_loc(date)
 
         if not in_position:
-            # Determine the reference high
+            # Determine reference high
             if rolling_max is not None:
-                ref_high = rolling_max.loc[date]
-                if pd.isna(ref_high):
-                    signals.iloc[signals.index.get_loc(date)] = 0
-                    continue
-                ref_high = float(ref_high)
+                ref_high = float(rolling_max.loc[date])
             else:
-                # Running high: only rises while flat
                 if px > running_high:
                     running_high = px
                 ref_high = running_high
 
-            # Enter when price drops `threshold` below the reference high
+            # Check for buy trigger on today's close
             if px <= ref_high * (1 - threshold):
-                in_position = True
-                entry_price = px
+                # Guard: Don't trigger a buy on the very last bar (no tomorrow)
+                if i + 1 < n_bars:
+                    in_position = True
+                    signals.iloc[idx] = 1  # Signal fires for tomorrow's open
+                    
+                    # Set entry price to tomorrow's open (if available)
+                    next_date = price_index[i + 1]
+                    if tqqq_open is not None and next_date in tqqq_open.index:
+                        entry_price = float(tqqq_open.loc[next_date])
+                    else:
+                        # Fallback: Use today's close if open is missing
+                        entry_price = px
+            else:
+                signals.iloc[idx] = 0
         else:
-            # In position — exit only at +threshold from entry
+            # In position — check exit condition on today's close
             if entry_price is not None and px >= entry_price * (1 + threshold):
-                in_position = False
-                entry_price = None
-                # Reset running high to exit price (Design B only)
-                if rolling_max is None:
-                    running_high = px
-
-        signals.iloc[signals.index.get_loc(date)] = 1 if in_position else 0
+                # Guard: Don't trigger a sell on the very last bar (no tomorrow)
+                if i + 1 < n_bars:
+                    in_position = False
+                    entry_price = None
+                    if rolling_max is None:
+                        running_high = px
+                    signals.iloc[idx] = 0  # Signal drops to 0 for tomorrow's open
+                else:
+                    # We are at the very end. Stay long, the engine will liquidate at the final close.
+                    signals.iloc[idx] = 1
+            else:
+                signals.iloc[idx] = 1  # Stay long
 
     return signals
 
+def signal_swing_regime(
+    qqq_close: pd.Series,
+    tqqq_close: pd.Series,
+    tqqq_open: pd.Series = None,
+    threshold: float = 0.15,
+    **params,
+) -> pd.Series:
+    """Buy a `threshold` drop from the running high, BUT only if QQQ is in a bull market.
+    
+    - Bull market: QQQ > 200-day SMA.
+    - Bear market: QQQ < 200-day SMA (stay in cash).
+    - Sells when TQQQ rallies `threshold` from the entry price.
+    """
+    signals = pd.Series(0, index=tqqq_close.index, dtype=int)
+    prices = tqqq_close.dropna()
+    if len(prices) < 2:
+        return signals
+
+    # Precalculate the QQQ 200-day SMA for the regime filter
+    qqq_sma200 = qqq_close.rolling(200).mean()
+
+    in_position = False
+    entry_price = None
+    running_high = float(prices.iloc[0])
+    price_index = list(prices.index)
+    n_bars = len(prices)
+
+    for i in range(n_bars):
+        date = price_index[i]
+        px = float(prices.iloc[i])
+        idx = signals.index.get_loc(date)
+
+        # Determine the Regime (Are we in a bull or bear market?)
+        is_bull_market = False
+        if date in qqq_sma200.index:
+            sma_val = qqq_sma200.loc[date]
+            qqq_val = qqq_close.loc[date]
+            if pd.notna(sma_val) and qqq_val > sma_val:
+                is_bull_market = True
+
+        if not in_position:
+            # Update the running high
+            if px > running_high:
+                running_high = px
+
+            # Check for buy trigger AND regime filter
+            if px <= running_high * (1 - threshold) and is_bull_market:
+                # Don't trigger on the very last bar
+                if i + 1 < n_bars:
+                    in_position = True
+                    signals.iloc[idx] = 1
+                    
+                    # Set entry price to tomorrow's open
+                    next_date = price_index[i + 1]
+                    if tqqq_open is not None and next_date in tqqq_open.index:
+                        entry_price = float(tqqq_open.loc[next_date])
+                    else:
+                        entry_price = px
+            else:
+                signals.iloc[idx] = 0
+        else:
+            # In position — check exit condition on today's close
+            if entry_price is not None and px >= entry_price * (1 + threshold):
+                if i + 1 < n_bars:
+                    in_position = False
+                    entry_price = None
+                    running_high = px # Reset the high
+                    signals.iloc[idx] = 0
+                else:
+                    signals.iloc[idx] = 1 # Hold through the end
+            else:
+                signals.iloc[idx] = 1 # Stay long
+                
+            # Optional: If the regime flips to BEAR while we are in a position, 
+            # do we sell? Let's just wait for the +15% target to sell.
+
+    return signals
 
 # ============================================================
 # STRATEGY REGISTRY
@@ -355,4 +438,5 @@ STRATEGIES = {
     "Swing - since last exit": signal_15pct_swing,
     "Swing - 20-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=20, **p),
     "Swing - 60-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=60, **p),
+    "Regime-Aware Swing": signal_swing_regime,   # <--- NEW
 }

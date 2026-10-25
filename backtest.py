@@ -61,39 +61,41 @@ class BacktestResult:
     fee_drag: float | None = None
 
 
-def load_backtest_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+def load_backtest_data(ticker: str, start: str, end: str, warmup_days: int = 250) -> pd.DataFrame:
     """Fetch daily OHLC for the target ticker and QQQ (for signals).
-
-    Returns a DataFrame with columns:
-        TQQQ_open (actually the target ticker's open), TQQQ_close (target close), QQQ_close
-    indexed by date.
-
-    Raises RuntimeError if either ticker has no data in the window.
+    
+    Fetches `warmup_days` of extra data before `start` so that long-term
+    indicators (like the 200-day SMA) have time to calculate before the
+    actual trading period begins.
     """
     from data_provider import get_ticker
+    import pandas as pd
+
+    # Use pandas to safely parse the start date, ignoring any time strings
+    start_dt = pd.to_datetime(start).tz_localize(None) if pd.to_datetime(start).tzinfo else pd.to_datetime(start)
+    extended_start = (start_dt - pd.Timedelta(days=warmup_days * 1.5)).strftime("%Y-%m-%d")
 
     frames = {}
     for sym in (ticker, "QQQ"):
         try:
-            hist = get_ticker(sym).history(start=start, end=end)
+            hist = get_ticker(sym).history(start=extended_start, end=end)
         except Exception as e:
             raise RuntimeError(f"Could not fetch {sym}: {e}") from e
         if hist is None or hist.empty:
-            raise RuntimeError(f"No data returned for {sym} in {start}..{end}")
+            raise RuntimeError(f"No data returned for {sym} in {extended_start}..{end}")
 
         hist = hist.copy()
+        
+        # Ensure the index is a clean, timezone-naive datetime
         hist.index = pd.to_datetime(hist.index).tz_localize(None)
 
         if sym == ticker:
-            # We keep the column names as TQQQ_open/TQQQ_close so the backtest 
-            # engine doesn't need to be rewritten.
             frames["TQQQ_open"] = hist["Open"]
             frames["TQQQ_close"] = hist["Close"]
         else:
             frames["QQQ_close"] = hist["Close"]
 
     df = pd.DataFrame(frames)
-    # Align on common trading days only
     df = df.dropna()
     return df
 

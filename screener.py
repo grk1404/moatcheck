@@ -605,14 +605,28 @@ def _render_aggrid(df: pd.DataFrame) -> None:
     gb.configure_column("Verdict", width=130)
 
     grid_options = gb.build()
-    AgGrid(
-        df,
-        gridOptions=grid_options,
-        height=600,
-        theme="streamlit",
-        update_mode=GridUpdateMode.NO_UPDATE,
-        allow_unsafe_jscode=False,
-    )
+    
+    # --- MUTE CONSOLE DURING AGGrid RENDER ---
+    # st_aggrid dumps massive amounts of debug info to the terminal. 
+    # We temporarily redirect sys.stdout to silence it.
+    import sys
+    import os
+    _original_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    
+    try:
+        AgGrid(
+            df,
+            gridOptions=grid_options,
+            height=600,
+            theme="streamlit",
+            update_mode=GridUpdateMode.NO_UPDATE,
+            allow_unsafe_jscode=False,
+        )
+    finally:
+        # ALWAYS restore stdout, even if AgGrid crashes
+        sys.stdout.close()
+        sys.stdout = _original_stdout
 
 def display_screener_stats(rows: list[ScreenerRow]):
     col1, col2, col3, col4 = st.columns(4)

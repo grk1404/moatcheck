@@ -31,6 +31,7 @@ from technical_indicators import TechnicalIndicatorAnalyzer
 # Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
 
+
 def _first_n_sentences(text: str, n: int = 2) -> str:
     """Return the first N sentences from text, or the whole text if fewer."""
     if not text:
@@ -95,6 +96,73 @@ _COMMON_TICKER_FIXES = {
     "AMZNN": "AMZN",
 }
 
+def _check_data_quality(prices: pd.DataFrame, ticker: str) -> None:
+    """Perform sanity checks on the backtest data before running strategies."""
+    if prices.empty:
+        return
+
+    st.markdown("### 🕵️ Data Quality Check")
+    
+    # 1. Date Range & Length
+    start_date = prices.index[0].strftime("%Y-%m-%d")
+    end_date = prices.index[-1].strftime("%Y-%m-%d")
+    total_rows = len(prices)
+    expected_years = (prices.index[-1] - prices.index[0]).days / 365.25
+    
+    # 2. Check for missing trading days
+    # Generate a business day range (Mon-Fri) and see how many are missing
+    bdays = pd.bdate_range(start=prices.index[0], end=prices.index[-1])
+    missing_days = len(bdays) - total_rows
+    # Rough estimate: ~9 market holidays per year
+    expected_missing = expected_years * 9
+    missing_pct = (missing_days / len(bdays)) * 100 if len(bdays) > 0 else 0
+    
+    # 3. Check for bad prices (0 or negative)
+    bad_price_rows = prices[(prices["TQQQ_close"] <= 0) | (prices["TQQQ_open"] <= 0)]
+    bad_price_count = len(bad_price_rows)
+    
+    # 4. Check for massive single-day jumps (possible unadjusted splits)
+    # A 50% jump in a single day for an ETF is extremely rare and usually a split
+    daily_returns = prices["TQQQ_close"].pct_change()
+    jumps = daily_returns[daily_returns.abs() > 0.50]
+    jump_count = len(jumps)
+    
+    # --- Display the Results ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Trading Days", f"{total_rows:,}", help=f"From {start_date} to {end_date}")
+    c2.metric("Missing Business Days", f"{missing_days:,}", delta=f"{missing_pct:.1f}%", delta_color="inverse" if missing_days > expected_missing else "normal")
+    
+    if bad_price_count > 0:
+        c3.metric("Zero/Negative Prices", f"{bad_price_count:,}", delta="FAIL", delta_color="inverse")
+    else:
+        c3.metric("Zero/Negative Prices", "0", delta="PASS", delta_color="normal")
+        
+    if jump_count > 0:
+        c4.metric("Massive Jumps (>50%)", f"{jump_count:,}", delta="WARN", delta_color="inverse")
+    else:
+        c4.metric("Massive Jumps (>50%)", "0", delta="PASS", delta_color="normal")
+
+    # Warnings and Details
+    if bad_price_count > 0:
+        st.error(f"⚠️ Found {bad_price_count} rows with zero or negative prices. This will break the backtest engine.")
+        
+    if jump_count > 0:
+        st.warning(f"⚠️ Found {jump_count} single-day jumps >50%. If this is a long-term backtest, Yahoo Finance likely failed to adjust for a stock split. Returns may be inaccurate.")
+        with st.expander("View Massive Jumps"):
+            jump_df = prices.loc[jumps.index, ["TQQQ_close"]].copy()
+            jump_df["Return"] = jumps * 100
+            st.dataframe(jump_df.style.format({"TQQQ_close": "${:.2f}", "Return": "{:+.1f}%"}))
+            
+    if missing_days > expected_missing + 20:
+        st.warning(f"⚠️ Found {missing_days} missing business days (expected ~{expected_missing:.0f} for holidays). Data may have gaps.")
+        st.session_state["backtest_warning"] = f"⚠️ Data gap detected: {missing_days} missing trading days."
+    else:
+        st.session_state.pop("backtest_warning", None)
+    
+    if bad_price_count == 0 and jump_count == 0 and missing_days <= expected_missing + 5:
+        st.success("✅ Data quality looks excellent. No gaps, bad ticks, or massive split jumps detected.")
+
+    st.markdown("---")
 
 def _suggest_ticker(symbol: str) -> str | None:
     symbol = symbol.strip().upper()
@@ -3198,7 +3266,8 @@ def render_backtest() -> None:
         "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close.\n"
         "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry.\n"
         "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high.\n"
-        "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high."
+        "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high.\n"
+        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below."
     )
 
     # ---------- Import lazily so the page only loads its deps when opened ----------
@@ -3217,7 +3286,7 @@ def render_backtest() -> None:
         backtest_ticker = ticker_input.strip().upper()
         
     with c1:
-        period_label = st.selectbox("Period", options=["1y", "2y", "3y", "5y", "8y", "10y", "20y", "Max"], index=3)
+        period_label = st.selectbox("Period", options=["1m", "3m", "6m", "1y", "2y", "3y", "5y", "8y", "10y", "20y", "Max"], index=5)
         
     with c2:
         starting_cash = st.number_input("Starting cash ($)", min_value=1000.0, max_value=10_000_000.0, value=10_000.0, step=1000.0)
@@ -3261,7 +3330,8 @@ def render_backtest() -> None:
     from datetime import datetime, timedelta
     today = datetime.now().date()
     period_days = {
-        "1y": 365, "2y": 730, "3y": 1095, "5y": 1825,
+        "1m": 30, "3m": 90, "6m": 180, "1y": 365, 
+        "2y": 730, "3y": 1095, "5y": 1825, 
         "8y": 2920, "10y": 3650, "20y": 7300, "Max": 9999,
     }
     start_date = (today - timedelta(days=period_days[period_label])).isoformat()
@@ -3272,8 +3342,8 @@ def render_backtest() -> None:
         try:
             with st.spinner(f"Loading historical prices for {backtest_ticker}…"):
                 try:
-                    # Pass the user's chosen ticker to the loader
-                    prices = load_backtest_data(backtest_ticker, start_date, end_date)
+                    # We pass a 250-day warmup so the 200-day SMA can calculate
+                    prices = load_backtest_data(backtest_ticker, start_date, end_date, warmup_days=250)
                 except Exception as e:
                     st.error(f"Could not load price data: {e}")
                     st.session_state["backtest_running"] = False
@@ -3283,6 +3353,9 @@ def render_backtest() -> None:
                 st.warning(f"Not enough data for a {period_label} backtest — got {len(prices)} bars.")
                 st.session_state["backtest_running"] = False
                 return
+
+            # --- RUN THE DATA QUALITY CHECK HERE ---
+            _check_data_quality(prices, backtest_ticker)
 
             qqq_close = prices["QQQ_close"]
             tqqq_close = prices["TQQQ_close"]
@@ -3299,11 +3372,32 @@ def render_backtest() -> None:
                 if "Swing" in name:
                     extra_kwargs["threshold"] = swing_pct / 100.0
 
+                # Pass the Open series to the Swing strategy
+                if "Swing" in name:
+                    extra_kwargs["tqqq_open"] = prices["TQQQ_open"]
+
                 if "progress_callback" in _params:
                     signal = fn(qqq_close, tqqq_close, progress_callback=None, **extra_kwargs)
                 else:
                     signal = fn(qqq_close, tqqq_close, **extra_kwargs)
+                    
+                
+                # The engine starts trading exactly on `start_date`, but the strategy 
+                # had access to the 250 days prior to calculate indicators.
+                start_ts = pd.Timestamp(start_date)
+
+                # Run the engine
                 results[name] = run_backtest(prices, signal, starting_cash=starting_cash, warmup_days=30, progress_callback=None)
+                
+                # Slice the equity curve to only show the user's requested window
+                results[name].equity_curve = results[name].equity_curve[results[name].equity_curve.index >= start_ts]
+                if not results[name].trades.empty:
+                    results[name].trades = results[name].trades[results[name].trades["entry_date"] >= start_ts]
+                
+                # FIX: Overwrite the dates on the result object so the UI header displays the 1m window
+                if not results[name].equity_curve.empty:
+                    results[name].start_date = results[name].equity_curve.index[0]
+                    results[name].end_date = results[name].equity_curve.index[-1]
 
             st.session_state["backtest_results"] = results
             st.session_state["backtest_prices"] = prices
@@ -3329,6 +3423,9 @@ def render_backtest() -> None:
         f"Starting cash: **${first.starting_cash:,.0f}**"
     )
 
+    if "backtest_warning" in st.session_state:
+        st.warning(st.session_state["backtest_warning"])
+
     # ---------- Strategy comparison table ----------
     st.markdown("#### Strategy Comparison")
 
@@ -3337,14 +3434,13 @@ def render_backtest() -> None:
         calmar = r.cagr / r.max_drawdown if r.max_drawdown > 0 else 0.0
         end_cash = r.starting_cash * (1 + r.total_return)
         display_name = name
-        if "Swing" in name:
-            # Registry key looks like "Swing - 20-day window".
-            # Extract the descriptive suffix after the dash and re-attach it
-            # after the current threshold so the row reads
-            # "Swing 20% - 20-day window".
+        
+        # Registry key looks like "Swing - 20-day window". Extract the descriptive suffix after the dash and re-attach it after the current threshold so the row reads "Swing 20% - 20-day window".
+        if "Swing" in name and "Regime-Aware" not in name:
             parts = name.split(" - ", 1)
             suffix = parts[1] if len(parts) == 2 else ""
             display_name = f"Swing {swing_pct:.0f}% - {suffix}".rstrip(" -")
+
         rows.append({
             "Strategy": display_name,
             "Total Return": f"{r.total_return*100:+.2f}%",
@@ -3527,10 +3623,11 @@ def render_backtest() -> None:
     # ---------- Trade logs — one expander per strategy ----------
     for name, r in results.items():
         _display = name
-        if "Swing" in name:
+        if "Swing" in name and "Regime-Aware" not in name:
             _parts = name.split(" - ", 1)
             _suffix = _parts[1] if len(_parts) == 2 else ""
             _display = f"Swing {swing_pct:.0f}% - {_suffix}".rstrip(" -")
+
         with st.expander(f"📋 {_display} — {r.num_trades} trades"):
             if r.trades.empty:
                 st.caption("No trades in this window.")
@@ -3540,7 +3637,7 @@ def render_backtest() -> None:
             display["exit_date"] = pd.to_datetime(display["exit_date"]).dt.strftime("%Y-%m-%d")
             display["entry_price"] = display["entry_price"].map(lambda v: f"${v:,.2f}")
             display["exit_price"] = display["exit_price"].map(lambda v: f"${v:,.2f}")
-            display["shares"] = display["shares"].map(lambda v: f"{v:.4f}")
+            display["shares"] = display["shares"].map(lambda v: f"{v:,.2f}".rstrip("0").rstrip("."))
             display["pnl"] = display["pnl"].map(lambda v: f"${v:+,.2f}")
             display["return_pct"] = display["return_pct"].map(lambda v: f"{v*100:+.2f}%")
             display = display.rename(columns={"entry_date": "Entry", "exit_date": "Exit", "entry_price": "Entry $", "exit_price": "Exit $", "shares": "Shares", "pnl": "P&L", "return_pct": "Return", "days_held": "Days"})
