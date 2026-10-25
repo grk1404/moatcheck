@@ -3342,8 +3342,7 @@ def render_backtest() -> None:
         try:
             with st.spinner(f"Loading historical prices for {backtest_ticker}…"):
                 try:
-                    # We pass a 250-day warmup so the 200-day SMA can calculate
-                    prices = load_backtest_data(backtest_ticker, start_date, end_date, warmup_days=250)
+                    prices = load_backtest_data(backtest_ticker, start_date, end_date)
                 except Exception as e:
                     st.error(f"Could not load price data: {e}")
                     st.session_state["backtest_running"] = False
@@ -3359,45 +3358,39 @@ def render_backtest() -> None:
 
             qqq_close = prices["QQQ_close"]
             tqqq_close = prices["TQQQ_close"]
-
-            import inspect
+            
+            start_ts = pd.Timestamp(start_date)
+            
             results = {}
+            import inspect
+
             for name, fn in bs.STRATEGIES.items():
                 _params = inspect.signature(fn).parameters
 
-                # Per-strategy extra kwargs. Only the Swing strategy uses
-                # the UI's swing_pct input; every other strategy keeps its
-                # own defaults untouched.
                 extra_kwargs = {}
                 if "Swing" in name:
                     extra_kwargs["threshold"] = swing_pct / 100.0
+                    if "tqqq_open" in _params:
+                        extra_kwargs["tqqq_open"] = prices["TQQQ_open"]
 
-                # Pass the Open series to the Swing strategy
-                if "Swing" in name:
-                    extra_kwargs["tqqq_open"] = prices["TQQQ_open"]
-
+                # 1. Generate signals on the FULL dataset (with warmup)
                 if "progress_callback" in _params:
                     signal = fn(qqq_close, tqqq_close, progress_callback=None, **extra_kwargs)
                 else:
                     signal = fn(qqq_close, tqqq_close, **extra_kwargs)
-                    
                 
-                # The engine starts trading exactly on `start_date`, but the strategy 
-                # had access to the 250 days prior to calculate indicators.
-                start_ts = pd.Timestamp(start_date)
-
-                # Run the engine
-                results[name] = run_backtest(prices, signal, starting_cash=starting_cash, warmup_days=30, progress_callback=None)
+                # 2. Slice prices and signal to just the user's chosen window
+                prices_sliced = prices[prices.index >= start_ts].copy()
+                signal_sliced = signal.reindex(prices_sliced.index).fillna(0).astype(int)
                 
-                # Slice the equity curve to only show the user's requested window
-                results[name].equity_curve = results[name].equity_curve[results[name].equity_curve.index >= start_ts]
-                if not results[name].trades.empty:
-                    results[name].trades = results[name].trades[results[name].trades["entry_date"] >= start_ts]
-                
-                # FIX: Overwrite the dates on the result object so the UI header displays the 1m window
-                if not results[name].equity_curve.empty:
-                    results[name].start_date = results[name].equity_curve.index[0]
-                    results[name].end_date = results[name].equity_curve.index[-1]
+                # 3. Run a fresh backtest on ONLY the sliced data (no extra warmup needed here)
+                results[name] = run_backtest(
+                    prices_sliced, 
+                    signal_sliced, 
+                    starting_cash=starting_cash, 
+                    warmup_days=0, 
+                    progress_callback=None
+                )
 
             st.session_state["backtest_results"] = results
             st.session_state["backtest_prices"] = prices
@@ -3690,7 +3683,7 @@ def compute_annualized_returns(yft, symbol: str) -> dict:
     yfinance_cache returns a split- and dividend-adjusted 'Close' column and
     does not provide a separate 'Adj Close', so we use 'Close' directly.
     """
-    import pandas as pd
+    
 
     try:
         hist = yft.history(period="max")
