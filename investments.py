@@ -832,6 +832,25 @@ def _parse_fidelity_csv(path: Path) -> pd.DataFrame:
     df = df[~df["Symbol"].astype(str).str.startswith('"', na=False)]
 
     # Numeric conversion — non-numeric becomes NaN
+    # --- Fidelity changed their CSV format. Map new column names to internal names ---
+    rename_map = {
+        "Last price": "Last price",
+        "Change $": "Last price change",
+        "Current value": "Current value",
+        "Today's gain/loss $": "Today's gain/loss dollar",
+        "Today's gain/loss %": "Today's gain/loss percent",
+        "Total gain/loss $": "Total gain/loss dollar",
+        "Total gain/loss %": "Total gain/loss percent",
+        "% of account": "Percent of account",
+        "Cost basis total": "Cost basis total",
+        "Average cost basis": "Average cost basis",
+    }
+    
+    # Rename the columns (only if they exist in the new format)
+    for old_col, new_col in rename_map.items():
+        if old_col in df.columns and new_col not in df.columns:
+            df[new_col] = df[old_col]
+
     numeric_cols = [
         "Quantity", "Last price", "Last price change", "Current value",
         "Today's gain/loss dollar", "Today's gain/loss percent",
@@ -939,7 +958,17 @@ def _hero_strip(df: pd.DataFrame) -> None:
             except (ValueError, OverflowError):
                 annualized = None
 
-    today_dollars = df["Today's gain/loss dollar"].fillna(0.0).sum()
+    # Safely handle Fidelity CSV layout changes
+    if "Today's gain/loss dollar" in df.columns:
+        today_dollars = df["Today's gain/loss dollar"].fillna(0.0).sum()
+    elif "Today's Gain/Loss Dollar" in df.columns:
+        today_dollars = df["Today's Gain/Loss Dollar"].fillna(0.0).sum()
+    elif "Today's gain/loss $" in df.columns:
+        today_dollars = df["Today's gain/loss $"].fillna(0.0).sum()
+    else:
+        # Column is missing entirely; default to 0.0 so the UI still renders
+        today_dollars = 0.0
+
     today_pct = (
         today_dollars / (total_value - today_dollars) * 100
         if (total_value - today_dollars) > 0

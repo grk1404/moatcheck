@@ -291,24 +291,23 @@ STRATEGIES = [
 # ============================================================
 
 def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
-    """
-    Run all registered strategies and aggregate their votes with symmetrical scaling.
-    Returns the target allocation plus per-strategy vote details with tolerance bands.
+    """Run all registered strategies and aggregate into a 3-way allocation.
+
+    Returns target_tqqq_pct, target_sqqq_pct, target_cash_pct (sum to 100%).
     """
     if data is None:
         data = load_strategy_data(period)
-
     if not data or "_indicators" not in data:
         return {"error": "Could not load strategy data"}
 
     ind = data["_indicators"]
-    votes = []
-    vote_details = []
+    votes: list[float] = []
+    vote_details: list[dict] = []
 
     for strategy_fn in STRATEGIES:
         try:
             result = strategy_fn(data)
-            votes.append(result["target_tqqq"])
+            votes.append(float(result["target_tqqq"]))
             vote_details.append({
                 "name": result["name"],
                 "target_tqqq_pct": result["target_tqqq"] * 100,
@@ -321,51 +320,43 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
     if not votes:
         return {"error": "All strategies failed"}
 
-    # Average vote = base allocation
+    # --- 1. Aggregate directional bias ---
     base_tqqq = sum(votes) / len(votes)
+    deviation = base_tqqq - 0.50
 
-    # Position multiplier based on BB width (trend strength)
+    # --- 2. Conviction multiplier on the direction (unchanged design) ---
     if ind["regime"] in ("BULL", "BEAR") and ind["bb_width"] > 0.10:
         position_multiplier = 1.2
     else:
         position_multiplier = 0.8
 
-    # Scale conviction symmetrically away from the 0.50 neutral baseline midpoint.
-    deviation = base_tqqq - 0.50
-    target_tqqq = 0.50 + (deviation * position_multiplier)
-    
-    # Bound exposures safely between 0.0 and 1.0 (0% to 100%)
-    target_tqqq = max(0.0, min(1.0, target_tqqq))
-    target_sqqq = 1.0 - target_tqqq
+    scaled = 0.50 + deviation * position_multiplier
+    scaled = max(0.0, min(1.0, scaled))    # direction stays bounded
 
-    # FIX: Define a neutral dead-zone tolerance band around the 50/50 baseline midpoint.
-    # A threshold of 0.02 means allocations between 48.0% and 52.0% are labeled BALANCED.
+    # --- 3. NEW: Cash fraction from average directional conviction ---
+    # Conviction of one vote = how far it sits from neutral (0.5), scaled to [0,1].
+    # A vote of 1.0 (full TQQQ) or 0.0 (full SQQQ) has conviction 1.0.
+    # A vote of 0.5 (dead neutral) has conviction 0.0.
+    avg_conviction = sum(abs(v - 0.5) * 2 for v in votes) / len(votes)
+
+    CASH_FLOOR = 0.10
+    cash_pct = CASH_FLOOR + (1.0 - CASH_FLOOR) * (1.0 - avg_conviction)
+    cash_pct = max(0.0, min(1.0, cash_pct))
+
+    # --- 4. Split the non-cash remainder between TQQQ and SQQQ ---
+    if scaled >= 0.5:
+        target_tqqq = scaled
+        target_sqqq = 0.0
+        target_cash = 1.0 - scaled
+    else:
+        target_tqqq = 0.0
+        target_sqqq = 1.0 - scaled
+        target_cash = 1.0 - target_sqqq
+
+    # --- 5. Signal classification (unchanged thresholds) ---
     NEUTRAL_THRESHOLD = 0.02
-    EPSILON = 1e-9   # tolerate floating-point representation error
+    EPSILON = 1e-9
 
-    # ============================================================
-    # SIGNAL CLASSIFICATION — bands are symmetric around 50/50
-    # ============================================================
-    #
-    #  target_tqqq       Label           Signal type
-    #  ───────────       ─────           ───────────
-    #  0.00 – 0.40       SQQQ HEAVY      short        (SQQQ >= 60%)
-    #  0.40 – 0.48       MILD SQQQ       short_light  (SQQQ 52–60%)
-    #  0.48 – 0.52       BALANCED        neutral      (within ±2% of even)
-    #  0.52 – 0.60       MILD TQQQ       long_light   (TQQQ 52–60%)
-    #  0.60 – 1.00       TQQQ HEAVY      long         (TQQQ >= 60%)
-    #
-    #  Boundary semantics:
-    #    - Bands are half-open on the upper edge: [lo, hi)
-    #    - The 0.60 boundary belongs to MILD TQQQ, not TQQQ HEAVY
-    #      (fires only when target_tqqq > 0.60, not >=)
-    #    - The 0.40 boundary belongs to MILD SQQQ, not SQQQ HEAVY
-    #      (fires only when target_sqqq > 0.60, not >=)
-    #
-    #  EPSILON (1e-9) absorbs floating-point representation error.
-    #  Without it, a target of 0.48 evaluates abs(0.48 - 0.50) as
-    #  0.020000000000000018 > 0.02 and silently escapes the dead-zone.
-    # ============================================================
     if target_tqqq > 0.60 + EPSILON:
         signal, signal_type = "TQQQ HEAVY", "long"
     elif target_tqqq > 0.50 + NEUTRAL_THRESHOLD + EPSILON:
@@ -383,6 +374,7 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
         "regime": ind["regime"],
         "target_tqqq_pct": target_tqqq * 100,
         "target_sqqq_pct": target_sqqq * 100,
+        "target_cash_pct": target_cash * 100,          # ← new field
         "current_price": ind["price"],
         "sma_50": ind["sma_50"],
         "sma_200": ind["sma_200"],
@@ -391,6 +383,7 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
         "bb_position": ind["bb_position"],
         "rsi": ind["rsi_14"],
         "position_multiplier": position_multiplier,
+        "avg_conviction": avg_conviction,             # ← new field, useful for debugging
         "votes": votes,
         "vote_details": vote_details,
         "confidence": abs(target_tqqq - 0.5) * 200,

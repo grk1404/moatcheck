@@ -20,7 +20,7 @@ CAPITAL_FILE = DATA_DIR / "capital.json"
 TRADE_COLUMNS = [
     "timestamp", "ticker", "action", "shares", "price",
     "total_value", "signal", "tqqq_target_pct",
-    "sqqq_target_pct", "account_value", "notes",
+    "sqqq_target_pct", "cash_target_pct", "account_value", "notes",
 ]
 
 
@@ -67,10 +67,8 @@ def load_position() -> dict:
         return {"tqqq_shares": 0.0, "sqqq_shares": 0.0, "updated": None}
 
 
-def save_position(tqqq_shares: float, sqqq_shares: float, tqqq_avg_cost: float = None, sqqq_avg_cost: float = None) -> None:
-    """ Persist the current position to disk. If avg cost is provided, it's saved so _compute_unrealized_pnl can use it
-    instead of reading from the stale sleeve CSV after every trade.
-    """
+def save_position(tqqq_shares: float, sqqq_shares: float, tqqq_avg_cost: float = None, sqqq_avg_cost: float = None, cash_balance: float = None) -> None:
+    """Persist the current position to disk, including cash on hand."""
     data = {
         "tqqq_shares": float(tqqq_shares),
         "sqqq_shares": float(sqqq_shares),
@@ -80,22 +78,13 @@ def save_position(tqqq_shares: float, sqqq_shares: float, tqqq_avg_cost: float =
         data["tqqq_avg_cost"] = float(tqqq_avg_cost)
     if sqqq_avg_cost is not None:
         data["sqqq_avg_cost"] = float(sqqq_avg_cost)
+    if cash_balance is not None:
+        data["cash_balance"] = float(cash_balance)
     POSITION_FILE.write_text(json.dumps(data, indent=2))
 
-def compute_running_pnl() -> dict:
-    """
-    Compute the current cumulative P&L for the sleeve.
-
-    Returns:
-        {
-            'net_capital': float,       # starting + deposits − withdrawals
-            'sleeve_value': float,      # current TQQQ+SQQQ market value
-            'pnl_dollars': float,       # sleeve_value − net_capital
-            'pnl_pct': float,           # pnl_dollars / net_capital * 100
-            'updated': str,             # timestamp of the position file
-        }
-    Returns zeros if no capital or position data exists yet.
-    """
+def compute_running_pnl(account_value: float = None) -> dict:
+    """Compute P&L. Prefers the live account_value from the UI, 
+    falls back to shares + cash if not provided."""
     cap = load_capital()
     starting = cap.get("starting_capital", 0.0)
     deposits = sum(x["amount"] for x in cap.get("deposits", []))
@@ -103,17 +92,19 @@ def compute_running_pnl() -> dict:
     net = starting + deposits - withdrawals
 
     pos = load_position()
-    tqqq_shares = pos.get("tqqq_shares", 0.0)
-    sqqq_shares = pos.get("sqqq_shares", 0.0)
-
-    # Fetch current prices to value the sleeve
-    try:        
-        tqqq_price = get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
-        sqqq_price = get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
-    except Exception:
-        tqqq_price = sqqq_price = 0.0
-
-    sleeve_value = tqqq_shares * tqqq_price + sqqq_shares * sqqq_price
+    
+    if account_value is not None:
+        sleeve_value = account_value
+    else:
+        tqqq_shares = pos.get("tqqq_shares", 0.0)
+        sqqq_shares = pos.get("sqqq_shares", 0.0)
+        cash_balance = pos.get("cash_balance", 0.0)
+        try:        
+            tqqq_price = get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1]
+            sqqq_price = get_ticker("SQQQ").history(period="1d")["Close"].iloc[-1]
+        except Exception:
+            tqqq_price = sqqq_price = 0.0
+        sleeve_value = tqqq_shares * tqqq_price + sqqq_shares * sqqq_price + cash_balance
 
     pnl = sleeve_value - net
     pnl_pct = (pnl / net * 100) if net > 0 else 0.0
@@ -197,12 +188,14 @@ def compute_realized_pnl() -> pd.DataFrame:
     df["cumulative_realized_pnl"] = cumulative_realized
     return df
 
-def compute_target_shares(account_value: float,
-                          tqqq_target_pct: float,
-                          tqqq_price: float,
-                          sqqq_price: float) -> dict:
+def compute_target_shares(account_value, tqqq_target_pct, tqqq_price, sqqq_price,
+                          cash_target_pct: float = 0.0):
     """
-    Compute fractional target share counts for both legs.
+    Compute fractional target share counts for both legs, reserving cash.
+
+    cash_target_pct is a PERCENT (0-100), matching tqqq_target_pct's units.
+    It reduces the investable base; the residual cash is NOT reallocated
+    to TQQQ/SQQQ.
 
     Returns:
         {
@@ -210,12 +203,18 @@ def compute_target_shares(account_value: float,
             'sqqq_target_value': float,
             'tqqq_target_shares': float,
             'sqqq_target_shares': float,
+            'cash_value': float,       # ← NEW
+            'invested_value': float,   # ← NEW
         }
     """
-    sqqq_target_pct = 100.0 - tqqq_target_pct
+    assert 0.0 <= cash_target_pct <= 100.0, (
+        f"cash_target_pct must be a percent (0-100), got {cash_target_pct}"
+    )
 
-    tqqq_value = account_value * (tqqq_target_pct / 100.0)
-    sqqq_value = account_value * (sqqq_target_pct / 100.0)
+    invested_value = account_value * (1.0 - cash_target_pct / 100.0)
+
+    tqqq_value = invested_value * (tqqq_target_pct / 100.0)
+    sqqq_value = invested_value - tqqq_value   # residual, not re-derived from pct
 
     tqqq_shares = tqqq_value / tqqq_price if tqqq_price > 0 else 0.0
     sqqq_shares = sqqq_value / sqqq_price if sqqq_price > 0 else 0.0
@@ -225,6 +224,8 @@ def compute_target_shares(account_value: float,
         "sqqq_target_value": sqqq_value,
         "tqqq_target_shares": tqqq_shares,
         "sqqq_target_shares": sqqq_shares,
+        "cash_value": account_value - invested_value,
+        "invested_value": invested_value,
     }
 
 
@@ -250,34 +251,21 @@ def compute_rebalance(current_tqqq_shares: float,
 
 
 def log_trade(ticker: str, action: str, shares: float, price: float,
-              signal: str, tqqq_target_pct: float,
+              signal: str, tqqq_target_pct: float, sqqq_target_pct: float, cash_target_pct: float,
               account_value: float, notes: str = "") -> None:
-    """Append a trade to the CSV log with total_value computed from shares × price.
-
-    Robust against:
-      - Missing trailing newline in the existing file — writes one before appending,
-        so the new row never gets concatenated onto the previous row.
-      - Fields containing commas — csv.DictWriter quotes them automatically.
-      - Concurrent writes — each write is a single atomic operation.
-    """
+    """Append a trade to the CSV log."""
     import os
-
     TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
     exists = TRADES_FILE.exists()
 
-    # --- GUARD: ensure the file ends with a newline before appending ---
-    # csv.writer writes the line terminator at the END of each row. If the
-    # last row in the file has no trailing newline (which can happen from a
-    # manual edit or a previous write that didn't include one), the next
-    # append would be concatenated onto that row.
     needs_leading_newline = False
     if exists:
         try:
             with open(TRADES_FILE, "rb") as f:
-                f.seek(0, 2)          # seek to end
+                f.seek(0, 2)
                 size = f.tell()
                 if size > 0:
-                    f.seek(-1, 2)     # last byte
+                    f.seek(-1, 2)
                     last = f.read(1)
                     if last not in (b"\n", b"\r"):
                         needs_leading_newline = True
@@ -293,7 +281,8 @@ def log_trade(ticker: str, action: str, shares: float, price: float,
         "total_value": round(shares * price, 2),
         "signal": signal,
         "tqqq_target_pct": tqqq_target_pct,
-        "sqqq_target_pct": round(100.0 - tqqq_target_pct, 2),
+        "sqqq_target_pct": sqqq_target_pct,
+        "cash_target_pct": cash_target_pct,
         "account_value": round(account_value, 2),
         "notes": notes,
     }
@@ -301,14 +290,12 @@ def log_trade(ticker: str, action: str, shares: float, price: float,
     with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
         if needs_leading_newline:
             f.write("\n")
-        writer = csv.DictWriter(
-            f, fieldnames=TRADE_COLUMNS, lineterminator="\r\n"
-        )
+        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS, lineterminator="\r\n")
         if not exists:
             writer.writeheader()
         writer.writerow(row)
         f.flush()
-        os.fsync(f.fileno())   # force the write to disk before returning
+        os.fsync(f.fileno())
 
 def repair_trade_log() -> int:
     """Detect and split concatenated rows in the trade log.

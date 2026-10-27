@@ -1,0 +1,162 @@
+# backtest_40y.py
+"""
+Run the TQQQ/SQQQ strategy over real prices (2010+) or synthetic (1986+).
+
+Modes:
+  --mode real        Real TQQQ/SQQQ prices (2010-02-11 onward).
+  --mode synthetic   Synthetic 3x from QQQ (1986 onward).
+  --mode both        Run both, compare.
+
+Usage:
+  python backtest_40y.py --mode both
+  python backtest_40y.py --mode real --start 2022-07-23 --end 2026-10-27
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+
+import pandas as pd
+
+from data_provider import get_ticker
+from synthetic import synthetic_levered_series
+from run_strategy_history import build_daily_targets
+from execute_backtest import execute
+
+
+def fetch_qqq(start: str, end: str) -> pd.DataFrame:
+    df = get_ticker("QQQ").history(start=start, end=end)
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df.dropna(subset=["Close"])
+
+
+def fetch_tqqq_sqqq(start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    out = {}
+    for tk in ("TQQQ", "SQQQ"):
+        df = get_ticker(tk).history(start=start, end=end)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        out[tk] = df.dropna(subset=["Close"])
+    return out["TQQQ"], out["SQQQ"]
+
+
+def synth_tqqq_sqqq_from_qqq(qqq: pd.DataFrame, financing_spread: float = 0.02) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Synthesize Open and Close for TQQQ/SQQQ from QQQ returns.
+
+    Simplification: we don't know intraday path, so we set synthetic
+    Open = previous Close for both legs. This avoids any same-day
+    look-ahead but understates real intraday moves. Documented; not a bug.
+    """
+    qqq_ret = qqq["Close"].pct_change().fillna(0.0)
+
+    tq_nav = synthetic_levered_series(qqq_ret, leverage=+3.0,
+                                      expense_ratio=0.0095,
+                                      financing_spread=financing_spread)
+    sq_nav = synthetic_levered_series(qqq_ret, leverage=-3.0,
+                                      expense_ratio=0.0095,
+                                      financing_spread=financing_spread)
+
+    def to_ohlc(nav: pd.Series) -> pd.DataFrame:
+        return pd.DataFrame({
+            "Open": nav.shift(1).fillna(nav.iloc[0]),  # prev close as open
+            "Close": nav,
+        }, index=nav.index)
+
+    return to_ohlc(tq_nav), to_ohlc(sq_nav)
+
+
+def run_mode(label: str, qqq: pd.DataFrame, tqqq: pd.DataFrame, sqqq: pd.DataFrame,
+             start_date: str | None, starting_cash: float) -> dict:
+    print(f"\n[{label}] building daily targets...")
+    targets = build_daily_targets(qqq, start_date=start_date)
+    if targets.empty:
+        print(f"[{label}] no targets produced — insufficient history")
+        return {}
+    print(f"[{label}] {len(targets)} days, running execution...")
+    result = execute(targets, tqqq, sqqq, starting_cash=starting_cash)
+    return {"label": label, "targets": targets, "result": result}
+
+
+def print_summary(r: dict) -> None:
+    if not r:
+        return
+    d = r["result"].diagnostics
+    print(f"\n{'=' * 60}\n{r['label']}\n{'=' * 60}")
+    print(f"  CAGR:                 {d['cagr']*100:+.2f}%")
+    print(f"  Volatility:           {d['vol']*100:.2f}%")
+    print(f"  Sharpe:               {d['sharpe']:.2f}")
+    print(f"  Max drawdown:         {d['max_dd']*100:.2f}%")
+    print(f"  Num trades:           {d['num_trades']}")
+    print(f"  Round-trip win rate:  {d['win_rate']*100:.1f}%")
+    print(f"  Avg trade duration:   {d['avg_duration_days']:.1f} days")
+    print(f"  Avg TQQQ weight:      {d['avg_tqqq_weight']*100:.1f}%")
+    print(f"  Avg SQQQ weight:      {d['avg_sqqq_weight']*100:.1f}%")
+    print(f"  Avg cash weight:      {d['avg_cash_weight']*100:.1f}%")
+    print(f"  Days mostly in cash:  {d['pct_days_mostly_cash']*100:.1f}%")
+    print(f"  Days short-heavy:     {d['pct_days_short_heavy']*100:.1f}%")
+    print(f"  Total cost paid:      ${d['total_cost_paid']:,.2f}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["real", "synthetic", "both"], default="both")
+    ap.add_argument("--start", default=None,
+                    help="Real mode only; default = 2010-02-11 (TQQQ inception)")
+    ap.add_argument("--end", default=datetime.now().strftime("%Y-%m-%d"))
+    ap.add_argument("--starting-cash", type=float, default=10_000.0)
+    ap.add_argument("--financing-spread", type=float, default=0.02,
+                    help="Synthetic-mode annual financing cost, e.g. 0.02 = 2%%")
+    ap.add_argument("--out-prefix", default="backtest40y")
+    args = ap.parse_args()
+
+    if args.mode in ("real", "both"):
+        start = args.start or "2010-02-11"
+        print(f"[real] fetching QQQ/TQQQ/SQQQ {start} → {args.end}")
+        qqq = fetch_qqq(start, args.end)
+        tqqq, sqqq = fetch_tqqq_sqqq(start, args.end)
+        r = run_mode(f"REAL prices {start} → {args.end}", qqq, tqqq, sqqq,
+                     start_date=start, starting_cash=args.starting_cash)
+        print_summary(r)
+        if r:
+            r["result"].equity.to_csv(f"{args.out_prefix}_real_equity.csv")
+            r["result"].trades.to_csv(f"{args.out_prefix}_real_trades.csv", index=False)
+            pd.DataFrame({
+                "tqqq": r["result"].tqqq_weight,
+                "sqqq": r["result"].sqqq_weight,
+                "cash": r["result"].cash_weight,
+            }).to_csv(f"{args.out_prefix}_real_weights.csv")
+
+    if args.mode in ("synthetic", "both"):
+        start = args.start or "1986-01-01"
+        print(f"\n[synthetic] fetching QQQ {start} → {args.end} (QQQ inception 1999; "
+              f"pre-1999 the synthetic run will start where data begins)")
+        qqq = fetch_qqq(start, args.end)
+        tqqq, sqqq = synth_tqqq_sqqq_from_qqq(qqq, financing_spread=args.financing_spread)
+        r = run_mode(f"SYNTHETIC 3x {qqq.index[0].date()} → {qqq.index[-1].date()}",
+                     qqq, tqqq, sqqq,
+                     start_date=None, starting_cash=args.starting_cash)
+        print_summary(r)
+        if r:
+            r["result"].equity.to_csv(f"{args.out_prefix}_synth_equity.csv")
+            r["result"].trades.to_csv(f"{args.out_prefix}_synth_trades.csv", index=False)
+            pd.DataFrame({
+                "tqqq": r["result"].tqqq_weight,
+                "sqqq": r["result"].sqqq_weight,
+                "cash": r["result"].cash_weight,
+            }).to_csv(f"{args.out_prefix}_synth_weights.csv")
+
+    print(f"\n{'=' * 60}")
+    print("VALIDATION TARGET — Mallik's Collective2 (2022-07-23 → today)")
+    print(f"{'=' * 60}")
+    print("  CAGR:                 +22.2%")
+    print("  Max drawdown:         -37.58%")
+    print("  Win rate:             39.2%")
+    print("  Num trades:           102")
+    print("  Avg trade duration:   13.2 days")
+    print()
+    print("If REAL mode's CAGR is wildly different (e.g., +80% vs +22%),")
+    print("our implementation is NOT Mallik's strategy. If it's within ±10%,")
+    print("the code faithfully implements something in his class.")
+
+
+if __name__ == "__main__":
+    main()

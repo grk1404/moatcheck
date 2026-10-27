@@ -2642,11 +2642,20 @@ def render_tqqq_sqqq_signals():
             st.session_state[_target] = st.session_state.pop(_pending)
 
     # Manual refresh button — forces a fresh yfinance fetch
+    # Manual refresh button — forces a fresh yfinance fetch
     refresh_col1, refresh_col2 = st.columns([1, 4])
     with refresh_col1:
         if st.button("🔄 Refresh Signals", key="refresh_tqqq", width="stretch"):
+            # 1. Clear Streamlit's memory
             st.cache_data.clear()
+            
+            # 2. Nuke the local yfinance_cache for these specific tickers
+            # This forces the app to reach out to Yahoo Finance and download fresh data
+            clear_yfinance_cache("QQQ")
+            clear_yfinance_cache("TQQQ")
+            clear_yfinance_cache("SQQQ")            
             st.rerun()
+            
     with refresh_col2:
         st.caption(
             "Click Refresh to force a fresh fetch at 3:50 PM ET. "
@@ -2698,9 +2707,10 @@ def render_tqqq_sqqq_signals():
             """, unsafe_allow_html=True)
 
         with col2:
-            alloc_col1, alloc_col2 = st.columns(2)
-            alloc_col1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
-            alloc_col2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
+            a2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
+            a3.metric("Cash",        f"{tqqq_signals['target_cash_pct']:.1f}%")
             st.caption(
                 f"Position multiplier: {tqqq_signals['position_multiplier']:.1f}× "
                 f"(adjusts size based on trend strength)"
@@ -2825,7 +2835,7 @@ def render_tqqq_sqqq_signals():
         )
 
         # --- Cumulative P&L banner (two cards: committed vs unrealized) ---
-        _running = compute_running_pnl()
+        _running = compute_running_pnl(account_value=account_value)
         _unreal = _compute_unrealized_pnl()
 
         if _running["net_capital"] > 0 and _running["sleeve_value"] > 0:
@@ -2941,6 +2951,7 @@ def render_tqqq_sqqq_signals():
             _implied = (
                 _pos_check.get("tqqq_shares", 0.0) * tqqq_price
                 + _pos_check.get("sqqq_shares", 0.0) * sqqq_price
+                + _pos_check.get("cash_balance", 0.0)
             )
             if _implied > 0:
                 diff_pct = abs(account_value - _implied) / _implied * 100
@@ -2957,10 +2968,11 @@ def render_tqqq_sqqq_signals():
                     tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
                     tqqq_price=tqqq_price,
                     sqqq_price=sqqq_price,
+                     cash_target_pct=tqqq_signals["target_cash_pct"],
                 )
 
             st.markdown("**Target Positions**")
-            tc1, tc2 = st.columns(2)
+            tc1, tc2, tc3 = st.columns(3)
             with tc1:
                 st.metric(
                     "TQQQ target",
@@ -2972,6 +2984,12 @@ def render_tqqq_sqqq_signals():
                     "SQQQ target",
                     f"{targets['sqqq_target_shares']:.4f} shares",
                     delta=f"${targets['sqqq_target_value']:.2f}",
+                )
+            with tc3:
+                st.metric(
+                    "Cash target",
+                    "—",
+                    delta=f"${targets['cash_value']:.2f}",
                 )
 
             _pos = load_position()
@@ -2998,9 +3016,15 @@ def render_tqqq_sqqq_signals():
                 )
 
             if st.button("💾 Save current holdings", key="save_position"):
-                save_position(current_tqqq, current_sqqq)
+                _tq_val = current_tqqq * tqqq_price
+                _sq_val = current_sqqq * sqqq_price
+                _cash_val = max(0.0, account_value - _tq_val - _sq_val)
+                save_position(
+                    current_tqqq, current_sqqq, 
+                    cash_balance=_cash_val
+                )
                 st.success(
-                    f"Saved: TQQQ {current_tqqq:.4f}, SQQQ {current_sqqq:.4f}"
+                    f"Saved: TQQQ {current_tqqq:.4f}, SQQQ {current_sqqq:.4f}, Cash ${_cash_val:.2f}"
                 )
 
             rebalance = compute_rebalance(
@@ -3043,22 +3067,22 @@ def render_tqqq_sqqq_signals():
                 delta = rebalance["sqqq_delta_shares"]
                 delta_value = abs(rebalance["sqqq_delta_value"])
                 delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
+                is_below_threshold = delta_pct < MIN_TRADE_PCT
 
-                if delta_pct < MIN_TRADE_PCT:
-                    st.info(
-                        f"SQQQ: no action needed "
-                        f"(delta {delta_pct:.2f}% < {MIN_TRADE_PCT:.1f}%)"
-                    )
+                if abs(delta) < 0.0001:
+                    st.info("SQQQ: Position matches target perfectly.")
                 elif delta > 0:
-                    st.success(
-                        f"SQQQ: **BUY {delta:.4f} shares** "
-                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    )
+                    msg = f"SQQQ: **BUY {delta:.4f} shares** (~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    if is_below_threshold:
+                        st.info(msg + f"\n\n*(Optional: under {MIN_TRADE_PCT}% threshold to prevent churn)*")
+                    else:
+                        st.success(msg)
                 else:
-                    st.warning(
-                        f"SQQQ: **SELL {abs(delta):.4f} shares** "
-                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    )
+                    msg = f"SQQQ: **SELL {abs(delta):.4f} shares** (~${delta_value:.2f}, {delta_pct:.1f}% of account)"
+                    if is_below_threshold:
+                        st.info(msg + f"\n\n*(Optional: under {MIN_TRADE_PCT}% threshold to prevent churn)*")
+                    else:
+                        st.warning(msg)
 
             # Log trade buttons
             # Snapshot signal + target so a refresh between display and click
@@ -3081,41 +3105,43 @@ def render_tqqq_sqqq_signals():
                         delta = rebalance["tqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
 
-                        # 1. Append to the trade log
                         log_trade(
                             ticker="TQQQ", action=action,
                             shares=abs(actual_tqqq_fill),
                             price=tqqq_price,
                             signal=signal_snapshot,
                             tqqq_target_pct=target_snapshot,
+                            sqqq_target_pct=tqqq_signals["target_sqqq_pct"],
+                            cash_target_pct=tqqq_signals["target_cash_pct"],
                             account_value=account_value,
                         )
 
-                        # 2. Update position file — quantity AND blended avg cost
                         _pos = load_position()
                         _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
                         _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
                         _cur_tq_avg = float(_pos.get("tqqq_avg_cost", 0.0))
                         _cur_sq_avg = float(_pos.get("sqqq_avg_cost", 0.0))
+                        _cur_cash = float(_pos.get("cash_balance", 0.0))
 
                         if action == "BUY":
                             _new_tqqq = _cur_tqqq + abs(actual_tqqq_fill)
+                            _new_cash = _cur_cash - (abs(actual_tqqq_fill) * tqqq_price)
                             if _new_tqqq > 0:
-                                _new_tq_avg = (
-                                    (_cur_tqqq * _cur_tq_avg)
-                                    + (abs(actual_tqqq_fill) * tqqq_price)
-                                ) / _new_tqqq
+                                _new_tq_avg = ((_cur_tqqq * _cur_tq_avg) + (abs(actual_tqqq_fill) * tqqq_price)) / _new_tqqq
                             else:
                                 _new_tq_avg = 0.0
                         else:  # SELL
                             _new_tqqq = max(0.0, _cur_tqqq - abs(actual_tqqq_fill))
+                            _new_cash = _cur_cash + (abs(actual_tqqq_fill) * tqqq_price)
                             _new_tq_avg = _cur_tq_avg
 
                         save_position(
                             _new_tqqq, _cur_sqqq,
                             tqqq_avg_cost=_new_tq_avg,
                             sqqq_avg_cost=_cur_sq_avg,
+                            cash_balance=_new_cash,
                         )
+                        
 
                         # 3. Queue widget updates for the NEXT run
                         st.session_state["_pending_cur_tqqq"] = _new_tqqq
@@ -3140,40 +3166,41 @@ def render_tqqq_sqqq_signals():
                         delta = rebalance["sqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
 
-                        # 1. Append to the trade log
                         log_trade(
                             ticker="SQQQ", action=action,
                             shares=abs(actual_sqqq_fill),
                             price=sqqq_price,
                             signal=signal_snapshot,
                             tqqq_target_pct=target_snapshot,
+                            sqqq_target_pct=tqqq_signals["target_sqqq_pct"],
+                            cash_target_pct=tqqq_signals["target_cash_pct"],
                             account_value=account_value,
                         )
 
-                        # 2. Update position file — quantity AND blended avg cost
                         _pos = load_position()
                         _cur_tqqq = float(_pos.get("tqqq_shares", 0.0))
                         _cur_sqqq = float(_pos.get("sqqq_shares", 0.0))
                         _cur_tq_avg = float(_pos.get("tqqq_avg_cost", 0.0))
                         _cur_sq_avg = float(_pos.get("sqqq_avg_cost", 0.0))
+                        _cur_cash = float(_pos.get("cash_balance", 0.0))
 
                         if action == "BUY":
                             _new_sqqq = _cur_sqqq + abs(actual_sqqq_fill)
+                            _new_cash = _cur_cash - (abs(actual_sqqq_fill) * sqqq_price)
                             if _new_sqqq > 0:
-                                _new_sq_avg = (
-                                    (_cur_sqqq * _cur_sq_avg)
-                                    + (abs(actual_sqqq_fill) * sqqq_price)
-                                ) / _new_sqqq
+                                _new_sq_avg = ((_cur_sqqq * _cur_sq_avg) + (abs(actual_sqqq_fill) * sqqq_price)) / _new_sqqq
                             else:
                                 _new_sq_avg = 0.0
                         else:  # SELL
                             _new_sqqq = max(0.0, _cur_sqqq - abs(actual_sqqq_fill))
+                            _new_cash = _cur_cash + (abs(actual_sqqq_fill) * sqqq_price)
                             _new_sq_avg = _cur_sq_avg
 
                         save_position(
                             _cur_tqqq, _new_sqqq,
                             tqqq_avg_cost=_cur_tq_avg,
                             sqqq_avg_cost=_new_sq_avg,
+                            cash_balance=_new_cash,
                         )
 
                         # 3. Queue widget updates for the NEXT run
