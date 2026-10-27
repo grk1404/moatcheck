@@ -373,9 +373,9 @@ def fetch(ticker: str) -> Financials:
         
         _w52_high = info.get("fiftyTwoWeekHigh")
         _w52_low = info.get("fiftyTwoWeekLow")
-        if _w52_high is not None:
+        if _w52_high is not None and str(_w52_high).strip() not in ("", "None", "nan"):
             week52_high = float(_w52_high)
-        if _w52_low is not None:
+        if _w52_low is not None and str(_w52_low).strip() not in ("", "None", "nan"):
             week52_low = float(_w52_low)
 
         company_summary = info.get("longBusinessSummary") or ""
@@ -486,6 +486,19 @@ def fetch(ticker: str) -> Financials:
         if book_value_per_share is not None:
             book_value_per_share = book_value_per_share * fx_rate
 
+    # --- Fallback for 52-week high/low if Yahoo's info dict is empty ---
+    if week52_high is None or week52_low is None:
+        try:
+            # Fetch 1 year of history directly from the ticker object we already loaded
+            _hist = yft.history(period="1y")
+            if not _hist.empty:
+                if week52_high is None:
+                    week52_high = float(_hist["High"].max())
+                if week52_low is None:
+                    week52_low = float(_hist["Low"].min())
+        except Exception:
+            pass
+
     return Financials(
         ticker=symbol,
         revenue=revenue,
@@ -525,8 +538,17 @@ def fetch(ticker: str) -> Financials:
             "candidate_tried": [c[0] for c in candidates],
         },
         exchange=exchange,
-        week52_high=week52_high,
-        week52_low=week52_low,
+        # --- BULLETPROOF 52-WEEK FALLBACK ---
+        week52_high=(
+            week52_high 
+            if week52_high is not None 
+            else getattr(yft.fast_info, "year_high", None) or getattr(yft.fast_info, "fiftyTwoWeekHigh", None)
+        ),
+        week52_low=(
+            week52_low 
+            if week52_low is not None 
+            else getattr(yft.fast_info, "year_low", None) or getattr(yft.fast_info, "fiftyTwoWeekLow", None)
+        ),
         company_summary=company_summary,
         company_sector=company_sector,
         company_industry=company_industry,

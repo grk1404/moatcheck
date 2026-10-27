@@ -1,6 +1,9 @@
 from __future__ import annotations
 import streamlit as st
 
+import shutil
+import os
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -31,6 +34,38 @@ from technical_indicators import TechnicalIndicatorAnalyzer
 # Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
 
+
+def clear_yfinance_cache(ticker: str | None = None) -> bool:
+    """Clear yfinance_cache data. 
+    
+    If `ticker` is provided, it only deletes the cache for that specific ticker.
+    If `ticker` is None, it nukes the entire cache folder.
+    Returns True if something was deleted, False otherwise.
+    """
+    # Common locations for yfinance_cache on Windows and Mac/Linux
+    potential_dirs = [
+        Path(os.path.expanduser("~")) / "AppData" / "Local" / "py-yfinance-cache",
+        Path(os.path.expanduser("~")) / ".cache" / "py-yfinance-cache",
+        Path("py-yfinance-cache"), # Local project folder
+    ]
+    
+    cleared = False
+    for base_dir in potential_dirs:
+        if not base_dir.exists():
+            continue
+            
+        if ticker:
+            # Clean just one ticker (e.g. "AAPL")
+            ticker_dir = base_dir / ticker.upper()
+            if ticker_dir.exists():
+                shutil.rmtree(ticker_dir)
+                cleared = True
+        else:
+            # Clean the entire cache
+            shutil.rmtree(base_dir)
+            cleared = True
+            
+    return cleared
 
 def _first_n_sentences(text: str, n: int = 2) -> str:
     """Return the first N sentences from text, or the whole text if fewer."""
@@ -575,6 +610,7 @@ def render_etf_dashboard(symbol: str, yft) -> None:
 
     st.caption("Data from Yahoo Finance. Expense ratios, AUM, and holdings update daily; " "verify against the fund's prospectus before investing.")
 
+
 def render_analyzer() -> None:
     st.markdown(
         '<h2 style="margin-bottom: 0.25rem;">'
@@ -663,10 +699,22 @@ def render_analyzer() -> None:
         except FetchError as e:
             st.session_state["analyzing"] = False
             st.error(str(e))
+            # Add a fix-it button right there
+            st.warning("This usually means the local cache is corrupted.")
+            if st.button(f"🧹 Clear cache for {symbol} and try again", key=f"fix_{symbol}"):
+                if clear_yfinance_cache(symbol):
+                    st.cache_data.clear()
+                    st.rerun()
             return
         except Exception as e:
             st.session_state["analyzing"] = False
             st.error(f"Unexpected error fetching {symbol}: {e}")
+            # Add a fix-it button right there
+            st.warning("This usually means the local cache is corrupted.")
+            if st.button(f"🧹 Clear cache for {symbol} and try again", key=f"fix_{symbol}"):
+                if clear_yfinance_cache(symbol):
+                    st.cache_data.clear()
+                    st.rerun()
             return
 
     # Company Name Display 
@@ -737,23 +785,24 @@ def render_analyzer() -> None:
     if _eps_ttm_raw is not None and _eps_ttm_raw <= 0 and not fin.eps.empty:
         positive_history = fin.eps[fin.eps > 0]
         if not positive_history.empty:
-            # Take the 3 most recent positive years (or fewer if less available).
-            recent_pos = positive_history.tail(3)
-            _normalized_eps = float(recent_pos.mean())
-            _normalized_years = [int(y) for y in recent_pos.index]
+            _normalized_eps = float(positive_history.mean())
+            _normalized_years = [int(y) for y in positive_history.index]
 
+    # Keep current_eps for display purposes
     current_eps = _normalized_eps if _normalized_eps is not None else _eps_ttm_raw
+    
+    # ADD THIS: Use the historical positive average for math, but fall back to current_eps if no history exists
+    eps_for_valuation = _normalized_eps if _normalized_eps is not None else _eps_ttm_raw
 
     if _normalized_eps is not None:
         yrs_txt = ", ".join(str(y) for y in _normalized_years)
         st.warning(
             f":warning: Latest reported EPS is negative (${_eps_ttm_raw:.2f}). "
-            f"value Price and other formulas need positive EPS to work — the app "
-            f"has substituted a **normalized EPS of ${_normalized_eps:.2f}**, computed as the "
-            f"average of the last {len(_normalized_years)} positive years ({yrs_txt}). "
+            f"To calculate intrinsic value, the app has substituted a **historical average EPS of ${_normalized_eps:.2f}**, "
+            f"computed from the last {len(_normalized_years)} profitable years ({yrs_txt}). "
             f"Treat these valuations as guidance about what this business *could* be worth "
             f"if it returns to prior profitability, not what it's worth today."
-        )    
+        )
 
     def _moat_conservative_growth() -> float | None:
         """Return a conservative 15% growth rate for Buffett-style valuation."""
@@ -790,7 +839,7 @@ def render_analyzer() -> None:
                 return None
             custom_growth = custom_growth_pct / 100.0
             return value_price(
-                current_eps=current_eps,
+                current_eps=eps_for_valuation,
                 big5_eps_growth=None,
                 analyst_growth=None,
                 historical_pe=fin.pe_ratio_ttm,
@@ -802,19 +851,26 @@ def render_analyzer() -> None:
             conservative_growth = _moat_conservative_growth()
             if conservative_growth is None:
                 return None
+            
+            # If EPS is negative or missing, we force a tiny $0.01 EPS 
+            # just so the math completes and gives us a theoretical floor value.
+            eps_for_math = eps_for_valuation
+            if eps_for_math is None or eps_for_math <= 0:
+                eps_for_math = 0.01
+
             return value_price(
-                current_eps=current_eps,
-                big5_eps_growth=None,           # Ignore Big5 growth
-                analyst_growth=None,            # Ignore analyst growth
+                current_eps=eps_for_math,
+                big5_eps_growth=None,           
+                analyst_growth=None,            
                 historical_pe=fin.pe_ratio_ttm,
-                custom_growth=conservative_growth,  # Force 15%
+                custom_growth=conservative_growth,
             )
 
         if mode == "Big 5 EPS growth":
             if big5_eps_g is None:
                 return None
             return value_price(
-                current_eps=current_eps,
+                current_eps=eps_for_valuation,
                 big5_eps_growth=big5_eps_g,
                 analyst_growth=None,
                 historical_pe=fin.pe_ratio_ttm,
@@ -824,7 +880,7 @@ def render_analyzer() -> None:
             if fin.analyst_5yr_growth is None:
                 return None
             return value_price(
-                current_eps=current_eps,
+                current_eps=eps_for_valuation,
                 big5_eps_growth=None,
                 analyst_growth=fin.analyst_5yr_growth,
                 historical_pe=fin.pe_ratio_ttm,
@@ -849,6 +905,80 @@ def render_analyzer() -> None:
     if val is None:
         val = _compute_valuation_value(selected_growth_mode)
         st.session_state["valuation_growth_result"] = val
+
+    # --- MOVED UP: Define the rendering helpers before calling them ---
+    _VERDICT_TOOLTIPS = {
+        "BARGAIN BUY": "Current price is at or below 50% of the MOS Buy Price...",
+        "BUY": "Current price is below the Margin of Safety (MOS) Buy Price...",
+        "WATCH": "Current price is between the MOS Buy Price and the Intrinsic Value...",
+        "AVOID": "AVOID here doesn't mean the stock is a bad buy...",
+        "Unknown": "Not enough data to compute a verdict.",
+    }
+
+    _ANALYST_STYLE = {
+        "strong_buy":  ("STRONG BUY",  "bargain"),
+        "buy":         ("BUY",         "green"),
+        "outperform":  ("BUY",         "green"),
+        "hold":        ("HOLD",        "orange"),
+        "underperform":("SELL",        "red"),
+        "sell":        ("SELL",        "red"),
+        "strong_sell": ("STRONG SELL", "red"),
+    }
+
+    def _render_analyst_cell(col, fin) -> None:
+        key = fin.analyst_rec_key
+        count = fin.analyst_count
+        label, color = _ANALYST_STYLE.get(key or "", (None, "gray"))
+
+        if label is None or not count:
+            col.markdown(
+                '<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
+                '<div style="font-size: 1.5rem; color: #9AA0A6;">n/a</div>'
+                '<div style="font-size: 0.72rem; color: #9aa0a6;">no analyst coverage</div>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        color_hex = _COLOR_HEX[color]
+        detail_parts = [f"{count} analyst{'s' if count != 1 else ''}"]
+        if fin.analyst_target_mean and fin.current_price and fin.current_price > 0:
+            tgt = fin.analyst_target_mean
+            upside = (tgt - fin.current_price) / fin.current_price * 100
+            detail_parts.append(f"target ${tgt:.0f} ({upside:+.0f}%)")
+        detail = " · ".join(detail_parts)
+
+        col.markdown(
+            f'<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
+            f'<div style="font-size: 2.0rem; font-weight: 400; line-height: 1.2; color: {color_hex};">{label}</div>'
+            f'<div style="font-size: 0.72rem; color: #9aa0a6; line-height: 1.3; margin-top: 0.2rem;">{detail}</div>',
+            unsafe_allow_html=True,
+        )
+
+    def _render_verdict_cell(col, verdict: str, detail: str, color: str) -> None:
+        tip_raw = _VERDICT_TOOLTIPS.get(verdict, _VERDICT_TOOLTIPS["Unknown"])
+        tip = tip_raw.replace('"', "&quot;")
+        col.markdown(
+            f'<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">'
+            f'Verdict <span title="{tip}" style="cursor: help; color: #4CAF50; margin-left: 4px; font-size: 0.9rem;">&#9432;</span>'
+            f'</div>'
+            f'<div style="font-size: 2.0rem; font-weight: 400; line-height: 1.2; color: {_COLOR_HEX[color]};">{verdict}</div>'
+            f'<div style="font-size: 0.72rem; color: #9aa0a6; line-height: 1.3; margin-top: 0.2rem;">{detail}</div>',
+            unsafe_allow_html=True,
+        )
+    # ---------------------------------------------------------------------
+
+    if val is None:
+        st.warning(
+            "⚠️ Cannot compute standard Value Price — this company has negative earnings or missing growth data. "
+            "Use the **Custom** growth source below to manually input a growth rate and calculate a theoretical value."
+        )
+
+    # Safe evaluation (checks if val is None before trying to read val.mos_price)
+    v_verdict, v_detail, v_color = _verdict_price(
+        fin.current_price, 
+        val.mos_price if val else None, 
+        val.value_price if val else None
+    )
 
     # ============================================================
     # METRICS ROW
@@ -1040,220 +1170,81 @@ def render_analyzer() -> None:
     # VALUATION (Intrinsic Value Section)
     # ============================================================
     st.markdown("### Valuation")
+    
+    v1, v2, v3, v4, v5 = st.columns(5)
+    v1.metric("Value Price / Intrinsic Value", _fmt_money(val.value_price, fin.exchange, fin.ticker) if val else "n/a")
+    v2.metric("Margin of Safety (MOS) Buy Price", _fmt_money(val.mos_price, fin.exchange, fin.ticker) if val else "n/a")
+    v3.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
+    _render_verdict_cell(v4, v_verdict, v_detail, v_color)
+    _render_analyst_cell(v5, fin)
 
-    _VERDICT_TOOLTIPS = {
-        "BARGAIN BUY": (
-            "Current price is at or below 50% of the MOS Buy Price — a rare deep "
-            "discount. In Value terms this is a 'back up the truck' setup: the "
-            "formula says you get a huge margin of safety on top of an already "
-            "conservative fair value. BUT — verify the company is still healthy. "
-            "Bargain prices often reflect real risks the market is pricing in "
-            "(pending lawsuit, industry decline, accounting concerns). Check "
-            "recent news and the Big 5 trend before buying."
-        ),
-        "BUY": (
-            "Current price is below the Margin of Safety (MOS) Buy Price. This "
-            "means the formula says you can buy today with the safety cushion "
-            "Buffett / Lynch / Graham built into their method. This is the "
-            "signal each method was designed to produce — but it's still just "
-            "one formula. Cross-check against the other valuation methods in "
-            "the table below, verify the Big 5 are strong, and confirm the "
-            "business quality before acting."
-        ),
-        "WATCH": (
-            "Current price is between the MOS Buy Price and the Intrinsic Value. "
-            "The formula thinks the stock is reasonably valued but not offering "
-            "a margin of safety. Add to your watchlist and wait for a pullback "
-            "toward MOS — Buffett's discipline is patience. If fundamentals "
-            "improve (Big 5 accelerating) or the stock drops, this can quickly "
-            "become a BUY."
-        ),
-        "AVOID": (
-            "AVOID here doesn't mean the stock is a bad buy in absolute terms — "
-            "it only means the current price is above the intrinsic value "
-            "produced by this specific formula (Value / Peter Lynch / etc.). "
-            "These formulas are deliberately conservative (Buffett caps growth "
-            "at 15%, uses a 15% discount rate, and applies a 50% margin of "
-            "safety). A stock flagged AVOID may still be a good long-term buy "
-            "if you believe the company will outgrow the conservative "
-            "assumptions, if you require a lower return than 15%, or if "
-            "qualitative factors (moat, management, industry) justify paying "
-            "above the formula price. Use these numbers as guardrails, not gospel."
-        ),
-        "Unknown": (
-            "Not enough data to compute a verdict — usually missing current price "
-            "or a computable fair value. Check the Data footnote at the bottom "
-            "of the page."
-        ),
-    }
+    # --- FIX: Everything in one row with proper sizing ---
+    growth_group_col, button_col = st.columns([4, 1])
+    
+    with growth_group_col:
+        st.markdown(
+            "<div style='font-size: 0.875rem; margin-bottom: 0.25rem;'>Growth source</div>",
+            unsafe_allow_html=True,
+        )
 
-    # Section-level tooltip (used above the Other Intrinsic Value Methods table,
-    # where a per-cell tooltip isn't possible). Covers all four verdict outcomes.
-    _VERDICT_TOOLTIP_SECTION = (
-        "Verdicts compare current price against each formula's fair value. "
-        "BARGAIN BUY = current is <= 50% of MOS Buy Price (deep discount). "
-        "BUY = current is below the MOS Buy Price. "
-        "WATCH = between MOS and fair value. "
-        "AVOID = above fair value — but each formula is deliberately conservative, "
-        "so AVOID doesn't necessarily mean 'bad company' — it means 'the formula's "
-        "guardrails say wait'. Cross-check with the Big 5 and the other methods."
-    )
+        col_radio, col_input, col_pct, col_btn, col_spacer = st.columns([2.1, 1.1, 0.2, 1.0, 1.8])
 
+        with col_radio:
+            selected_growth_mode = st.radio(
+                "Growth source",
+                options=mode_options,
+                horizontal=True,
+                format_func=_valuation_growth_rate_label,
+                key="valuation_growth_mode",
+                label_visibility="collapsed",
+            )
 
-    _ANALYST_STYLE = {
-        # yfinance recommendationKey -> (display, color)
-        "strong_buy":  ("STRONG BUY",  "bargain"),
-        "buy":         ("BUY",         "green"),
-        "outperform":  ("BUY",         "green"),   # legacy label some tickers still use
-        "hold":        ("HOLD",        "orange"),
-        "underperform":("SELL",        "red"),
-        "sell":        ("SELL",        "red"),
-        "strong_sell": ("STRONG SELL", "red"),
-    }
-
-
-    def _render_analyst_cell(col, fin) -> None:
-        """Analyst consensus rating from yfinance, with count and price target upside."""
-        key = fin.analyst_rec_key
-        count = fin.analyst_count
-        label, color = _ANALYST_STYLE.get(key or "", (None, "gray"))
-
-        if label is None or not count:
-            col.markdown(
+        with col_input:
+            st.markdown(
                 """
-                <div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>
-                <div style="font-size: 1.5rem; color: #9AA0A6;">n/a</div>
-                <div style="font-size: 0.72rem; color: #9aa0a6;">no analyst coverage</div>
+                <style>
+                [data-testid="stNumberInput"] {
+                    width: 100% !important;
+                }
+                </style>
                 """,
                 unsafe_allow_html=True,
             )
-            return
+            st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
+            st.number_input(
+                "Custom %",
+                key="custom_growth_rate",
+                min_value=1,
+                max_value=100,
+                step=1,
+                format="%d",
+                disabled=(selected_growth_mode != "Custom"),
+                label_visibility="collapsed",
+            )
 
-        color_hex = _COLOR_HEX[color]
-        # Detail: N analysts, plus price target upside vs current if available.
-        detail_parts = [f"{count} analyst{'s' if count != 1 else ''}"]
-        if fin.analyst_target_mean and fin.current_price and fin.current_price > 0:
-            tgt = fin.analyst_target_mean
-            upside = (tgt - fin.current_price) / fin.current_price * 100
-            detail_parts.append(f"target ${tgt:.0f} ({upside:+.0f}%)")
-        detail = " · ".join(detail_parts)
-
-        col.markdown(
-            f"""
-            <div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>
-            <div style="font-size: 2.0rem; font-weight: 400; line-height: 1.2; color: {color_hex};">
-                {label}
-            </div>
-            <div style="font-size: 0.72rem; color: #9aa0a6; line-height: 1.3; margin-top: 0.2rem;">
-                {detail}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-    def _render_verdict_cell(col, verdict: str, detail: str, color: str) -> None:
-        # &#9432; is the ⓘ (info) glyph. HTML `title` gives us a native browser tooltip
-        # on hover — works on all platforms without needing any Streamlit component.
-        tip_raw = _VERDICT_TOOLTIPS.get(verdict, _VERDICT_TOOLTIPS["Unknown"])
-        tip = tip_raw.replace('"', "&quot;")
-        col.markdown(
-            f"""
-            <div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">
-                Verdict
-                <span title="{tip}" style="cursor: help; color: #4CAF50; margin-left: 4px; font-size: 0.9rem;">&#9432;</span>
-            </div>
-            <div style="font-size: 2.0rem; font-weight: 400; line-height: 1.2; color: {_COLOR_HEX[color]};">
-                {verdict}
-            </div>
-            <div style="font-size: 0.72rem; color: #9aa0a6; line-height: 1.3; margin-top: 0.2rem;">
-                {detail}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if val is None:
-        st.info(
-            "Cannot compute value Price — need positive current EPS and at least one "
-            "growth estimate (Big 5 EPS growth or analyst 5yr growth)."
-        )
-    else:
-        v_verdict, v_detail, v_color = _verdict_price(fin.current_price, val.mos_price, val.value_price)
-        v1, v2, v3, v4, v5 = st.columns(5)
-        v1.metric("Value Price / Intrinsic Value", _fmt_money(val.value_price, fin.exchange, fin.ticker))
-        v2.metric("Margin of Safety (MOS) Buy Price", _fmt_money(val.mos_price, fin.exchange, fin.ticker))
-        v3.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
-        _render_verdict_cell(v4, v_verdict, v_detail, v_color)
-        _render_analyst_cell(v5, fin)
-
-        # --- FIX: Everything in one row with proper sizing ---
-        growth_group_col, button_col = st.columns([4, 1])
-        
-        with growth_group_col:
-            # --- FIX: Custom input right next to "Custom" radio button ---
-                
+        with col_pct:
             st.markdown(
-                "<div style='font-size: 0.875rem; margin-bottom: 0.25rem;'>Growth source</div>",
+                "<div style='height: 44px;'></div><div style='font-size: 0.875rem; color: #9aa0a6;'>%</div>",
                 unsafe_allow_html=True,
             )
 
-            col_radio, col_input, col_pct, col_btn, col_spacer = st.columns([2.1, 1.1, 0.2, 1.0, 1.8])
+        with col_btn:
+            st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
+            revalue_button = st.button(
+                "RE-VALUATE", 
+                key="revaluate_btn",
+                help="Recalculate with selected growth rate"
+            )
 
-            with col_radio:
-                selected_growth_mode = st.radio(
-                    "Growth source",
-                    options=mode_options,
-                    horizontal=True,
-                    format_func=_valuation_growth_rate_label,
-                    key="valuation_growth_mode",
-                    label_visibility="collapsed",
-                )
+    st.caption(f"DEBUG — mode: {selected_growth_mode} | custom box: {st.session_state.get('custom_growth_rate')}")
 
-            with col_input:
-                st.markdown(
-                    """
-                    <style>
-                    [data-testid="stNumberInput"] {
-                        width: 100% !important;
-                    }
-                    </style>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
-                st.number_input(
-                    "Custom %",
-                    key="custom_growth_rate",
-                    min_value=1,
-                    max_value=100,
-                    step=1,
-                    format="%d",
-                    disabled=(selected_growth_mode != "Custom"),
-                    label_visibility="collapsed",
-                )
+    if revalue_button:
+        st.session_state["valuation_growth_result"] = _compute_valuation_value(selected_growth_mode)
+        st.session_state["valuation_calculated_mode"] = selected_growth_mode
+        st.rerun()
 
-            with col_pct:
-                st.markdown(
-                    "<div style='height: 44px;'></div><div style='font-size: 0.875rem; color: #9aa0a6;'>%</div>",
-                    unsafe_allow_html=True,
-                )
-
-            with col_btn:
-                st.markdown("<div style='height: 36px;'></div>", unsafe_allow_html=True)
-                revalue_button = st.button(
-                    "RE-VALUATE", 
-                    key="revaluate_btn",
-                    help="Recalculate with selected growth rate"
-                )
-
-        st.caption(f"DEBUG — mode: {selected_growth_mode} | custom box: {st.session_state.get('custom_growth_rate')}")
-
-        if revalue_button:
-            st.session_state["valuation_growth_result"] = _compute_valuation_value(selected_growth_mode)
-            st.session_state["valuation_calculated_mode"] = selected_growth_mode
-            st.rerun()
-
+    # Only show the "How it was calculated" expander if val actually exists
+    if val is not None:
         with st.expander("How the value Price was calculated"):
             _big5_g_txt = _fmt_pct(big5_eps_g)
             _analyst_g_txt = _fmt_pct(fin.analyst_5yr_growth)
@@ -1380,6 +1371,50 @@ def render_analyzer() -> None:
     st.markdown("---")
 
     # ============================================================
+    # PRICE-TO-SALES (P/S) FALLBACK
+    # ============================================================
+    if current_eps is None or current_eps <= 0:
+        st.markdown("#### Price-to-Sales (P/S) Valuation")
+        st.caption(
+            "Since this company has negative earnings or missing data, we use a Price-to-Sales multiple "
+            "to estimate fair value. This is the standard Wall Street method for pre-profit high-growth companies."
+        )
+        
+        _revenue_ttm = float(fin.revenue.iloc[-1]) if not fin.revenue.empty else None
+        _shares = fin.shares_outstanding
+        
+        if _revenue_ttm and _revenue_ttm > 0 and _shares and _shares > 0:
+            _sales_per_share = _revenue_ttm / _shares
+            
+            ps_col1, ps_col2 = st.columns(2)
+            with ps_col1:
+                _fair_ps_multiple = st.slider(
+                    "Fair P/S Multiple", 
+                    min_value=1.0, max_value=30.0, value=10.0, step=1.0, 
+                    help="A 10x multiple means you are willing to pay $10 for every $1 of revenue."
+                )
+            
+            _fair_value_ps = _sales_per_share * _fair_ps_multiple
+            _mos_ps = _fair_value_ps * 0.75  # 25% margin of safety
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Revenue (TTM)", _fmt_money(_revenue_ttm, fin.exchange, fin.ticker))
+            col2.metric("Sales Per Share", _fmt_money(_sales_per_share, fin.exchange, fin.ticker))
+            col3.metric("Fair Value (P/S)", _fmt_money(_fair_value_ps, fin.exchange, fin.ticker))
+            col4.metric("P/S MOS Buy", _fmt_money(_mos_ps, fin.exchange, fin.ticker))
+            
+            if fin.current_price:
+                _upside_ps = (_fair_value_ps - fin.current_price) / fin.current_price
+                if _upside_ps > 0:
+                    st.success(f"Stock is **{_upside_ps*100:.1f}% below** its P/S fair value.")
+                else:
+                    st.warning(f"Stock is **{abs(_upside_ps)*100:.1f}% above** its P/S fair value.")
+        else:
+            st.info("Cannot calculate P/S — missing Revenue or Shares Outstanding.")
+            
+        st.markdown("---")
+
+    # ============================================================
     # OTHER INTRINSIC VALUE METHODS
     # ============================================================
     # Assumptions for the other methods (Graham Formula and Lynch/Graham/PEG MOS)
@@ -1408,7 +1443,7 @@ def render_analyzer() -> None:
                 key="mos_pct_slider",
             ) / 100
 
-    _tip_other = _VERDICT_TOOLTIP_SECTION.replace('"', "&quot;")
+    _tip_other = _VERDICT_TOOLTIPS.get("BUY", "").replace('"', "&quot;")
     st.markdown(
         f"""
         <h3 style="margin-bottom: 0.25rem;">
@@ -1445,7 +1480,7 @@ def render_analyzer() -> None:
     )
     _add(
         peter_lynch_fair(
-            current_eps=current_eps,
+            current_eps=eps_for_valuation,
             growth_rate=_growth_for_intrinsic,
             dividend_yield=fin.dividend_yield,
             current_price=fin.current_price,
@@ -1454,7 +1489,7 @@ def render_analyzer() -> None:
     )
     _add(
         graham_number(
-            current_eps=current_eps,
+            current_eps=eps_for_valuation,
             book_value_per_share=fin.book_value_per_share,
             current_price=fin.current_price,
             mos=mos_pct,
@@ -1462,7 +1497,7 @@ def render_analyzer() -> None:
     )
     _add(
         graham_formula(
-            current_eps=current_eps,
+            current_eps=eps_for_valuation,
             growth_rate=_growth_for_intrinsic,
             current_price=fin.current_price,
             aaa_bond_yield=aaa_yield,
@@ -1471,7 +1506,7 @@ def render_analyzer() -> None:
     )
     _add(
         peg_fair_value(
-            current_eps=current_eps,
+            current_eps=eps_for_valuation,
             growth_rate=_growth_for_intrinsic,
             current_price=fin.current_price,
             mos=mos_pct,
@@ -3359,7 +3394,7 @@ def render_backtest() -> None:
             qqq_close = prices["QQQ_close"]
             tqqq_close = prices["TQQQ_close"]
             
-            start_ts = pd.Timestamp(start_date)
+            start_ts = datetime.fromisoformat(start_date)
             
             results = {}
             import inspect
@@ -3755,6 +3790,7 @@ _pages = [
 _nav = st.navigation(_pages, position="sidebar")
 
 # Small brand mark above the nav links
+# Small brand mark above the nav links
 with st.sidebar:
     st.markdown(
         """
@@ -3765,5 +3801,30 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    
+    st.markdown("---")
+    st.markdown("**Data Utilities**")
+    
+    # Form to clear specific ticker
+    with st.form("clear_cache_form"):
+        st.caption("Clear cached data for a specific stock (e.g., AAPL).")
+        ticker_to_clear = st.text_input("Ticker to clear", placeholder="AAPL", label_visibility="collapsed").strip().upper()
+        clear_single = st.form_submit_button("Clear this ticker's cache", use_container_width=True)
+        
+        if clear_single and ticker_to_clear:
+            if clear_yfinance_cache(ticker_to_clear):
+                st.cache_data.clear()
+                st.success(f"Cleared cache for {ticker_to_clear}!")
+            else:
+                st.info(f"No cache found for {ticker_to_clear}.")
 
-_nav.run()                        
+    # Button to nuke everything
+    if st.button("🚨 Clear ENTIRE cache", type="primary", use_container_width=True):
+        if clear_yfinance_cache(ticker=None):
+            st.cache_data.clear()
+            st.success("Entire cache cleared!")
+            st.rerun()
+        else:
+            st.info("No cache folders found.")
+
+_nav.run()
