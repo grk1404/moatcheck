@@ -75,7 +75,11 @@ def run_mode(label: str, qqq: pd.DataFrame, tqqq: pd.DataFrame, sqqq: pd.DataFra
         return {}
         
     # Slice targets and prices to only include the requested start date onwards
-    start_ts = pd.to_datetime(start_date)
+    if start_date is not None:
+        start_ts = pd.to_datetime(start_date)
+    else:
+        start_ts = targets.index[0]  # Use earliest available date for synthetic runs
+        
     targets_sliced = targets[targets.index >= start_ts]
     tqqq_sliced = tqqq[tqqq.index >= start_ts]
     sqqq_sliced = sqqq[sqqq.index >= start_ts]
