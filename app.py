@@ -12,6 +12,7 @@ import json
 import warnings
 from data_provider import get_ticker
 from investments import _metric_html, render_my_investments
+from data_quality import check_data_quality
 
 from trade_manager import (
     compute_target_shares,
@@ -2672,49 +2673,42 @@ def render_tqqq_sqqq_signals():
             st.warning(f"Strategy analysis unavailable: {tqqq_signals['error']}")
             return
 
-        # Signal card + allocation
-        col1, col2 = st.columns([1, 2])
+        # --- Signal Header (Clean Text, No Box) ---
+        signal = tqqq_signals["signal"]
+        regime = tqqq_signals["regime"]
+        confidence = tqqq_signals["confidence"]
 
-        with col1:
-            signal = tqqq_signals["signal"]
-            regime = tqqq_signals["regime"]
-            confidence = tqqq_signals["confidence"]
+        if "TQQQ" in signal:
+            color_tag = "green" if "HEAVY" in signal else "blue"
+        elif "SQQQ" in signal:
+            color_tag = "red" if "HEAVY" in signal else "orange"
+        else:
+            color_tag = "gray"
 
-            if "TQQQ" in signal and "HEAVY" in signal:
-                color, bg = "#4CAF50", "#1e4620"
-            elif "TQQQ" in signal:
-                color, bg = "#8BC34A", "#2a3d1e"
-            elif "SQQQ" in signal and "HEAVY" in signal:
-                color, bg = "#EF5350", "#4b1e1e"
-            elif "SQQQ" in signal:
-                color, bg = "#FF7043", "#3d241e"
-            else:
-                color, bg = "#FFA726", "#4a3a1e"
+        st.markdown(f"### Signal: :{color_tag}[{signal}]")
+        st.markdown(f"**Regime:** {regime} | **Confidence:** {confidence:.0f}%")
+        
+        st.divider()
 
-            st.markdown(f"""
-            <div style="background-color:{bg}; border:2px solid {color};
-                        border-radius:10px; padding:1.25rem; text-align:center;">
-                <div style="font-size:1.5rem; font-weight:700; color:{color};">
-                    {signal}
-                </div>
-                <div style="color:#9aa0a6; font-size:0.85rem; margin-top:0.4rem;">
-                    Regime: <strong>{regime}</strong>
-                </div>
-                <div style="color:#9aa0a6; font-size:0.75rem;">
-                    Confidence: {confidence:.0f}%
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col2:
+        # --- Side-by-Side Strategy Targets ---
+        st.markdown("#### 🎯 Strategy Targets")
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.markdown("**MoatCheck (7-Strategy Ensemble)**")
             a1, a2, a3 = st.columns(3)
             a1.metric("TQQQ Target", f"{tqqq_signals['target_tqqq_pct']:.1f}%")
             a2.metric("SQQQ Target", f"{tqqq_signals['target_sqqq_pct']:.1f}%")
             a3.metric("Cash",        f"{tqqq_signals['target_cash_pct']:.1f}%")
-            st.caption(
-                f"Position multiplier: {tqqq_signals['position_multiplier']:.1f}× "
-                f"(adjusts size based on trend strength)"
-            )
+            
+        with c2:
+            st.markdown("**Mallik Sim (Continuous Sizing)**")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("TQQQ Target", f"{tqqq_signals['mallik_tqqq_pct']:.1f}%")
+            m2.metric("SQQQ Target", f"{tqqq_signals['mallik_sqqq_pct']:.1f}%")
+            m3.metric("Cash",        f"{tqqq_signals['mallik_cash_pct']:.1f}%")
+            
+        st.divider()
 
         # Per-strategy vote breakdown
         with st.expander("📋 Sub-Strategy Votes"):
@@ -2966,9 +2960,10 @@ def render_tqqq_sqqq_signals():
                 targets = compute_target_shares(
                     account_value=account_value,
                     tqqq_target_pct=tqqq_signals["target_tqqq_pct"],
+                    sqqq_target_pct=tqqq_signals["target_sqqq_pct"], # <-- ADD THIS
                     tqqq_price=tqqq_price,
                     sqqq_price=sqqq_price,
-                     cash_target_pct=tqqq_signals["target_cash_pct"],
+                    #cash_target_pct=tqqq_signals["target_cash_pct"],
                 )
 
             st.markdown("**Target Positions**")
@@ -3035,54 +3030,60 @@ def render_tqqq_sqqq_signals():
                 tqqq_price=tqqq_price,
                 sqqq_price=sqqq_price,
             )
+            
+            # Calculate Mallik Sim target shares and actions for reference
+            mallik_targets = compute_target_shares(
+                account_value=account_value,
+                tqqq_target_pct=tqqq_signals["mallik_tqqq_pct"],
+                sqqq_target_pct=tqqq_signals["mallik_sqqq_pct"], # <-- ADD THIS
+                tqqq_price=tqqq_price,
+                sqqq_price=sqqq_price,
+                #cash_target_pct=tqqq_signals["mallik_cash_pct"],
+            )
+            mallik_rebalance = compute_rebalance(
+                current_tqqq_shares=current_tqqq,
+                current_sqqq_shares=current_sqqq,
+                tqqq_target_shares=mallik_targets["tqqq_target_shares"],
+                sqqq_target_shares=mallik_targets["sqqq_target_shares"],
+                tqqq_price=tqqq_price,
+                sqqq_price=sqqq_price,
+            )
 
             #Action Display Block
             st.markdown("**Actions to Take Now**")
-            ac1, ac2 = st.columns(2)
-
-            # Minimum percentage shift in allocation to justify a rebalance.
-            # Expressed as a % of account value so it scales with capital.
-            with ac1:
-                delta = rebalance["tqqq_delta_shares"]
-                delta_value = abs(rebalance["tqqq_delta_value"])
-                delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
-
-                if delta_pct < MIN_TRADE_PCT:
-                    st.info(
-                        f"TQQQ: no action needed "
-                        f"(delta {delta_pct:.2f}% < {MIN_TRADE_PCT:.1f}%)"
-                    )
-                elif delta > 0:
-                    st.success(
-                        f"TQQQ: **BUY {delta:.4f} shares** "
-                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    )
-                else:
-                    st.warning(
-                        f"TQQQ: **SELL {abs(delta):.4f} shares** "
-                        f"(~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    )
-
-            with ac2:
-                delta = rebalance["sqqq_delta_shares"]
-                delta_value = abs(rebalance["sqqq_delta_value"])
-                delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
-                is_below_threshold = delta_pct < MIN_TRADE_PCT
-
-                if abs(delta) < 0.0001:
-                    st.info("SQQQ: Position matches target perfectly.")
-                elif delta > 0:
-                    msg = f"SQQQ: **BUY {delta:.4f} shares** (~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    if is_below_threshold:
-                        st.info(msg + f"\n\n*(Optional: under {MIN_TRADE_PCT}% threshold to prevent churn)*")
+            
+            def render_action_block(rebalance_dict, title_prefix=""):
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    delta = rebalance_dict["tqqq_delta_shares"]
+                    delta_value = abs(rebalance_dict["tqqq_delta_value"])
+                    delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
+                    if delta_pct < MIN_TRADE_PCT:
+                        st.info(f"{title_prefix}TQQQ: no action needed (delta {delta_pct:.2f}%)")
+                    elif delta > 0:
+                        st.success(f"{title_prefix}TQQQ: **BUY {delta:.4f} shares** (~${delta_value:.2f})")
                     else:
-                        st.success(msg)
-                else:
-                    msg = f"SQQQ: **SELL {abs(delta):.4f} shares** (~${delta_value:.2f}, {delta_pct:.1f}% of account)"
-                    if is_below_threshold:
-                        st.info(msg + f"\n\n*(Optional: under {MIN_TRADE_PCT}% threshold to prevent churn)*")
+                        st.warning(f"{title_prefix}TQQQ: **SELL {abs(delta):.4f} shares** (~${delta_value:.2f})")
+                with ac2:
+                    delta = rebalance_dict["sqqq_delta_shares"]
+                    delta_value = abs(rebalance_dict["sqqq_delta_value"])
+                    delta_pct = (delta_value / account_value) * 100 if account_value > 0 else 0
+                    if delta_pct < MIN_TRADE_PCT:
+                        st.info(f"{title_prefix}SQQQ: no action needed (delta {delta_pct:.2f}%)")
+                    elif delta > 0:
+                        st.success(f"{title_prefix}SQQQ: **BUY {delta:.4f} shares** (~${delta_value:.2f})")
                     else:
-                        st.warning(msg)
+                        st.warning(f"{title_prefix}SQQQ: **SELL {abs(delta):.4f} shares** (~${delta_value:.2f})")
+
+            # Show MoatCheck Actions
+            st.markdown("**MoatCheck Strategy**")
+            render_action_block(rebalance)
+            
+            st.markdown("---")
+            
+            # Show Mallik Sim Actions
+            st.markdown("**Mallik Sim Strategy** *(For Reference)*")
+            render_action_block(mallik_rebalance)
 
             # Log trade buttons
             # Snapshot signal + target so a refresh between display and click

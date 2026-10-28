@@ -188,33 +188,12 @@ def compute_realized_pnl() -> pd.DataFrame:
     df["cumulative_realized_pnl"] = cumulative_realized
     return df
 
-def compute_target_shares(account_value, tqqq_target_pct, tqqq_price, sqqq_price,
-                          cash_target_pct: float = 0.0):
+def compute_target_shares(account_value, tqqq_target_pct, sqqq_target_pct, tqqq_price, sqqq_price):
     """
-    Compute fractional target share counts for both legs, reserving cash.
-
-    cash_target_pct is a PERCENT (0-100), matching tqqq_target_pct's units.
-    It reduces the investable base; the residual cash is NOT reallocated
-    to TQQQ/SQQQ.
-
-    Returns:
-        {
-            'tqqq_target_value': float,
-            'sqqq_target_value': float,
-            'tqqq_target_shares': float,
-            'sqqq_target_shares': float,
-            'cash_value': float,       # ← NEW
-            'invested_value': float,   # ← NEW
-        }
+    Compute target shares. target_pct is the absolute percentage of the TOTAL account.
     """
-    assert 0.0 <= cash_target_pct <= 100.0, (
-        f"cash_target_pct must be a percent (0-100), got {cash_target_pct}"
-    )
-
-    invested_value = account_value * (1.0 - cash_target_pct / 100.0)
-
-    tqqq_value = invested_value * (tqqq_target_pct / 100.0)
-    sqqq_value = invested_value - tqqq_value   # residual, not re-derived from pct
+    tqqq_value = account_value * (tqqq_target_pct / 100.0)
+    sqqq_value = account_value * (sqqq_target_pct / 100.0)
 
     tqqq_shares = tqqq_value / tqqq_price if tqqq_price > 0 else 0.0
     sqqq_shares = sqqq_value / sqqq_price if sqqq_price > 0 else 0.0
@@ -224,8 +203,8 @@ def compute_target_shares(account_value, tqqq_target_pct, tqqq_price, sqqq_price
         "sqqq_target_value": sqqq_value,
         "tqqq_target_shares": tqqq_shares,
         "sqqq_target_shares": sqqq_shares,
-        "cash_value": account_value - invested_value,
-        "invested_value": invested_value,
+        "cash_value": account_value - tqqq_value - sqqq_value,
+        "invested_value": tqqq_value + sqqq_value,
     }
 
 

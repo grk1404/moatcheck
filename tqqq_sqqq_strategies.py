@@ -284,7 +284,57 @@ STRATEGIES = [
     strategy_bear_bounce_fade,
 ]
 
-
+def get_mallik_live_target(data: dict) -> dict:
+    """Calculate Mallik's continuous sizing target for the live app."""
+    qqq = data["QQQ"]
+    close = qqq["Close"]
+    
+    if len(close) < 250:
+        return {"tqqq_pct": 0.0, "sqqq_pct": 0.0, "cash_pct": 100.0}
+        
+    price = float(close.iloc[-1])
+    sma_50 = float(close.rolling(50).mean().iloc[-1])
+    sma_250 = float(close.rolling(250).mean().iloc[-1])
+    
+    bb_mid = float(close.rolling(20).mean().iloc[-1])
+    bb_std = float(close.rolling(20).std().iloc[-1])
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid != 0 else 0.0
+    
+    # Mallik Math
+    dist_250 = (price - sma_250) / sma_250
+    base_target = 0.5 + (dist_250 * 5.0)
+    base_target = max(0.0, min(1.0, base_target))
+    
+    if price > sma_50 and sma_50 > sma_250:
+        target = base_target
+    elif price < sma_50 and sma_50 < sma_250:
+        target = base_target * 0.5
+    else:
+        target = 0.5
+        
+    if bb_width > 0.10:
+        deviation = target - 0.5
+        target = 0.5 + (deviation * 1.2)
+        
+    target = max(0.0, min(1.0, target))
+    
+    # One-sided execution
+    if target >= 0.5:
+        tqqq = target
+        sqqq = 0.0
+        cash = 1.0 - target
+    else:
+        tqqq = 0.0
+        sqqq = 1.0 - target
+        cash = 1.0 - sqqq
+        
+    return {
+        "tqqq_pct": tqqq * 100,
+        "sqqq_pct": sqqq * 100,
+        "cash_pct": cash * 100
+    }
 
 # ============================================================
 # COORDINATOR - Runs all strategies and aggregates votes
@@ -368,6 +418,10 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
     else:
         signal, signal_type = "SQQQ HEAVY", "short"
 
+    # --- Calculate Mallik's Live Target ---
+    mallik_live = get_mallik_live_target(data)
+    # --------------------------------------
+    
     return {
         "signal": signal,
         "signal_type": signal_type,
@@ -375,6 +429,9 @@ def run_all_strategies(data: dict = None, period: str = "2y") -> dict:
         "target_tqqq_pct": target_tqqq * 100,
         "target_sqqq_pct": target_sqqq * 100,
         "target_cash_pct": target_cash * 100,          # ← new field
+        "mallik_tqqq_pct": mallik_live["tqqq_pct"],   # <-- NEW
+        "mallik_sqqq_pct": mallik_live["sqqq_pct"],   # <-- NEW
+        "mallik_cash_pct": mallik_live["cash_pct"],   # <-- NEW
         "current_price": ind["price"],
         "sma_50": ind["sma_50"],
         "sma_200": ind["sma_200"],
