@@ -9,6 +9,7 @@ import csv
 import json
 import pandas as pd
 from datetime import datetime
+import streamlit as st
 
 from pathlib import Path
 
@@ -331,6 +332,7 @@ def repair_trade_log() -> int:
 
     return repaired
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_trades() -> pd.DataFrame:
     """Load the trade log as a DataFrame (empty if no file yet).
 
@@ -346,7 +348,7 @@ def load_trades() -> pd.DataFrame:
         df = pd.read_csv(
             TRADES_FILE,
             engine="python",
-            on_bad_lines="error",
+            on_bad_lines="skip",
         )
     except pd.errors.ParserError as e:
         print(f"[trades] Malformed rows detected in {TRADES_FILE}: {e}")
