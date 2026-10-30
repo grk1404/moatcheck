@@ -499,6 +499,18 @@ def run_all_strategies(
 
     mallik_live = get_mallik_live_target(data)
 
+    # --- Calculate TQQQ SMAs and Price for the UI ---
+    tqqq_df = data.get("TQQQ")
+    tq_sma_50, tq_sma_200, tq_sma_250 = 0.0, 0.0, 0.0
+    tq_price = 0.0
+    if tqqq_df is not None and not tqqq_df.empty:
+        tq_close = tqqq_df["Close"]
+        tq_price = float(tq_close.iloc[-1])   # <-- NEW: Current TQQQ Price
+        tq_sma_50 = float(tq_close.rolling(50).mean().iloc[-1]) if len(tq_close) >= 50 else 0.0
+        tq_sma_200 = float(tq_close.rolling(200).mean().iloc[-1]) if len(tq_close) >= 200 else 0.0
+        tq_sma_250 = float(tq_close.rolling(250).mean().iloc[-1]) if len(tq_close) >= 250 else 0.0
+
+
     result = {
         "signal": signal,
         "signal_type": signal_type,
@@ -512,9 +524,14 @@ def run_all_strategies(
         "mallik_cash_pct": mallik_live["cash_pct"],
         "mallik_dial": mallik_live["dial"],
         "current_price": ind["price"],
+        "tqqq_current_price": tq_price,
         "sma_50": ind["sma_50"],
         "sma_200": ind["sma_200"],
         "sma_250": ind["sma_250"],
+        "tqqq_sma_50": tq_sma_50,      # <-- NEW
+        "tqqq_sma_200": tq_sma_200,    # <-- NEW
+        "tqqq_sma_250": tq_sma_250,    # <-- NEW
+        "tqqq_price": tq_price,        # <-- NEW
         "distance_from_sma50_pct": ind["dist_from_sma50"] * 100,
         "bb_width": ind["bb_width"],
         "bb_position": ind["bb_position"],

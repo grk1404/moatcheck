@@ -2677,6 +2677,16 @@ def render_tqqq_sqqq_signals():
         signal = tqqq_signals["signal"]
         regime = tqqq_signals["regime"]
         confidence = tqqq_signals["confidence"]
+        
+        # QQQ SMAs
+        sma_50 = tqqq_signals.get("sma_50", 0.0)
+        sma_200 = tqqq_signals.get("sma_200", 0.0)
+        sma_250 = tqqq_signals.get("sma_250", 0.0)
+        
+        # TQQQ SMAs
+        tq_sma_50 = tqqq_signals.get("tqqq_sma_50", 0.0)
+        tq_sma_200 = tqqq_signals.get("tqqq_sma_200", 0.0)
+        tq_sma_250 = tqqq_signals.get("tqqq_sma_250", 0.0)
 
         if "TQQQ" in signal:
             color_tag = "green" if "HEAVY" in signal else "blue"
@@ -2685,9 +2695,66 @@ def render_tqqq_sqqq_signals():
         else:
             color_tag = "gray"
 
-        st.markdown(f"### Signal: :{color_tag}[{signal}]")
-        st.markdown(f"**Regime:** {regime} | **Confidence:** {confidence:.0f}%")
+        # Split into two main columns: Signal on left, SMAs on right
+        head_col1, head_col2 = st.columns([1, 2])
         
+        with head_col1:
+            st.markdown(f"### Signal: :{color_tag}[{signal}]")
+            st.markdown(f"**Regime:** {regime} | **Confidence:** {confidence:.0f}%")
+            
+            # Extract prices
+            qqq_price = tqqq_signals.get("current_price", 0.0)
+            tqqq_price = tqqq_signals.get("tqqq_current_price", 0.0)
+            
+            # Add a little spacing before the prices
+            st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+            
+            # Display side-by-side prices
+            p1, p2 = st.columns(2)            
+            # Helper to generate the colored sub-text
+            def _sma_status(price, sma_val, label):
+                if not sma_val or sma_val == 0: return ""
+                pct = ((price - sma_val) / sma_val) * 100
+                color = "#00E676" if pct > 0 else "#EF5350"
+                return f"<span style='color:{color};'>{pct:+.1f}%</span> vs {label}<br>"
+            
+            with p1:
+                st.metric("QQQ Price", f"${qqq_price:.2f}")
+                
+                # QQQ SMA distances
+                qqq_subtext = (
+                    _sma_status(qqq_price, sma_50, "50") +
+                    _sma_status(qqq_price, sma_200, "200") +
+                    _sma_status(qqq_price, sma_250, "250")
+                )
+                st.markdown(f"<div style='font-size:0.75rem; line-height:1.5; margin-top:-0.5rem;'>{qqq_subtext}</div>", unsafe_allow_html=True)
+
+            with p2:
+                st.metric("TQQQ Price", f"${tqqq_price:.2f}")
+                
+                # TQQQ SMA distances
+                tqqq_subtext = (
+                    _sma_status(tqqq_price, tq_sma_50, "50") +
+                    _sma_status(tqqq_price, tq_sma_200, "200") +
+                    _sma_status(tqqq_price, tq_sma_250, "250")
+                )
+                st.markdown(f"<div style='font-size:0.75rem; line-height:1.5; margin-top:-0.5rem;'>{tqqq_subtext}</div>", unsafe_allow_html=True)
+            
+        with head_col2:
+            # Row 1: QQQ SMAs
+            st.markdown("**QQQ** *(Signal Source)*")
+            q1, q2, q3 = st.columns(3)
+            q1.metric("SMA 50", f"${sma_50:.2f}")
+            q2.metric("SMA 200", f"${sma_200:.2f}")
+            q3.metric("SMA 250", f"${sma_250:.2f}")
+            
+            # Row 2: TQQQ SMAs
+            st.markdown("**TQQQ** *(Trading Vehicle)*")
+            t1, t2, t3 = st.columns(3)
+            t1.metric("SMA 50", f"${tq_sma_50:.2f}")
+            t2.metric("SMA 200", f"${tq_sma_200:.2f}")
+            t3.metric("SMA 250", f"${tq_sma_250:.2f}")
+            
         st.divider()
 
         # --- Side-by-Side Strategy Targets ---
@@ -2899,31 +2966,21 @@ def render_tqqq_sqqq_signals():
 
                 _breakdown = ""
                 if _unreal.get("tqqq") is not None and _unreal.get("sqqq") is not None:
-                    _breakdown = (
-                        f"TQQQ ${_unreal['tqqq']:+,.2f} · "
-                        f"SQQQ ${_unreal['sqqq']:+,.2f}"
-                    )
+                    # Add 0.0 to clean up negative zeros (e.g., -0.00 becomes 0.00)
+                    _tq_val = _unreal['tqqq'] + 0.0
+                    _sq_val = _unreal['sqqq'] + 0.0
+                    _breakdown = f"TQQQ ${_tq_val:+,.2f} · SQQQ ${_sq_val:+,.2f}"
 
-                st.markdown(f"""
-                <div style="background-color:{_u_bg}; border:2px solid {_u_color};
-                            border-radius:10px; padding:1.25rem; margin:0.75rem 0;">
-                    <div style="color:#9aa0a6; font-size:0.7rem; text-transform:uppercase;
-                                letter-spacing:0.05em;">
-                        Unrealized P&amp;L (open positions)
-                    </div>
-                    <div style="color:{_u_color}; font-size:2rem; font-weight:700;
-                                line-height:1.1; margin-top:0.35rem;">
-                        {_u_icon} {_u_text}
-                    </div>
-                    <div style="color:{_u_color}; font-size:1rem; font-weight:600;
-                                margin-top:0.15rem;">
-                        {_u_pct_text}
-                    </div>
-                    <div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.6rem;">
-                        {_breakdown}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                # Render as a single continuous string to prevent Markdown code-block formatting
+                st.markdown(
+                    f'<div style="background-color:{_u_bg}; border:2px solid {_u_color}; border-radius:10px; padding:1.25rem; margin:0.75rem 0;">'
+                    f'<div style="color:#9aa0a6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Unrealized P&amp;L (open positions)</div>'
+                    f'<div style="color:{_u_color}; font-size:2rem; font-weight:700; line-height:1.1; margin-top:0.35rem;">{_u_icon} {_u_text}</div>'
+                    f'<div style="color:{_u_color}; font-size:1rem; font-weight:600; margin-top:0.15rem;">{_u_pct_text}</div>'
+                    f'<div style="color:#9aa0a6; font-size:0.72rem; margin-top:0.6rem;">{_breakdown}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
         else:
             st.info(
                 "Cumulative P&L will appear once capital and a current position are recorded."

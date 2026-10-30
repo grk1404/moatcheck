@@ -78,7 +78,7 @@ CONFIG = {
     "bnf_cooldown_hours": 168,       # 7 days per ticker (panic events cluster)
     
     # TQQQ daily signal alert
-    "tqqq_signal_interval_hours": 24,       # once per day
+    "tqqq_signal_interval_hours": 22,       # once per day
     "tqqq_signal_target_hour_ct": 14,       # 2 PM Central Time
     "tqqq_signal_target_minute_ct": 45,     # at 2:45 PM CT
     "tqqq_signal_window_minutes": 15,       # fire if within ±15 minutes
@@ -585,10 +585,12 @@ def check_tqqq_signal() -> dict | None:
 
         target_tq = float(r["target_tqqq_pct"])
         target_sq = float(r["target_sqqq_pct"])
+        target_cash = float(r.get("target_cash_pct", 100.0 - target_tq - target_sq))
 
         pos = load_position()
         cur_tq = float(pos.get("tqqq_shares", 0.0))
         cur_sq = float(pos.get("sqqq_shares", 0.0))
+        cur_cash = float(pos.get("cash_balance", 0.0))  # NEW: Read cash balance
 
         try:
             tq_px = float(get_ticker("TQQQ").history(period="1d")["Close"].iloc[-1])
@@ -596,7 +598,8 @@ def check_tqqq_signal() -> dict | None:
         except Exception:
             return None
 
-        account_value = cur_tq * tq_px + cur_sq * sq_px
+        # FIX: Include cash in the total account value
+        account_value = (cur_tq * tq_px) + (cur_sq * sq_px) + cur_cash
         if account_value <= 0:
             return None
 
@@ -630,6 +633,7 @@ def check_tqqq_signal() -> dict | None:
             "regime": r["regime"],
             "target_tqqq_pct": target_tq,
             "target_sqqq_pct": target_sq,
+            "target_cash_pct": target_cash,
             "account_value": account_value,
             "tqqq_target_shares": tq_target_shares,
             "sqqq_target_shares": sq_target_shares,
@@ -652,17 +656,20 @@ def _run_tqqq_signal_check(state: dict) -> int:
         return 0
 
     key = "TQQQ_SIGNAL"
-    if not should_alert(key, "_daily", state, 20):   # 20h cooldown
+    if not should_alert(key, "_daily", state, 12):   # 12h cooldown
         return 0
 
     action_icon = "🎯" if info["needs_action"] else "😴"
 
     lines = [
-        f"{action_icon} TQQQ Signal — {info['signal']}",
+        f"{action_icon} TQQQ Regime — {info['signal']}",
         f"Regime: {info['regime']}",
-        f"Target: {info['target_tqqq_pct']:.2f}% TQQQ / {info['target_sqqq_pct']:.2f}% SQQQ",
-        f"Sleeve value: {info['account_value']:.2f} USD",
+        f"Total Sleeve: {info['account_value']:.2f} USD",
         "",
+        f"🎯 TARGETS:",
+        f"TQQQ: {info['target_tqqq_pct']:.1f}% | SQQQ: {info['target_sqqq_pct']:.1f}% | Cash: {info['target_cash_pct']:.1f}%",
+        "",
+        f"⚡ ACTIONS:",
         f"TQQQ: {info['tqqq_action']}",
         f"SQQQ: {info['sqqq_action']}",
     ]
