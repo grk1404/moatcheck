@@ -332,7 +332,6 @@ def repair_trade_log() -> int:
 
     return repaired
 
-@st.cache_data(ttl=60, show_spinner=False)
 def load_trades() -> pd.DataFrame:
     """Load the trade log as a DataFrame (empty if no file yet).
 

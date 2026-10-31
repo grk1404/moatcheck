@@ -94,14 +94,7 @@ def _compute_indicators_at(qqq_window: pd.DataFrame) -> dict:
 
 
 def _vote_7step(ind: dict) -> float:
-    """Run the 7 sub-strategy votes on a single day's indicators.
-
-    Mirrors strategies.py's strategy_momentum_long, strategy_mean_reversion,
-    strategy_bb_reversion, strategy_bb_width, strategy_momentum_short,
-    strategy_short_reversion, strategy_bear_bounce_fade.
-
-    Returns the average target_tqqq in [0, 1].
-    """
+    """Run the 7 sub-strategy votes on a single day's indicators."""
     price = ind["price"]
     sma_50 = ind["sma_50"]
     regime = ind["regime"]
@@ -112,12 +105,12 @@ def _vote_7step(ind: dict) -> float:
     votes = []
 
     # S1 — Momentum Long
-    if regime == "BULL" and (sma_50 is None or price > sma_50):
+    if regime == "BULL":
         votes.append(1.0)
     elif regime == "BEAR":
         votes.append(0.0)
     else:
-        votes.append(0.3)
+        votes.append(0.5) # <--- UPDATED: Neutral is now 0.5
 
     # S2 — Mean Reversion
     if dist < -0.08 and regime != "BEAR":
@@ -138,22 +131,20 @@ def _vote_7step(ind: dict) -> float:
     # S4 — BB Width Momentum Confirmation
     if regime == "BULL" and bb_width > 0.08:
         votes.append(0.9)
-    elif regime == "BULL":
-        votes.append(0.5)
     else:
-        votes.append(0.2)
+        votes.append(0.5) # <--- UPDATED
 
     # S5 — Momentum Short
     if regime == "BEAR":
         votes.append(0.0)
     else:
-        votes.append(0.7)
+        votes.append(0.5) # <--- UPDATED
 
     # S6 — Short Overbought Fade
     if dist > 0.12 and regime != "BULL":
         votes.append(0.1)
     else:
-        votes.append(0.6)
+        votes.append(0.5) # <--- UPDATED
 
     # S7 — Bear Bounce Fade
     if regime == "BEAR" and dist > -0.02:

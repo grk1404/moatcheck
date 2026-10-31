@@ -36,14 +36,36 @@ import pandas as pd
 import numpy as np
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+import json
+from pathlib import Path
 
-NEUTRAL = 0.5            # vote used when a system has no signal
-REGIME_LONG_MA = 250     # 250 matches Mallik's blog; set to 200 for the old behaviour
-MIN_ROWS = 250           # minimum valid QQQ rows required
-ALLOCATION_MODE = "continuous"   # "continuous" or "legacy"
+# ============================================================
+# CONFIG LOADER
+# ============================================================
+def load_dial_settings() -> dict:
+    """Read the dial settings from JSON, fallback to conservative defaults."""
+    defaults = {
+        "dead_zone": 0.02,
+        "high_vol_multiplier": 1.2,
+        "low_vol_multiplier": 0.8,
+        "regime_long_ma": 250
+    }
+    path = Path("data/dial_settings.json")
+    if path.exists():
+        try:
+            user_settings = json.loads(path.read_text())
+            defaults.update(user_settings)
+        except Exception as e:
+            print(f"Error reading dial_settings.json: {e}")
+    return defaults
+
+# Load the settings globally
+SETTINGS = load_dial_settings()
+
+NEUTRAL = 0.5            
+REGIME_LONG_MA = SETTINGS["regime_long_ma"]
+MIN_ROWS = 250           
+ALLOCATION_MODE = "continuous"
 
 
 # ============================================================
@@ -51,10 +73,7 @@ ALLOCATION_MODE = "continuous"   # "continuous" or "legacy"
 # ============================================================
 
 def dial_to_allocation(dial: float, mode: Optional[str] = None) -> dict:
-    """
-    Convert a 0..1 dial into fractions {tqqq, sqqq, cash} that sum to 1.
-    Uses a 48%-52% cash dead-zone, but does NOT dampen exposure outside the zone.
-    """
+    """Convert dial to allocation using the JSON settings."""
     mode = mode or ALLOCATION_MODE
     try:
         dial = float(dial)
@@ -64,27 +83,19 @@ def dial_to_allocation(dial: float, mode: Optional[str] = None) -> dict:
         return {"tqqq": 0.0, "sqqq": 0.0, "cash": 1.0}
 
     dial = max(0.0, min(1.0, dial))
-    
-    DEAD_ZONE = 0.02  # 0.48 to 0.52 is 100% Cash
+    dead_zone = SETTINGS["dead_zone"]
 
-    if dial >= 0.50 + DEAD_ZONE:
-        # Direct allocation. If dial is 0.70, TQQQ is 70%.
+    if dial >= 0.50 + dead_zone:
         tqqq = dial
         sqqq = 0.0
-    elif dial <= 0.50 - DEAD_ZONE:
-        # Direct allocation. If dial is 0.30, SQQQ is 70% (1.0 - 0.30).
+    elif dial <= 0.50 - dead_zone:
         tqqq = 0.0
         sqqq = 1.0 - dial
     else:
-        # Inside the dead zone
         tqqq = 0.0
         sqqq = 0.0
 
-    # Clamp to ensure safety
-    tqqq = max(0.0, min(1.0, tqqq))
-    sqqq = max(0.0, min(1.0, sqqq))
     cash = max(0.0, 1.0 - tqqq - sqqq)
-
     return {"tqqq": tqqq, "sqqq": sqqq, "cash": cash}
 
 
@@ -480,21 +491,22 @@ def run_all_strategies(
 
     # 2. Conviction multiplier
     if ind["regime"] in ("BULL", "BEAR") and ind["bb_width"] > 0.10:
-        position_multiplier = 1.2
+        position_multiplier = SETTINGS["high_vol_multiplier"]
     else:
-        position_multiplier = 0.8
+        position_multiplier = SETTINGS["low_vol_multiplier"]
 
+    # 3. Apply multiplier and clamp between 0.0 and 1.0 (LEAVE THIS EXACTLY AS IS)
     dial = max(0.0, min(1.0, 0.5 + deviation * position_multiplier))
 
-    # 3. Dial -> allocation
+    # 4. Dial -> allocation (CALLS THE UPDATED dial_to_allocation FUNCTION)
     alloc = dial_to_allocation(dial)
     target_tqqq, target_sqqq, target_cash = alloc["tqqq"], alloc["sqqq"], alloc["cash"]
 
-    # 4. Signal label and confidence from the dial
+    # 5. Signal label and confidence from the dial
     signal, signal_type = _classify_signal(dial)
     confidence = abs(dial - 0.5) * 200
 
-    # 5. Average conviction (diagnostic only)
+    # 6. Average conviction (diagnostic only)
     avg_conviction = sum(abs(v - 0.5) * 2 for v in votes) / len(votes)
 
     mallik_live = get_mallik_live_target(data)
