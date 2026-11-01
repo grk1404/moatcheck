@@ -2759,8 +2759,10 @@ def render_tqqq_sqqq_signals():
 
         # --- Side-by-Side Strategy Targets ---
         st.markdown("#### 🎯 Strategy Targets")
-        c1, c2 = st.columns(2)
-        
+        from sleeves_strategy import get_sleeve_target
+        _sl = get_sleeve_target()
+        c1, c2, c3 = st.columns(3)
+
         with c1:
             st.markdown("**MoatCheck (7-Strategy Ensemble)**")
             a1, a2, a3 = st.columns(3)
@@ -2774,7 +2776,17 @@ def render_tqqq_sqqq_signals():
             m1.metric("TQQQ Target", f"{tqqq_signals['mallik_tqqq_pct']:.1f}%")
             m2.metric("SQQQ Target", f"{tqqq_signals['mallik_sqqq_pct']:.1f}%")
             m3.metric("Cash",        f"{tqqq_signals['mallik_cash_pct']:.1f}%")
-            
+
+        with c3:
+            st.markdown("**Sleeves (NDX Trend, Long-or-Cash)**")
+            if _sl.get("error"):
+                st.warning(_sl["error"])
+            else:
+                l1, l2, l3 = st.columns(3)
+                l1.metric("TQQQ Target", f"{_sl['tqqq_pct']:.1f}%")
+                l2.metric("SQQQ Target", f"{_sl['sqqq_pct']:.1f}%")
+                l3.metric("Cash",        f"{_sl['cash_pct']:.1f}%")
+
         st.divider()
 
         # Per-strategy vote breakdown
@@ -2857,7 +2869,7 @@ def render_tqqq_sqqq_signals():
         net_cap = starting + deposits - withdrawals
 
         if "tqqq_capital" not in st.session_state:
-            st.session_state["tqqq_capital"] = net_cap
+            st.session_state["tqqq_capital"] = net_cap if net_cap >= 100.0 else 5000.0
 
         # Fetch prices BEFORE rendering the row so everything lands on one line
         try:
@@ -3141,6 +3153,37 @@ def render_tqqq_sqqq_signals():
             # Show Mallik Sim Actions
             st.markdown("**Mallik Sim Strategy** *(For Reference)*")
             render_action_block(mallik_rebalance)
+
+            # --- Sleeve strategy (trend-regime sleeve, long-or-cash) ---
+            st.markdown("---")
+            st.markdown("**Sleeve Strategy** *(trend regime on NDX, long-or-cash)*")
+            if _sl.get("error"):
+                st.warning(_sl["error"])
+            else:
+                _sl_t = compute_target_shares(
+                    account_value=account_value,
+                    tqqq_target_pct=_sl["tqqq_pct"],
+                    sqqq_target_pct=_sl["sqqq_pct"],
+                    tqqq_price=tqqq_price,
+                    sqqq_price=sqqq_price,
+                )
+                _sl_r = compute_rebalance(
+                    current_tqqq_shares=current_tqqq,
+                    current_sqqq_shares=current_sqqq,
+                    tqqq_target_shares=_sl_t["tqqq_target_shares"],
+                    sqqq_target_shares=_sl_t["sqqq_target_shares"],
+                    tqqq_price=tqqq_price,
+                    sqqq_price=sqqq_price,
+                )
+                s1, s2, s3 = st.columns(3)
+                s1.metric("TQQQ", f"{_sl['tqqq_pct']:.1f}%", f"${_sl_t['tqqq_target_value']:,.2f}")
+                s2.metric("SQQQ", f"{_sl['sqqq_pct']:.1f}%", f"${_sl_t['sqqq_target_value']:,.2f}")
+                s3.metric("Cash", f"{_sl['cash_pct']:.1f}%", f"${_sl_t['cash_value']:,.2f}")
+                st.caption(
+                    f"NDX regime: {_sl['regime']} · as of {_sl['as_of']} · "
+                    f"target {_sl_t['tqqq_target_shares']:.4f} TQQQ / {_sl_t['sqqq_target_shares']:.4f} SQQQ shares"
+                )
+                render_action_block(_sl_r)
 
             # Log trade buttons
             # Snapshot signal + target so a refresh between display and click

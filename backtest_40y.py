@@ -216,64 +216,61 @@ def run_mode(label: str, qqq: pd.DataFrame, tqqq: pd.DataFrame, sqqq: pd.DataFra
         "qqq_df": qqq, "tqqq_df": tqqq, "sqqq_df": sqqq
     }
 
+def _equity_from_targets(targets: pd.DataFrame, start_ts: pd.Timestamp, r: dict, starting_cash: float) -> pd.Series:
+    """Run a target frame through the same execution engine, from start_ts on."""
+    t = targets[targets.index >= start_ts]
+    return execute(t, r["tqqq_df"], r["sqqq_df"], starting_cash=starting_cash).equity
+
+
 def print_monthly_returns(equity: pd.Series, starting_cash: float, r: dict):
-    qqq_df = r["qqq_df"]
-    tqqq_df = r["tqqq_df"]
-    sqqq_df = r["sqqq_df"]
-    
-    mallik_eq = None
-    if qqq_df is not None:
-        mallik_targets = generate_mallik_signals(qqq_df)
-        common_dates = mallik_targets.index.intersection(tqqq_df.index)
-        mallik_targets = mallik_targets.loc[common_dates]
-        res = execute(mallik_targets, tqqq_df.loc[common_dates], sqqq_df.loc[common_dates], starting_cash=starting_cash)
-        mallik_eq = res.equity
+    from sleeves_strategy import build_sleeve_targets
 
-    start_date = equity.index[0] - pd.Timedelta(1, unit='D')
-    eq_with_start = pd.concat([pd.Series([starting_cash], index=[start_date]), equity])
-    monthly_returns = eq_with_start.resample('ME').last().pct_change().dropna()
-    
-    if mallik_eq is not None:
-        mallik_with_start = pd.concat([pd.Series([starting_cash], index=[start_date]), mallik_eq])
-        monthly_mallik = mallik_with_start.resample('ME').last().pct_change().dropna()
-    else:
-        monthly_mallik = None
+    start_ts = equity.index[0]
+    base_date = start_ts - pd.Timedelta(1, unit='D')
 
-    monthly_bh = None
-    if tqqq_df is not None:
-        tqqq_px = tqqq_df["Close"]
-        bh_with_start = tqqq_px.reindex([start_date]).ffill().fillna(100.0).iloc[0]
-        bh_series = pd.concat([pd.Series([bh_with_start], index=[start_date]), tqqq_px])
-        monthly_bh = bh_series.resample('ME').last().pct_change().dropna()
-    
-    print(f"\n{'=' * 95}\nMONTHLY RETURNS: MOATCHECK vs MALLIK SIM vs BUY & HOLD\n{'=' * 95}")
-    print(f"{'Month':<10} | {'MoatCheck':<10} | {'Mallik Sim':<11} | {'Buy&Hold':<10} | {'MC vs Mallik':<12} | {'MC vs BH':<10}")
-    print("-" * 90)
-    
-    for date, ret in monthly_returns.items():
-        our_ret = ret * 100
-        m_ret = monthly_mallik.get(date) * 100 if monthly_mallik is not None and date in monthly_mallik.index else 0.0
-        bh_ret = monthly_bh.get(date) * 100 if monthly_bh is not None and date in monthly_bh.index else 0.0
-        print(f"{date.strftime('%Y-%m'):<10} | {our_ret:>+9.2f}% | {m_ret:>+10.2f}% | {bh_ret:>+9.2f}% | {(our_ret - m_ret):>+11.2f}% | {(our_ret - bh_ret):>+9.2f}%")
-            
-    print("-" * 90)
-    import math
+    # All strategies use the same window, data and execution engine.
+    mallik_eq = _equity_from_targets(generate_mallik_signals(r["qqq_df"]), start_ts, r, starting_cash)
+    sleeve_eq = _equity_from_targets(build_sleeve_targets(r["qqq_df"]["Close"]), start_ts, r, starting_cash)
+
+    bh_px = r["tqqq_df"]["Close"]
+    bh_px = bh_px[bh_px.index >= start_ts]
+
+    curves = {
+        "MoatCheck": (equity, starting_cash),
+        "Mallik Sim": (mallik_eq, starting_cash),
+        "Sleeves": (sleeve_eq, starting_cash),
+        "Buy&Hold": (bh_px, float(bh_px.iloc[0])),
+    }
+    monthly = {}
+    for name, (curve, base) in curves.items():
+        with_base = pd.concat([pd.Series([base], index=[base_date]), curve])
+        monthly[name] = with_base.resample('ME').last().pct_change().dropna()
+
+    names = list(curves)
+    width = 12 + 14 * len(names)
+    print(f"\n{'=' * width}\nMONTHLY RETURNS: MOATCHECK vs MALLIK SIM vs SLEEVES vs BUY & HOLD\n{'=' * width}")
+    print(f"{'Month':<9}" + "".join(f"| {n:>11} " for n in names))
+    print("-" * width)
+
+    for date in monthly["MoatCheck"].index:
+        cells = []
+        for n in names:
+            v = monthly[n].get(date)
+            cells.append(f"| {v * 100:>+10.2f}% " if v is not None else f"| {'n/a':>11} ")
+        print(f"{date.strftime('%Y-%m'):<9}" + "".join(cells))
+
+    print("-" * width)
     years = (equity.index[-1] - equity.index[0]).days / 365.25
-    our_total = (equity.iloc[-1] / starting_cash - 1.0) * 100
-    our_cagr = ((equity.iloc[-1] / starting_cash) ** (1 / years) - 1) * 100
-    
-    mallik_total, mallik_cagr = 0.0, 0.0
-    if mallik_eq is not None:
-        mallik_total = (mallik_eq.iloc[-1] / starting_cash - 1.0) * 100
-        mallik_cagr = ((mallik_eq.iloc[-1] / starting_cash) ** (1 / years) - 1) * 100
-
-    bh_total, bh_cagr = 0.0, 0.0
-    if monthly_bh is not None and not monthly_bh.empty:
-        bh_total = (math.prod(1 + r for r in monthly_bh) - 1) * 100
-        bh_cagr = ((1 + bh_total/100) ** (1 / years) - 1) * 100
-        
-    print(f"{'TOTAL':<10} | {our_total:>+9.2f}% | {mallik_total:>+10.2f}% | {bh_total:>+9.2f}%")
-    print(f"{'CAGR':<10} | {our_cagr:>+9.2f}% | {mallik_cagr:>+10.2f}% | {bh_cagr:>+9.2f}%")
+    totals, cagrs, dds = [], [], []
+    for n in names:
+        curve, base = curves[n]
+        growth = curve.iloc[-1] / base
+        totals.append(f"| {(growth - 1) * 100:>+10.2f}% ")
+        cagrs.append(f"| {(growth ** (1 / years) - 1) * 100:>+10.2f}% ")
+        dds.append(f"| {(curve / curve.cummax() - 1).min() * 100:>+10.2f}% ")
+    print(f"{'TOTAL':<9}" + "".join(totals))
+    print(f"{'CAGR':<9}" + "".join(cagrs))
+    print(f"{'MAX DD':<9}" + "".join(dds))
 
 def print_summary(r: dict, starting_cash: float = 10000.0) -> None:
     if not r: return
