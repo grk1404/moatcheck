@@ -226,7 +226,7 @@ def print_monthly_returns(equity: pd.Series, starting_cash: float, r: dict):
     from sleeves_strategy import build_sleeve_targets
 
     start_ts = equity.index[0]
-    base_date = start_ts - pd.Timedelta(1, unit='D')
+    base_date = start_ts - pd.offsets.MonthEnd(1)  # prior month-end, so the first month is not dropped
 
     # All strategies use the same window, data and execution engine.
     mallik_eq = _equity_from_targets(generate_mallik_signals(r["qqq_df"]), start_ts, r, starting_cash)
@@ -324,9 +324,10 @@ def main():
     if args.mode in ("synthetic", "both"):
         start = args.start or "1986-01-01"
         print(f"\n[synthetic] fetching QQQ {start} → {args.end} (QQQ inception 1999)")
-        qqq = fetch_qqq(start, args.end)
+        fetch_start = (pd.to_datetime(start) - pd.Timedelta(365, unit='D')).strftime("%Y-%m-%d") if args.start else start
+        qqq = fetch_qqq(fetch_start, args.end)
         tqqq, sqqq = synth_tqqq_sqqq_from_qqq(qqq, financing_spread=args.financing_spread)
-        r = run_mode(f"SYNTHETIC 3x {qqq.index[0].date()} → {qqq.index[-1].date()}", qqq, tqqq, sqqq, start_date=None, starting_cash=args.starting_cash)
+        r = run_mode(f"SYNTHETIC 3x {args.start or qqq.index[0].date()} → {qqq.index[-1].date()}", qqq, tqqq, sqqq, start_date=args.start, starting_cash=args.starting_cash)
         
         print_summary(r, args.starting_cash)
         if r:
@@ -335,7 +336,7 @@ def main():
             pd.DataFrame({"tqqq": r["result"].tqqq_weight, "sqqq": r["result"].sqqq_weight, "cash": r["result"].cash_weight}).to_csv(f"{args.out_prefix}_synth_weights.csv")
 
     print(f"\n{'=' * 60}\nVALIDATION TARGET — Mallik's Collective2 (2022-07-23 → today)\n{'=' * 60}")
-    print("  CAGR:                 +22.2%\n  Max drawdown:         -37.58%\n  Win rate:             39.2%")
+    print("  CAGR:                 +20.7%\n  Max drawdown:         -37.58%\n  Win rate:             38.2%  (102 trades, avg 13.2 days)")
     print("\nIf REAL mode's CAGR is wildly different (e.g., +80% vs +22%),")
     print("our implementation is NOT Mallik's strategy.")
 

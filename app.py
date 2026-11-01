@@ -2654,7 +2654,8 @@ def render_tqqq_sqqq_signals():
             # This forces the app to reach out to Yahoo Finance and download fresh data
             clear_yfinance_cache("QQQ")
             clear_yfinance_cache("TQQQ")
-            clear_yfinance_cache("SQQQ")            
+            clear_yfinance_cache("SQQQ")
+            clear_yfinance_cache("^NDX")  # sleeve strategy signal source
             st.rerun()
             
     with refresh_col2:
@@ -2786,6 +2787,11 @@ def render_tqqq_sqqq_signals():
                 l1.metric("TQQQ Target", f"{_sl['tqqq_pct']:.1f}%")
                 l2.metric("SQQQ Target", f"{_sl['sqqq_pct']:.1f}%")
                 l3.metric("Cash",        f"{_sl['cash_pct']:.1f}%")
+                _stale = _sl["as_of"] is not None and _sl["as_of"] < datetime.now().date() - timedelta(days=3)
+                st.caption(
+                    f"NDX regime: {_sl['regime']} · data as of {_sl['as_of']}"
+                    + (" ⚠️ stale" if _stale else "")
+                )
 
         st.divider()
 
@@ -3188,8 +3194,22 @@ def render_tqqq_sqqq_signals():
             # Log trade buttons
             # Snapshot signal + target so a refresh between display and click
             # can't desync what gets logged
-            signal_snapshot = tqqq_signals["signal"]
-            target_snapshot = tqqq_signals["target_tqqq_pct"]
+            # Logged against the SLEEVE strategy (the one being traded). If the
+            # sleeve is unavailable, fall back to the dial and label it as such.
+            if _sl.get("error"):
+                _log_rb = rebalance
+                signal_snapshot = f"DIAL-FALLBACK {tqqq_signals['signal']}"
+                target_snapshot = tqqq_signals["target_tqqq_pct"]
+                sqqq_target_snapshot = tqqq_signals["target_sqqq_pct"]
+                cash_target_snapshot = tqqq_signals["target_cash_pct"]
+                log_notes = "sleeve unavailable"
+            else:
+                _log_rb = _sl_r
+                signal_snapshot = f"SLEEVE {_sl['regime']}"
+                target_snapshot = _sl["tqqq_pct"]
+                sqqq_target_snapshot = _sl["sqqq_pct"]
+                cash_target_snapshot = _sl["cash_pct"]
+                log_notes = f"sleeve as_of={_sl['as_of']}; dial={tqqq_signals['signal']} {tqqq_signals['target_tqqq_pct']:.1f}%"
 
             st.markdown("**Log These Trades**")
             st.caption("Enter the actual share count from your Fidelity fill confirmation.")
@@ -3203,7 +3223,7 @@ def render_tqqq_sqqq_signals():
                 )
                 if st.button("✅ Log TQQQ trade", key="log_tqqq"):
                     if actual_tqqq_fill > 0:
-                        delta = rebalance["tqqq_delta_shares"]
+                        delta = _log_rb["tqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
 
                         log_trade(
@@ -3212,9 +3232,10 @@ def render_tqqq_sqqq_signals():
                             price=tqqq_price,
                             signal=signal_snapshot,
                             tqqq_target_pct=target_snapshot,
-                            sqqq_target_pct=tqqq_signals["target_sqqq_pct"],
-                            cash_target_pct=tqqq_signals["target_cash_pct"],
+                            sqqq_target_pct=sqqq_target_snapshot,
+                            cash_target_pct=cash_target_snapshot,
                             account_value=account_value,
+                            notes=log_notes,
                         )
 
                         _pos = load_position()
@@ -3264,7 +3285,7 @@ def render_tqqq_sqqq_signals():
                 )
                 if st.button("✅ Log SQQQ trade", key="log_sqqq"):
                     if actual_sqqq_fill > 0:
-                        delta = rebalance["sqqq_delta_shares"]
+                        delta = _log_rb["sqqq_delta_shares"]
                         action = "BUY" if delta > 0 else "SELL"
 
                         log_trade(
@@ -3273,9 +3294,10 @@ def render_tqqq_sqqq_signals():
                             price=sqqq_price,
                             signal=signal_snapshot,
                             tqqq_target_pct=target_snapshot,
-                            sqqq_target_pct=tqqq_signals["target_sqqq_pct"],
-                            cash_target_pct=tqqq_signals["target_cash_pct"],
+                            sqqq_target_pct=sqqq_target_snapshot,
+                            cash_target_pct=cash_target_snapshot,
                             account_value=account_value,
+                            notes=log_notes,
                         )
 
                         _pos = load_position()
