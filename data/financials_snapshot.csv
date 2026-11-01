@@ -1,0 +1,4 @@
+ticker,current_price,market_cap,pe_ratio_ttm,analyst_5yr_growth,shares_outstanding,dividend_yield,beta,book_value_per_share,analyst_rec_key,analyst_rec_mean,analyst_count,analyst_target_mean,analyst_target_high,analyst_target_low,company_name,data_source,data_source_note,exchange
+AAPL,334.3299865722656,4879272003433.228,38.184845,0.287,14594180000.0,0.0033,1.085,7.36,buy,2.20455,39,327.1964,405.0,215.0,Apple Inc.,yfinance,,NMS
+MSFT,497.2650146484375,3692463987354.754,27.714603,0.317,7425545491.0,0.008,1.108,59.565,strong_buy,1.36364,52,572.91516,870.0,400.0,Microsoft Corporation,yfinance,,NMS
+NVDA,225.50999450683594,5445389837356.567,27.729456,1.278,24147000000.0,0.004699999999999999,2.217,9.483,strong_buy,1.29508,58,328.4879,515.0,180.0,NVIDIA Corporation,yfinance,,NMS

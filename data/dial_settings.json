@@ -1,0 +1,6 @@
+{
+  "dead_zone": 0.00,
+  "high_vol_multiplier": 1.2,
+  "low_vol_multiplier": 1.0,
+  "regime_long_ma": 250
+}
