@@ -3452,7 +3452,8 @@ def render_backtest() -> None:
         "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry.\n"
         "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high.\n"
         "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high.\n"
-        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below."
+        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below.\n"
+        "- **Sleeve (NDX Trend)** — the TQQQ Signals page sleeve: ^NDX 50d/250d trend regime with a volatility overlay, moved toward target at most 10%/day. Holds a fractional TQQQ weight, rest in cash (no SQQQ)."
     )
 
     # ---------- Import lazily so the page only loads its deps when opened ----------
@@ -3566,7 +3567,7 @@ def render_backtest() -> None:
                 
                 # 2. Slice prices and signal to just the user's chosen window
                 prices_sliced = prices[prices.index >= start_ts].copy()
-                signal_sliced = signal.reindex(prices_sliced.index).fillna(0).astype(int)
+                signal_sliced = signal.reindex(prices_sliced.index).fillna(0.0).astype(float)
                 
                 # 3. Run a fresh backtest on ONLY the sliced data (no extra warmup needed here)
                 results[name] = run_backtest(
@@ -3670,7 +3671,7 @@ def render_backtest() -> None:
     import plotly.graph_objects as go
     fig = go.Figure()
 
-    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726"]
+    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726", "#26C6DA", "#F06292"]
     for i, (name, r) in enumerate(results.items()):
         color = strategy_colors[i % len(strategy_colors)]
         fig.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=name, line=dict(color=color, width=2.5)))

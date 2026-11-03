@@ -28,9 +28,10 @@ NEUTRAL = 0.5
 REGIME_LONG_MA = 250
 
 # --- BACKTEST GLOBALS ---
-DEAD_ZONE = 0.00
-HIGH_VOL_MULT = 1.0
-LOW_VOL_MULT = 1.0
+DEAD_ZONE = 0.05        #The Cash Buffer. 0 means ZERO cash and always invested. 
+HIGH_VOL_MULT = 1.5     #The Trend Amplifier. When the market is in a confirmed BULL or BEAR trend and the Bollinger Bands are wide (volatile), it multiplies the signal by this number.
+LOW_VOL_MULT = 0.5      #The Chop Dampener. When the market is choppy (narrow Bollinger Bands) and the regime is NEUTRAL, it cuts the signal in half if the value is 0.5. 1 means no dampening.
+MEAN_REVERSION_THRESHOLD = -0.05  # The Dip Buyer. If the price drops this far below its 50-day average, it triggers an 50% (-0.05)TQQQ buy to catch the bounce (e.g., -0.08 means an 8% drop).
 
 def dial_to_allocation(dial: float) -> dict:
     dial = max(0.0, min(1.0, dial))
@@ -83,7 +84,7 @@ def build_strategy_targets(qqq_df: pd.DataFrame) -> pd.DataFrame:
         elif regime == "BEAR": votes.append(0.0)
         else: votes.append(NEUTRAL)
         # 2. Mean Reversion
-        if dist_50 < -0.08 and regime != "BEAR": votes.append(0.8)
+        if dist_50 < MEAN_REVERSION_THRESHOLD and regime != "BEAR": votes.append(0.8)
         elif dist_50 > 0.10: votes.append(0.2)
         else: votes.append(NEUTRAL)
         # 3. BB Reversion

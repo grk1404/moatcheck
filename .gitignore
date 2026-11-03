@@ -38,9 +38,3 @@ Thumbs.db
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
-# Data files
-*.csv
-*.xlsx
-*.parquet
-data/
-

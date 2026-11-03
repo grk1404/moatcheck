@@ -130,7 +130,7 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
 
     Args:
         prices: DataFrame with TQQQ_open, TQQQ_close, QQQ_close columns.
-        signal: Series of 0 (cash) or 1 (long TQQQ) indexed the same as prices.
+        signal: Series of target TQQQ weight in [0, 1] (0 = cash, 1 = all-in) indexed the same as prices.
                 signal[N] is the position to hold on day N+1.
         starting_cash: initial portfolio value.
         warmup_days: number of trading days to skip at the start. Gives
@@ -151,37 +151,41 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
     if prices.empty:
         raise ValueError(f"After {warmup_days} warm-up days, no price data remains. Use a longer date range.")
 
-    signal = signal.reindex(prices.index).fillna(0).astype(int)
-    position = signal.shift(1).fillna(0).astype(int)
+    # Signal is a target TQQQ weight in [0, 1]. Binary 0/1 strategies are the
+    # special case (all-in / all-cash); fractional weights rebalance at the open.
+    signal = signal.reindex(prices.index).fillna(0.0).astype(float).clip(0.0, 1.0)
+    position = signal.shift(1).fillna(0.0)
 
     n = len(prices)
     cash = float(starting_cash)
     shares = 0.0
+    cur_w = 0.0
     equity_values = np.zeros(n)
     trade_rows = []
-    open_trade = None
+    open_trade = None  # one "trade" = a flat -> invested -> flat episode
 
     for i in range(n):
         date = prices.index[i]
         px_open = float(prices["TQQQ_open"].iloc[i])
         px_close = float(prices["TQQQ_close"].iloc[i])
-        want_long = position.iloc[i] == 1
-        is_long = shares > 0
+        w = float(position.iloc[i])
 
-        if want_long and not is_long and px_open > 0:
-            shares = cash / px_open
-            cash = 0.0
-            open_trade = {"entry_date": date, "entry_price": px_open, "shares": shares}
-
-        elif not want_long and is_long and px_open > 0:
-            proceeds = shares * px_open
-            cash = proceeds
-            if open_trade is not None:
-                pnl = (px_open - open_trade["entry_price"]) * open_trade["shares"]
-                ret_pct = px_open / open_trade["entry_price"] - 1.0
-                trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": date, "entry_price": open_trade["entry_price"], "exit_price": px_open, "shares": open_trade["shares"], "pnl": pnl, "return_pct": ret_pct, "days_held": (date - open_trade["entry_date"]).days})
-            shares = 0.0
-            open_trade = None
+        if px_open > 0 and abs(w - cur_w) > 1e-9:
+            equity_open = cash + shares * px_open
+            if cur_w == 0.0:
+                open_trade = {"entry_date": date, "entry_price": px_open, "shares": 0.0, "equity_in": equity_open}
+            if w == 0.0:
+                shares, cash = 0.0, equity_open
+                pnl = cash - open_trade["equity_in"]
+                trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": date, "entry_price": open_trade["entry_price"], "exit_price": px_open, "shares": open_trade["shares"], "pnl": pnl, "return_pct": cash / open_trade["equity_in"] - 1.0, "days_held": (date - open_trade["entry_date"]).days})
+                open_trade = None
+            else:
+                shares = w * equity_open / px_open
+                cash = equity_open - shares * px_open
+                if abs(cash) < 1e-9:
+                    cash = 0.0
+                open_trade["shares"] = max(open_trade["shares"], shares)
+            cur_w = w
 
         equity_values[i] = cash + shares * px_close
 
@@ -190,9 +194,8 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
 
     if open_trade is not None:
         final_close = float(prices["TQQQ_close"].iloc[-1])
-        pnl = (final_close - open_trade["entry_price"]) * open_trade["shares"]
-        ret_pct = final_close / open_trade["entry_price"] - 1.0
-        trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": prices.index[-1], "entry_price": open_trade["entry_price"], "exit_price": final_close, "shares": open_trade["shares"], "pnl": pnl, "return_pct": ret_pct, "days_held": (prices.index[-1] - open_trade["entry_date"]).days, "open_at_end": True})
+        final_equity = cash + shares * final_close
+        trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": prices.index[-1], "entry_price": open_trade["entry_price"], "exit_price": final_close, "shares": open_trade["shares"], "pnl": final_equity - open_trade["equity_in"], "return_pct": final_equity / open_trade["equity_in"] - 1.0, "days_held": (prices.index[-1] - open_trade["entry_date"]).days, "open_at_end": True})
 
     equity = pd.Series(equity_values, index=prices.index)
     trades_df = pd.DataFrame(trade_rows)
@@ -216,8 +219,8 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
 
     time_in_market = float(position.mean()) if len(position) else 0.0
 
-    if (position == 1).any():
-        first_trade_date = position[position == 1].index[0]
+    if (position > 0).any():
+        first_trade_date = position[position > 0].index[0]
     else:
         first_trade_date = prices.index[0]
 

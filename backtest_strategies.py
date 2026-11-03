@@ -2,7 +2,8 @@
 Backtest strategies for MoatCheck.
 
 Each strategy is a function that takes QQQ (and optionally TQQQ) price history
-and returns a pd.Series of 0/1 signals indexed the same as the input.
+and returns a pd.Series of target TQQQ weights (0/1, or 0..1 for the sleeve)
+indexed the same as the input.
 
 The strategy code must NOT look ahead. For each day i, the signal is computed
 using only data up to and including day i's close. The backtest engine then
@@ -12,6 +13,7 @@ Currently available:
   - signal_buy_hold   : always long (baseline — should match the benchmark)
   - signal_7step      : your live TQQQ/SQQQ 7-step framework, binary long/cash
   - signal_1pct_week  : TASC "One Percent A Week" weekly swing on TQQQ
+  - signal_sleeve     : NDX trend-regime sleeve, fractional TQQQ weight (0..1)
 """
 from __future__ import annotations
 
@@ -420,6 +422,34 @@ def signal_swing_regime(
     return signals
 
 # ============================================================
+# STRATEGY 8 — Sleeve (NDX trend regime, long-or-cash)
+# ============================================================
+
+def signal_sleeve(qqq_close: pd.Series, tqqq_close: pd.Series, ndx_close: pd.Series | None = None, **params) -> pd.Series:
+    """TQQQ weight (0..1) from the live sleeve rules in sleeves_strategy.py.
+
+    Regime on ^NDX (50d/250d MA), vol overlay, 0.10/day smoothing; shorts off
+    (SQQQ -> cash). Fractional weights; the engine rebalances at next-day open.
+    ^NDX is fetched with extra history so the 250d MA and smoothing path are warm.
+    """
+    from datetime import timedelta
+    from sleeves_strategy import HISTORY_DAYS, SYMBOL, build_sleeve_targets
+
+    if ndx_close is None:
+        from data_provider import get_ticker
+        start = (qqq_close.index[0] - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+        end = (qqq_close.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            ndx_close = get_ticker(SYMBOL).history(start=start, end=end)["Close"].dropna()
+        except Exception as e:
+            raise RuntimeError(f"Sleeve strategy: could not fetch {SYMBOL}: {e}") from e
+        ndx_close.index = pd.to_datetime(ndx_close.index).tz_localize(None)
+
+    tqqq_w = build_sleeve_targets(ndx_close, short_scale=0.0)["tqqq"]
+    return tqqq_w.reindex(qqq_close.index, method="ffill").fillna(0.0).clip(0.0, 1.0)
+
+
+# ============================================================
 # STRATEGY REGISTRY
 # ============================================================
 STRATEGIES = {
@@ -430,4 +460,5 @@ STRATEGIES = {
     "Swing - 20-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=20, **p),
     "Swing - 60-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=60, **p),
     "Regime-Aware Swing": signal_swing_regime,   # <--- NEW
+    "Sleeve (NDX Trend)": signal_sleeve,
 }

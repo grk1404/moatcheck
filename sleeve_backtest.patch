@@ -1,0 +1,194 @@
+diff --git a/app.py b/app.py
+index 6134782..27cb58b 100644
+--- a/app.py
++++ b/app.py
+@@ -3452,7 +3452,8 @@ def render_backtest() -> None:
+         "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry.\n"
+         "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high.\n"
+         "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high.\n"
+-        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below."
++        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below.\n"
++        "- **Sleeve (NDX Trend)** — the TQQQ Signals page sleeve: ^NDX 50d/250d trend regime with a volatility overlay, moved toward target at most 10%/day. Holds a fractional TQQQ weight, rest in cash (no SQQQ)."
+     )
+ 
+     # ---------- Import lazily so the page only loads its deps when opened ----------
+@@ -3566,7 +3567,7 @@ def render_backtest() -> None:
+                 
+                 # 2. Slice prices and signal to just the user's chosen window
+                 prices_sliced = prices[prices.index >= start_ts].copy()
+-                signal_sliced = signal.reindex(prices_sliced.index).fillna(0).astype(int)
++                signal_sliced = signal.reindex(prices_sliced.index).fillna(0.0).astype(float)
+                 
+                 # 3. Run a fresh backtest on ONLY the sliced data (no extra warmup needed here)
+                 results[name] = run_backtest(
+@@ -3670,7 +3671,7 @@ def render_backtest() -> None:
+     import plotly.graph_objects as go
+     fig = go.Figure()
+ 
+-    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726"]
++    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726", "#26C6DA", "#F06292"]
+     for i, (name, r) in enumerate(results.items()):
+         color = strategy_colors[i % len(strategy_colors)]
+         fig.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=name, line=dict(color=color, width=2.5)))
+diff --git a/backtest.py b/backtest.py
+index 6f2415c..3e2f0d9 100644
+--- a/backtest.py
++++ b/backtest.py
+@@ -130,7 +130,7 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
+ 
+     Args:
+         prices: DataFrame with TQQQ_open, TQQQ_close, QQQ_close columns.
+-        signal: Series of 0 (cash) or 1 (long TQQQ) indexed the same as prices.
++        signal: Series of target TQQQ weight in [0, 1] (0 = cash, 1 = all-in) indexed the same as prices.
+                 signal[N] is the position to hold on day N+1.
+         starting_cash: initial portfolio value.
+         warmup_days: number of trading days to skip at the start. Gives
+@@ -151,37 +151,41 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
+     if prices.empty:
+         raise ValueError(f"After {warmup_days} warm-up days, no price data remains. Use a longer date range.")
+ 
+-    signal = signal.reindex(prices.index).fillna(0).astype(int)
+-    position = signal.shift(1).fillna(0).astype(int)
++    # Signal is a target TQQQ weight in [0, 1]. Binary 0/1 strategies are the
++    # special case (all-in / all-cash); fractional weights rebalance at the open.
++    signal = signal.reindex(prices.index).fillna(0.0).astype(float).clip(0.0, 1.0)
++    position = signal.shift(1).fillna(0.0)
+ 
+     n = len(prices)
+     cash = float(starting_cash)
+     shares = 0.0
++    cur_w = 0.0
+     equity_values = np.zeros(n)
+     trade_rows = []
+-    open_trade = None
++    open_trade = None  # one "trade" = a flat -> invested -> flat episode
+ 
+     for i in range(n):
+         date = prices.index[i]
+         px_open = float(prices["TQQQ_open"].iloc[i])
+         px_close = float(prices["TQQQ_close"].iloc[i])
+-        want_long = position.iloc[i] == 1
+-        is_long = shares > 0
+-
+-        if want_long and not is_long and px_open > 0:
+-            shares = cash / px_open
+-            cash = 0.0
+-            open_trade = {"entry_date": date, "entry_price": px_open, "shares": shares}
+-
+-        elif not want_long and is_long and px_open > 0:
+-            proceeds = shares * px_open
+-            cash = proceeds
+-            if open_trade is not None:
+-                pnl = (px_open - open_trade["entry_price"]) * open_trade["shares"]
+-                ret_pct = px_open / open_trade["entry_price"] - 1.0
+-                trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": date, "entry_price": open_trade["entry_price"], "exit_price": px_open, "shares": open_trade["shares"], "pnl": pnl, "return_pct": ret_pct, "days_held": (date - open_trade["entry_date"]).days})
+-            shares = 0.0
+-            open_trade = None
++        w = float(position.iloc[i])
++
++        if px_open > 0 and abs(w - cur_w) > 1e-9:
++            equity_open = cash + shares * px_open
++            if cur_w == 0.0:
++                open_trade = {"entry_date": date, "entry_price": px_open, "shares": 0.0, "equity_in": equity_open}
++            if w == 0.0:
++                shares, cash = 0.0, equity_open
++                pnl = cash - open_trade["equity_in"]
++                trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": date, "entry_price": open_trade["entry_price"], "exit_price": px_open, "shares": open_trade["shares"], "pnl": pnl, "return_pct": cash / open_trade["equity_in"] - 1.0, "days_held": (date - open_trade["entry_date"]).days})
++                open_trade = None
++            else:
++                shares = w * equity_open / px_open
++                cash = equity_open - shares * px_open
++                if abs(cash) < 1e-9:
++                    cash = 0.0
++                open_trade["shares"] = max(open_trade["shares"], shares)
++            cur_w = w
+ 
+         equity_values[i] = cash + shares * px_close
+ 
+@@ -190,9 +194,8 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
+ 
+     if open_trade is not None:
+         final_close = float(prices["TQQQ_close"].iloc[-1])
+-        pnl = (final_close - open_trade["entry_price"]) * open_trade["shares"]
+-        ret_pct = final_close / open_trade["entry_price"] - 1.0
+-        trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": prices.index[-1], "entry_price": open_trade["entry_price"], "exit_price": final_close, "shares": open_trade["shares"], "pnl": pnl, "return_pct": ret_pct, "days_held": (prices.index[-1] - open_trade["entry_date"]).days, "open_at_end": True})
++        final_equity = cash + shares * final_close
++        trade_rows.append({"entry_date": open_trade["entry_date"], "exit_date": prices.index[-1], "entry_price": open_trade["entry_price"], "exit_price": final_close, "shares": open_trade["shares"], "pnl": final_equity - open_trade["equity_in"], "return_pct": final_equity / open_trade["equity_in"] - 1.0, "days_held": (prices.index[-1] - open_trade["entry_date"]).days, "open_at_end": True})
+ 
+     equity = pd.Series(equity_values, index=prices.index)
+     trades_df = pd.DataFrame(trade_rows)
+@@ -216,8 +219,8 @@ def run_backtest(prices: pd.DataFrame, signal: pd.Series, starting_cash: float =
+ 
+     time_in_market = float(position.mean()) if len(position) else 0.0
+ 
+-    if (position == 1).any():
+-        first_trade_date = position[position == 1].index[0]
++    if (position > 0).any():
++        first_trade_date = position[position > 0].index[0]
+     else:
+         first_trade_date = prices.index[0]
+ 
+diff --git a/backtest_strategies.py b/backtest_strategies.py
+index f357816..4750ead 100644
+--- a/backtest_strategies.py
++++ b/backtest_strategies.py
+@@ -2,7 +2,8 @@
+ Backtest strategies for MoatCheck.
+ 
+ Each strategy is a function that takes QQQ (and optionally TQQQ) price history
+-and returns a pd.Series of 0/1 signals indexed the same as the input.
++and returns a pd.Series of target TQQQ weights (0/1, or 0..1 for the sleeve)
++indexed the same as the input.
+ 
+ The strategy code must NOT look ahead. For each day i, the signal is computed
+ using only data up to and including day i's close. The backtest engine then
+@@ -12,6 +13,7 @@ Currently available:
+   - signal_buy_hold   : always long (baseline — should match the benchmark)
+   - signal_7step      : your live TQQQ/SQQQ 7-step framework, binary long/cash
+   - signal_1pct_week  : TASC "One Percent A Week" weekly swing on TQQQ
++  - signal_sleeve     : NDX trend-regime sleeve, fractional TQQQ weight (0..1)
+ """
+ from __future__ import annotations
+ 
+@@ -419,6 +421,34 @@ def signal_swing_regime(
+ 
+     return signals
+ 
++# ============================================================
++# STRATEGY 8 — Sleeve (NDX trend regime, long-or-cash)
++# ============================================================
++
++def signal_sleeve(qqq_close: pd.Series, tqqq_close: pd.Series, ndx_close: pd.Series | None = None, **params) -> pd.Series:
++    """TQQQ weight (0..1) from the live sleeve rules in sleeves_strategy.py.
++
++    Regime on ^NDX (50d/250d MA), vol overlay, 0.10/day smoothing; shorts off
++    (SQQQ -> cash). Fractional weights; the engine rebalances at next-day open.
++    ^NDX is fetched with extra history so the 250d MA and smoothing path are warm.
++    """
++    from datetime import timedelta
++    from sleeves_strategy import HISTORY_DAYS, SYMBOL, build_sleeve_targets
++
++    if ndx_close is None:
++        from data_provider import get_ticker
++        start = (qqq_close.index[0] - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
++        end = (qqq_close.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
++        try:
++            ndx_close = get_ticker(SYMBOL).history(start=start, end=end)["Close"].dropna()
++        except Exception as e:
++            raise RuntimeError(f"Sleeve strategy: could not fetch {SYMBOL}: {e}") from e
++        ndx_close.index = pd.to_datetime(ndx_close.index).tz_localize(None)
++
++    tqqq_w = build_sleeve_targets(ndx_close, short_scale=0.0)["tqqq"]
++    return tqqq_w.reindex(qqq_close.index, method="ffill").fillna(0.0).clip(0.0, 1.0)
++
++
+ # ============================================================
+ # STRATEGY REGISTRY
+ # ============================================================
+@@ -430,4 +460,5 @@ STRATEGIES = {
+     "Swing - 20-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=20, **p),
+     "Swing - 60-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=60, **p),
+     "Regime-Aware Swing": signal_swing_regime,   # <--- NEW
++    "Sleeve (NDX Trend)": signal_sleeve,
+ }
+\ No newline at end of file
