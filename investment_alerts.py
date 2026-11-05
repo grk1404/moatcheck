@@ -575,17 +575,19 @@ def check_tqqq_signal() -> dict | None:
     """Run the live TQQQ/SQQQ strategy and compute the daily action."""
     print(f"[alerts] Starting TQQQ/SQQQ live strategy check.")
     try:
-        from tqqq_sqqq_strategies import run_all_strategies
+        from sleeves_strategy import get_sleeve_target
         from trade_manager import load_position
         from data_provider import get_ticker
 
-        r = run_all_strategies()
-        if not r or "error" in r:
+        # Sleeve strategy (the one actually traded). Never fall back to the dial.
+        r = get_sleeve_target()
+        if not r or r.get("error") or not r.get("as_of"):
+            print(f"[alerts] Sleeve target unavailable: {(r or {}).get('error', 'no data')}")
             return None
 
-        target_tq = float(r["target_tqqq_pct"])
-        target_sq = float(r["target_sqqq_pct"])
-        target_cash = float(r.get("target_cash_pct", 100.0 - target_tq - target_sq))
+        target_tq = float(r["tqqq_pct"])
+        target_sq = float(r["sqqq_pct"])
+        target_cash = float(r["cash_pct"])
 
         pos = load_position()
         cur_tq = float(pos.get("tqqq_shares", 0.0))
@@ -629,8 +631,8 @@ def check_tqqq_signal() -> dict | None:
             sq_action = f"SELL {abs(sq_delta):.4f} shares SQQQ (~{abs(sq_delta) * sq_px:.2f} USD)"
 
         return {
-            "signal": r["signal"],
-            "regime": r["regime"],
+            "signal": "SLEEVE",
+            "regime": f"{r['regime']} (NDX as of {r['as_of']})",
             "target_tqqq_pct": target_tq,
             "target_sqqq_pct": target_sq,
             "target_cash_pct": target_cash,
@@ -662,7 +664,7 @@ def _run_tqqq_signal_check(state: dict) -> int:
     action_icon = "🎯" if info["needs_action"] else "😴"
 
     lines = [
-        f"{action_icon} TQQQ Regime — {info['signal']}",
+        f"{action_icon} TQQQ Sleeve Signal",
         f"Regime: {info['regime']}",
         f"Total Sleeve: {info['account_value']:.2f} USD",
         "",
