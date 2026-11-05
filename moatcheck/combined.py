@@ -196,6 +196,18 @@ def fetch(ticker: str) -> Financials:
         ebit_s = _conv(edgar.ebit)
         # tax_rate is a unit-less ratio — no conversion.
 
+        # ---- EPS gap: multi-class filers (V, BRK-B, GOOGL...) tag EPS per class,
+        # so EDGAR's companyfacts has none or only old years. Use Yahoo's EPS
+        # (contiguous, ~4 yrs) when EDGAR's doesn't reach the latest filed year.
+        _eps_note = ""
+        _latest = max((int(s.index.max()) for s in (rev, ni) if not s.empty), default=None)
+        _yf_eps = snapshot.eps if snapshot is not None else pd.Series(dtype=float)
+        if _latest is not None and not _yf_eps.empty and (
+            eps_s.empty or int(eps_s.index.max()) < _latest - 1
+        ):
+            eps_s = _yf_eps
+            _eps_note = "EPS from Yahoo Finance (not available in EDGAR for this filer)"
+
         # ---- Shares: override for IFRS filers ----
         # Foreign private issuers (IFRS taxonomy) often report total shares
         # across all classes — e.g. Ferrari reports 243M covering both the
@@ -231,6 +243,8 @@ def fetch(ticker: str) -> Financials:
         if getattr(edgar, "taxonomy", "us-gaap") == "ifrs-full" and \
            shares_series is not edgar.shares:
             note_parts.append("shares count from Yahoo Finance")
+        if _eps_note:
+            note_parts.append(_eps_note)
         note_parts.append(
             "Yahoo Finance (price, market cap, P/E, dividend yield, analyst est.)"
         )

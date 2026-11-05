@@ -83,9 +83,11 @@ IFRS_CONCEPTS: dict[str, list[str]] = {
 CONCEPTS: dict[str, list[str]] = {
     "revenue": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",  # CRWD and others
         "Revenues",
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
     ],
     "net_income": [
         "NetIncomeLoss",

@@ -8,3 +8,4 @@ streamlit-aggrid
 curl_cffi
 yfinance-cache
 scikit-learn
+pulp<4  # pulp 4.x removed LpVariable.dicts, which yfinance-cache needs
