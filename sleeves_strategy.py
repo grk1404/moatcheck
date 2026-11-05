@@ -23,7 +23,7 @@ HISTORY_DAYS = 1500   # warmup for the 250d MA, vol and the smoothing path
 SYMBOL = "^NDX"
 
 
-def _target_series(close: pd.Series, band: float, use_vol: bool) -> pd.Series:
+def _target_series(close: pd.Series, band: float, use_vol: bool, leverage: float = 3.0) -> pd.Series:
     s50 = close.rolling(50).mean()
     s250 = close.rolling(250).mean()
     bull = (close > s50 * (1 + band)) & (s50 > s250)
@@ -36,7 +36,7 @@ def _target_series(close: pd.Series, band: float, use_vol: bool) -> pd.Series:
 
     if use_vol:
         rv = close.pct_change().rolling(20).std() * np.sqrt(252)
-        scale = (TARGET_VOL / (rv * 3.0)).clip(upper=1.0).fillna(1.0)
+        scale = (TARGET_VOL / (rv * leverage)).clip(upper=1.0).fillna(1.0)
         target = target * scale
     return target
 

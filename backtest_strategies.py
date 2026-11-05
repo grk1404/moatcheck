@@ -1,433 +1,263 @@
 """
-Backtest strategies for MoatCheck.
+Backtest strategies for the MoatCheck Back Test page.
 
-Each strategy is a function that takes QQQ (and optionally TQQQ) price history
-and returns a pd.Series of 0/1 signals indexed the same as the input.
+Every strategy has the signature
 
-The strategy code must NOT look ahead. For each day i, the signal is computed
-using only data up to and including day i's close. The backtest engine then
-applies that signal on day i+1.
+    fn(prices, trade_start=None, swing_pct=0.15, leverage=1.0, **_) -> StrategySignal
 
-Currently available:
-  - signal_buy_hold   : always long (baseline — should match the benchmark)
-  - signal_7step      : your live TQQQ/SQQQ 7-step framework, binary long/cash
-  - signal_1pct_week  : TASC "One Percent A Week" weekly swing on TQQQ
+`prices` comes from backtest.load_backtest_data (columns: open, close,
+signal_close, qqq_open, qqq_close). `open`/`close` are the TRADED ticker.
+`signal_close` is the series the trend/regime logic reads: the ticker's own
+price, or QQQ when the user picks it (default for TQQQ, matching the live app).
+
+The returned weight is the fraction of the portfolio to hold from the NEXT
+bar's open (the engine applies the shift), so nothing can look ahead.
+
+`trade_start`: history before it only warms up indicators (SMAs, rolling
+highs). The weight is 0 before it, and all trade state (in-position flag,
+running high, entry price, Sleeves position ramp) starts clean at it, so
+results do not depend on how much warmup history the loader fetched.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 
+@dataclass
+class StrategySignal:
+    weight: pd.Series                         # target weight 0..1, decided at each bar's close
+    exit_at_close: pd.Series | None = None    # True = sell at this bar's close, not the next open
+
+
+def _start_pos(index: pd.Index, trade_start) -> int:
+    """Integer position of the first bar on/after trade_start (0 if None)."""
+    if trade_start is None:
+        return 0
+    return int(index.searchsorted(pd.Timestamp(trade_start), side="left"))
+
+
+def _zeros(index: pd.Index) -> pd.Series:
+    return pd.Series(0.0, index=index)
+
+
 # ============================================================
-# STRATEGY 1 — Buy and hold (baseline)
+# 1. Buy and hold (baseline)
 # ============================================================
 
-def signal_buy_hold(qqq_close: pd.Series, tqqq_close: pd.Series, **params) -> pd.Series:
-    """Always long. Used to verify the engine matches the benchmark."""
-    return pd.Series(1, index=qqq_close.index, dtype=int)
+def signal_buy_hold(prices: pd.DataFrame, trade_start=None, **_) -> StrategySignal:
+    w = pd.Series(1.0, index=prices.index)
+    w.iloc[: _start_pos(prices.index, trade_start)] = 0.0
+    return StrategySignal(w)
 
 
 # ============================================================
-# STRATEGY 2 — 7-step TQQQ framework (live strategy)
+# 2. 7-Step dial (live rules) - the same vote functions the live app uses
 # ============================================================
 
-def _compute_indicators_at(qqq_window: pd.DataFrame) -> dict:
-    """Compute the indicators the 7-step strategies need, on a slice of QQQ.
-
-    qqq_window must have columns Open, High, Low, Close, Volume.
-    Returns the same shape as strategies.py's _indicators dict, plus
-    None placeholders when not enough history is available.
-    """
-    close = qqq_window["Close"]
-
-    def _last(series, default=None):
-        try:
-            v = series.iloc[-1]
-            return float(v) if pd.notna(v) else default
-        except Exception:
-            return default
-
-    sma_20 = close.rolling(20).mean()
+def _dial_indicators(close: pd.Series, regime_ma: int) -> pd.DataFrame:
+    """Per-day version of tqqq_sqqq_strategies.load_strategy_data's indicator block."""
     sma_50 = close.rolling(50).mean()
-    sma_200 = close.rolling(200).mean()
+    sma_reg = close.rolling(regime_ma).mean()
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
+    bb_upper, bb_lower = bb_mid + 2 * bb_std, bb_mid - 2 * bb_std
+    bb_range = bb_upper - bb_lower
+    denom_w = bb_mid.where(bb_mid.notna() & (bb_mid != 0), 1.0)
+    denom_p = bb_range.where(bb_range.notna() & (bb_range != 0), 1.0)
+    return pd.DataFrame({
+        "price": close, "sma_50": sma_50, "sma_regime": sma_reg,
+        "dist_from_sma50": (close - sma_50) / sma_50,
+        "bb_width": bb_range / denom_w,
+        "bb_position": (close - bb_lower) / denom_p * 100,
+    })
 
-    # RSI (Wilder)
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rsi_series = 100 - (100 / (1 + avg_gain / avg_loss.replace(0, np.nan)))
 
-    price = float(close.iloc[-1])
-    sma_50_v = _last(sma_50)
-    sma_200_v = _last(sma_200)
-    bb_mid_v = _last(bb_mid)
-    bb_std_v = _last(bb_std)
+def signal_dial(prices: pd.DataFrame, trade_start=None, **_) -> StrategySignal:
+    """Live 7-vote dial -> TQQQ weight, long-or-cash (the short leg is not traded).
 
-    bb_upper = bb_mid_v + 2 * bb_std_v if (bb_mid_v is not None and bb_std_v is not None) else None
-    bb_lower = bb_mid_v - 2 * bb_std_v if (bb_mid_v is not None and bb_std_v is not None) else None
+    Calls the live strategy_* functions and dial_to_allocation, so the Back Test
+    cannot drift from the app. Settings come from data/dial_settings.json.
+    """
+    import tqqq_sqqq_strategies as live
 
-    bb_range = (bb_upper - bb_lower) if (bb_upper is not None and bb_lower is not None) else None
-    denom_width = bb_mid_v if (bb_mid_v and bb_mid_v != 0) else 1.0
-    denom_pos = bb_range if (bb_range and bb_range != 0) else 1.0
+    ind = _dial_indicators(prices["signal_close"], live.REGIME_LONG_MA)
+    start_i = _start_pos(prices.index, trade_start)
+    w = np.zeros(len(ind))
+    cols = ind.to_dict("list")
+    for i in range(start_i, len(ind)):
+        if pd.isna(cols["sma_regime"][i]) or pd.isna(cols["bb_position"][i]):
+            continue
+        px, s50, sreg = cols["price"][i], cols["sma_50"][i], cols["sma_regime"][i]
+        regime = "BULL" if px > s50 > sreg else "BEAR" if px < s50 < sreg else "NEUTRAL"
+        d = {"price": px, "sma_50": s50, "sma_regime": sreg, "regime": regime,
+             "dist_from_sma50": cols["dist_from_sma50"][i],
+             "bb_width": cols["bb_width"][i], "bb_position": cols["bb_position"][i]}
+        data = {"_indicators": d}
+        votes = [float(fn(data)["target_tqqq"]) for fn in live.STRATEGIES]
+        deviation = sum(votes) / len(votes) - 0.5
+        mult = live.SETTINGS["high_vol_multiplier"] if (regime in ("BULL", "BEAR") and d["bb_width"] > 0.10) else live.SETTINGS["low_vol_multiplier"]
+        dial = max(0.0, min(1.0, 0.5 + deviation * mult))
+        w[i] = live.dial_to_allocation(dial)["tqqq"]
+    return StrategySignal(pd.Series(w, index=prices.index))
 
-    bb_width = (bb_range / denom_width) if bb_range is not None else 0.0
-    bb_position = ((price - bb_lower) / denom_pos * 100) if (bb_lower is not None) else 50.0
 
-    if sma_50_v is not None and sma_200_v is not None:
-        if price > sma_50_v > sma_200_v:
-            regime = "BULL"
-        elif price < sma_50_v < sma_200_v:
-            regime = "BEAR"
+# ============================================================
+# 3. Sleeves (the strategy traded live)
+# ============================================================
+
+def signal_sleeves(prices: pd.DataFrame, trade_start=None, leverage: float = 1.0, **_) -> StrategySignal:
+    """Trend-regime sleeve from sleeves_strategy.py, long-or-cash.
+
+    The 50/250-day MAs and 20-day vol are computed on `signal_close` using all
+    warmup history. The 10%/day position ramp starts from cash at trade_start,
+    like someone starting that day. `leverage` is the traded ticker's leverage
+    relative to the signal series (3 for TQQQ driven by QQQ) and scales the vol overlay.
+    """
+    import sleeves_strategy as sl
+
+    target = sl._target_series(prices["signal_close"], band=0.0, use_vol=True, leverage=leverage)
+    start_i = _start_pos(prices.index, trade_start)
+    w = pd.Series(0.0, index=prices.index)
+    if start_i < len(target):
+        pos = sl._smooth(target.iloc[start_i:])
+        w.iloc[start_i:] = pos.clip(lower=0.0, upper=1.0).to_numpy()
+    return StrategySignal(w)
+
+
+# ============================================================
+# 4. One Percent A Week (TASC) - daily-bar version
+# ============================================================
+
+def signal_1pct_week(prices: pd.DataFrame, trade_start=None, dip_pct: float = 0.01,
+                     profit_pct: float = 0.01, stop_pct: float = 0.005, **_) -> StrategySignal:
+    """Weekly dip-buy on the TRADED ticker.
+
+    - Reference = the week's first OPEN. A close >= dip_pct below it signals a buy, filled at the next open.
+    - Exit: close >= entry + profit_pct (sold at the next open), close <= entry - stop_pct (stop, next open),
+      or the week's last trading day, sold AT THAT DAY'S CLOSE (never held over the weekend).
+    - No entries on a week's last trading day. Long only, one position at a time.
+    Daily bars cannot see intraday touches, so triggers are checked on closes.
+    """
+    idx = prices.index
+    o, c = prices["open"].to_numpy(float), prices["close"].to_numpy(float)
+    iso = idx.isocalendar()
+    wk = (iso.year.astype(int) * 100 + iso.week.astype(int)).to_numpy()
+    n = len(idx)
+    start_i = _start_pos(idx, trade_start)
+
+    w = np.zeros(n)
+    exit_close = np.zeros(n, dtype=bool)
+    in_pos = False       # holding, or filled at the next open
+    entry_px = None      # actual fill (open of the bar after the signal)
+    entry_bar = -1
+    week_open = None
+    cur_wk = None
+
+    for i in range(start_i, n):
+        if wk[i] != cur_wk:
+            cur_wk, week_open = wk[i], o[i]
+            if in_pos:   # defensive: position never survives the weekly close
+                in_pos, entry_px = False, None
+        last_of_week = (i + 1 >= n) or (wk[i + 1] != wk[i])
+
+        if in_pos:
+            if entry_px is None and i == entry_bar:      # fill happens at this bar's open
+                entry_px = o[i]
+            if last_of_week:
+                exit_close[i], in_pos, entry_px = True, False, None
+                continue
+            gain = c[i] / entry_px - 1.0
+            if gain >= profit_pct or gain <= -stop_pct:
+                in_pos, entry_px = False, None
+                continue
+            w[i] = 1.0
         else:
-            regime = "NEUTRAL"
-    else:
-        regime = "NEUTRAL"
-
-    dist_sma50 = ((price - sma_50_v) / sma_50_v) if sma_50_v else 0.0
-
-    return {"price": price, "sma_20": _last(sma_20), "sma_50": sma_50_v, "sma_200": sma_200_v, "bb_mid": bb_mid_v, "bb_std": bb_std_v, "bb_upper": bb_upper, "bb_lower": bb_lower, "bb_width": bb_width, "bb_position": bb_position, "rsi_14": _last(rsi_series, 50.0), "regime": regime, "dist_from_sma50": dist_sma50}
-
-
-def _vote_7step(ind: dict) -> float:
-    """Run the 7 sub-strategy votes on a single day's indicators."""
-    price = ind["price"]
-    sma_50 = ind["sma_50"]
-    regime = ind["regime"]
-    bb_pos = ind["bb_position"]
-    bb_width = ind["bb_width"]
-    dist = ind["dist_from_sma50"]
-
-    votes = []
-
-    # S1 — Momentum Long
-    if regime == "BULL":
-        votes.append(1.0)
-    elif regime == "BEAR":
-        votes.append(0.0)
-    else:
-        votes.append(0.5) # <--- UPDATED: Neutral is now 0.5
-
-    # S2 — Mean Reversion
-    if dist < -0.08 and regime != "BEAR":
-        votes.append(0.8)
-    elif dist > 0.10:
-        votes.append(0.2)
-    else:
-        votes.append(0.5)
-
-    # S3 — Bollinger Band Reversion
-    if bb_pos < 15:
-        votes.append(0.9)
-    elif bb_pos > 85:
-        votes.append(0.1)
-    else:
-        votes.append(0.5)
-
-    # S4 — BB Width Momentum Confirmation
-    if regime == "BULL" and bb_width > 0.08:
-        votes.append(0.9)
-    else:
-        votes.append(0.5) # <--- UPDATED
-
-    # S5 — Momentum Short
-    if regime == "BEAR":
-        votes.append(0.0)
-    else:
-        votes.append(0.5) # <--- UPDATED
-
-    # S6 — Short Overbought Fade
-    if dist > 0.12 and regime != "BULL":
-        votes.append(0.1)
-    else:
-        votes.append(0.5) # <--- UPDATED
-
-    # S7 — Bear Bounce Fade
-    if regime == "BEAR" and dist > -0.02:
-        votes.append(0.0)
-    elif regime == "BEAR" and dist < -0.10:
-        votes.append(0.3)
-    else:
-        votes.append(0.5)
-
-    return float(sum(votes) / len(votes))
-
-
-def signal_7step(qqq_close: pd.Series, tqqq_close: pd.Series, min_history: int = 200, threshold: float = 0.60, **params) -> pd.Series:
-    """Run the 7-step framework day-by-day, return 0/1 signals.
-
-    Parameters:
-        qqq_close: full QQQ close series (used to build the OHLC window).
-        tqqq_close: full TQQQ close series (kept for symmetry; unused here).
-        min_history: minimum QQQ bars required before producing a signal.
-        threshold: average vote >= threshold -> long. Below -> cash.
-
-    Returns: pd.Series of 0/1, indexed like qqq_close.
-    """
-    signals = pd.Series(0, index=qqq_close.index, dtype=int)
-    n = len(qqq_close)
-
-    # We need Open/High/Low to compute ATR and other things in the real
-    # strategy, but for these 7 votes, Close is enough. Use Close as a stand-in
-    # for the OHLC window.
-    qqq_df = pd.DataFrame({"Close": qqq_close})
-
-    for i in range(min_history, n):
-        window = qqq_df.iloc[: i + 1]
-        ind = _compute_indicators_at(window)
-        avg_vote = _vote_7step(ind)
-        signals.iloc[i] = 1 if avg_vote >= threshold else 0
-
-    return signals
+            if not last_of_week and c[i] <= week_open * (1.0 - dip_pct) and i + 1 < n:
+                in_pos, entry_px, entry_bar = True, None, i + 1
+                w[i] = 1.0
+    return StrategySignal(pd.Series(w, index=idx), pd.Series(exit_close, index=idx))
 
 
 # ============================================================
-# STRATEGY 3 — One Percent A Week (TASC weekly swing)
+# 5. Swing family
 # ============================================================
 
-def signal_1pct_week(qqq_close: pd.Series, tqqq_close: pd.Series, dip_pct: float = 0.01, profit_pct: float = 0.01, breakeven_pct: float = 0.005, **params) -> pd.Series:
-    """The TASC 'One Percent A Week' strategy, daily bar equivalent.
+def _swing(prices: pd.DataFrame, trade_start, threshold: float, lookback: int | None, regime_filter: bool) -> StrategySignal:
+    """Buy a `threshold` drop from the reference high, sell `threshold` above the fill price.
 
-    Rules (simplified for daily bars):
-      - On each Monday (or first trading day of the week), note the open price.
-      - During the week, if price drops dip_pct% below Monday's open, enter long.
-      - Exit at +profit_pct% from entry, or at breakeven if a loss of
-        breakeven_pct% is hit first, or at Friday close.
-      - Long-only, no shorts. Return 0/1 daily.
-
-    Since the daily engine can only trade at next-day open, this strategy
-    computes the entry trigger intraday and fires the signal the next day.
-    The engine then buys at the following open.
+    Reference high: running high since the last exit (lookback None) or the
+    rolling `lookback`-bar high. regime_filter: only buy while signal_close > its 200-day SMA.
+    The fill (entry price) is the NEXT bar's open, taken from the traded ticker's own open.
     """
-    signals = pd.Series(0, index=qqq_close.index, dtype=int)
+    idx = prices.index
+    c, o = prices["close"].to_numpy(float), prices["open"].to_numpy(float)
+    n = len(idx)
+    if n < 2:
+        return StrategySignal(_zeros(idx))
+    start_i = min(_start_pos(idx, trade_start), n - 1)
 
-    # Group by ISO week
-    idx = qqq_close.index
-    week_id = idx.isocalendar().week.values
-    year_id = idx.isocalendar().year.values
-
-    # Track state per week
-    position = 0
-    entry_price = None
-    week_open_price = None
-    current_week = None
-
-    for i, date in enumerate(idx):
-        this_week = (year_id[i], week_id[i])
-
-        # New week — reset
-        if this_week != current_week:
-            current_week = this_week
-            week_open_price = float(qqq_close.iloc[i])
-            position = 0
-            entry_price = None
-
-        price = float(qqq_close.iloc[i])
-
-        if position == 0:
-            # Look for entry: price dropped dip_pct below week's open
-            if week_open_price is not None and price <= week_open_price * (1 - dip_pct):
-                # Fire signal for tomorrow's open (engine will apply it next day)
-                position = 1
-                entry_price = price
-                signals.iloc[i] = 1
-                continue
-
-        elif position == 1:
-            # In position — check exit conditions on this day's close
-            # (signal fires for tomorrow, engine sells at tomorrow's open)
-            if entry_price is not None:
-                gain = price / entry_price - 1.0
-                if gain >= profit_pct:
-                    position = 0
-                    entry_price = None
-                    signals.iloc[i] = 0
-                    continue
-                if gain <= -breakeven_pct:
-                    position = 0
-                    entry_price = None
-                    signals.iloc[i] = 0
-                    continue
-
-            # Friday close — force exit
-            if date.weekday() == 4:  # Friday
-                position = 0
-                entry_price = None
-                signals.iloc[i] = 0
-                continue
-
-            # Stay in position
-            signals.iloc[i] = 1
-
-    return signals
-
-
-def signal_15pct_swing(
-    qqq_close: pd.Series,
-    tqqq_close: pd.Series,
-    tqqq_open: pd.Series = None,
-    lookback: int | None = None,
-    threshold: float = 0.15,
-    **params,
-) -> pd.Series:
-    """Buy every `threshold` drop. Sell only when +`threshold` from entry."""
-    signals = pd.Series(0, index=tqqq_close.index, dtype=int)
-    prices = tqqq_close.dropna()
-    if len(prices) < 2:
-        return signals
-
+    roll_hi = None
     if lookback is not None:
-        rolling_max = prices.rolling(lookback).max()
-        expanding_max = prices.expanding().max()
-        rolling_max = rolling_max.fillna(expanding_max)
+        roll_hi = prices["close"].rolling(lookback, min_periods=1).max().to_numpy(float)
+    if regime_filter:
+        sma = prices["signal_close"].rolling(200).mean().to_numpy(float)
+        sig_px = prices["signal_close"].to_numpy(float)
+        bull = np.where(np.isnan(sma), False, sig_px > sma)
     else:
-        rolling_max = None
+        bull = np.ones(n, dtype=bool)
 
-    in_position = False
-    entry_price = None
-    running_high = float(prices.iloc[0])
-    price_index = list(prices.index)
-    n_bars = len(prices)
+    w = np.zeros(n)
+    in_pos, entry_px = False, None
+    entry_bar = -1
+    running_high = c[start_i]
 
-    for i in range(n_bars):
-        date = price_index[i]
-        px = float(prices.iloc[i])
-        idx = signals.index.get_loc(date)
-
-        if not in_position:
-            # Determine reference high
-            if rolling_max is not None:
-                ref_high = float(rolling_max.loc[date])
-            else:
-                if px > running_high:
-                    running_high = px
-                ref_high = running_high
-
-            # Check for buy trigger on today's close
-            if px <= ref_high * (1 - threshold):
-                # Guard: Don't trigger a buy on the very last bar (no tomorrow)
-                if i + 1 < n_bars:
-                    in_position = True
-                    signals.iloc[idx] = 1  # Signal fires for tomorrow's open
-                    
-                    # Set entry price to tomorrow's open (if available)
-                    next_date = price_index[i + 1]
-                    if tqqq_open is not None and next_date in tqqq_open.index:
-                        entry_price = float(tqqq_open.loc[next_date])
-                    else:
-                        # Fallback: Use today's close if open is missing
-                        entry_price = px
-            else:
-                signals.iloc[idx] = 0
+    for i in range(start_i, n):
+        if not in_pos:
+            running_high = max(running_high, c[i])
+            ref = roll_hi[i] if roll_hi is not None else running_high
+            if c[i] <= ref * (1.0 - threshold) and bull[i] and i + 1 < n:
+                in_pos, entry_px, entry_bar = True, None, i + 1
+                w[i] = 1.0
         else:
-            # In position — check exit condition on today's close
-            if entry_price is not None and px >= entry_price * (1 + threshold):
-                # Guard: Don't trigger a sell on the very last bar (no tomorrow)
-                if i + 1 < n_bars:
-                    in_position = False
-                    entry_price = None
-                    if rolling_max is None:
-                        running_high = px
-                    signals.iloc[idx] = 0  # Signal drops to 0 for tomorrow's open
-                else:
-                    # We are at the very end. Stay long, the engine will liquidate at the final close.
-                    signals.iloc[idx] = 1
-            else:
-                signals.iloc[idx] = 1  # Stay long
+            if entry_px is None:
+                entry_px = o[entry_bar]          # actual fill: the open after the signal
+            w[i] = 1.0
+            if i + 1 < n and c[i] >= entry_px * (1.0 + threshold):
+                in_pos, entry_px = False, None   # sell at the next open
+                running_high = c[i]
+                w[i] = 0.0
+    return StrategySignal(pd.Series(w, index=idx))
 
-    return signals
 
-def signal_swing_regime(
-    qqq_close: pd.Series,
-    tqqq_close: pd.Series,
-    tqqq_open: pd.Series = None,
-    threshold: float = 0.15,
-    **params,
-) -> pd.Series:
-    """Buy a `threshold` drop from the running high, BUT only if QQQ is in a bull market.
-    
-    - Bull market: QQQ > 200-day SMA.
-    - Bear market: QQQ < 200-day SMA (stay in cash).
-    - Sells when TQQQ rallies `threshold` from the entry price.
-    """
-    signals = pd.Series(0, index=tqqq_close.index, dtype=int)
-    prices = tqqq_close.dropna()
-    if len(prices) < 2:
-        return signals
+def signal_swing_since_exit(prices, trade_start=None, swing_pct=0.15, **_):
+    return _swing(prices, trade_start, swing_pct, None, False)
 
-    # Precalculate the QQQ 200-day SMA for the regime filter
-    qqq_sma200 = qqq_close.rolling(200).mean()
 
-    in_position = False
-    entry_price = None
-    running_high = float(prices.iloc[0])
-    price_index = list(prices.index)
-    n_bars = len(prices)
+def signal_swing_20d(prices, trade_start=None, swing_pct=0.15, **_):
+    return _swing(prices, trade_start, swing_pct, 20, False)
 
-    for i in range(n_bars):
-        date = price_index[i]
-        px = float(prices.iloc[i])
-        idx = signals.index.get_loc(date)
 
-        # Determine the Regime (Are we in a bull or bear market?)
-        is_bull_market = False
-        if date in qqq_sma200.index:
-            sma_val = qqq_sma200.loc[date]
-            qqq_val = qqq_close.loc[date]
-            if pd.notna(sma_val) and qqq_val > sma_val:
-                is_bull_market = True
+def signal_swing_60d(prices, trade_start=None, swing_pct=0.15, **_):
+    return _swing(prices, trade_start, swing_pct, 60, False)
 
-        if not in_position:
-            # Update the running high
-            if px > running_high:
-                running_high = px
 
-            # Check for buy trigger AND regime filter
-            if px <= running_high * (1 - threshold) and is_bull_market:
-                # Don't trigger on the very last bar
-                if i + 1 < n_bars:
-                    in_position = True
-                    signals.iloc[idx] = 1
-                    
-                    # Set entry price to tomorrow's open
-                    next_date = price_index[i + 1]
-                    if tqqq_open is not None and next_date in tqqq_open.index:
-                        entry_price = float(tqqq_open.loc[next_date])
-                    else:
-                        entry_price = px
-            else:
-                signals.iloc[idx] = 0
-        else:
-            # In position — check exit condition on today's close
-            if entry_price is not None and px >= entry_price * (1 + threshold):
-                if i + 1 < n_bars:
-                    in_position = False
-                    entry_price = None
-                    running_high = px # Reset the high
-                    signals.iloc[idx] = 0
-                else:
-                    signals.iloc[idx] = 1 # Hold through the end
-            else:
-                signals.iloc[idx] = 1 # Stay long
-                
-            # Optional: If the regime flips to BEAR while we are in a position, 
-            # do we sell? Let's just wait for the +15% target to sell.
+def signal_swing_regime(prices, trade_start=None, swing_pct=0.15, **_):
+    return _swing(prices, trade_start, swing_pct, None, True)
 
-    return signals
 
 # ============================================================
 # STRATEGY REGISTRY
 # ============================================================
 STRATEGIES = {
     "Buy and Hold (baseline)": signal_buy_hold,
-    "7-Step TQQQ (live)": signal_7step,
+    "Sleeves (traded live)": signal_sleeves,
+    "7-Step Dial (live rules)": signal_dial,
     "One Percent A Week (TASC^)": signal_1pct_week,
-    "Swing - since last exit": signal_15pct_swing,
-    "Swing - 20-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=20, **p),
-    "Swing - 60-day window": lambda q, t, **p: signal_15pct_swing(q, t, lookback=60, **p),
-    "Regime-Aware Swing": signal_swing_regime,   # <--- NEW
+    "Swing - since last exit": signal_swing_since_exit,
+    "Swing - 20-day window": signal_swing_20d,
+    "Swing - 60-day window": signal_swing_60d,
+    "Regime-Aware Swing": signal_swing_regime,
 }
