@@ -3679,7 +3679,7 @@ def render_backtest() -> None:
     import plotly.graph_objects as go
     fig = go.Figure()
 
-    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726"]
+    strategy_colors = ["#4DABF7", "#FF6B6B", "#FFD43B", "#B388FF", "#00E676", "#FFA726", "#26C6DA", "#F06292"]
     for i, (name, r) in enumerate(results.items()):
         color = strategy_colors[i % len(strategy_colors)]
         fig.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=name, line=dict(color=color, width=2.5)))
