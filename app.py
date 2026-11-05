@@ -154,12 +154,12 @@ def _check_data_quality(prices: pd.DataFrame, ticker: str) -> None:
     missing_pct = (missing_days / len(bdays)) * 100 if len(bdays) > 0 else 0
     
     # 3. Check for bad prices (0 or negative)
-    bad_price_rows = prices[(prices["TQQQ_close"] <= 0) | (prices["TQQQ_open"] <= 0)]
+    bad_price_rows = prices[(prices["close"] <= 0) | (prices["open"] <= 0)]
     bad_price_count = len(bad_price_rows)
     
     # 4. Check for massive single-day jumps (possible unadjusted splits)
     # A 50% jump in a single day for an ETF is extremely rare and usually a split
-    daily_returns = prices["TQQQ_close"].pct_change()
+    daily_returns = prices["close"].pct_change()
     jumps = daily_returns[daily_returns.abs() > 0.50]
     jump_count = len(jumps)
     
@@ -185,9 +185,9 @@ def _check_data_quality(prices: pd.DataFrame, ticker: str) -> None:
     if jump_count > 0:
         st.warning(f"⚠️ Found {jump_count} single-day jumps >50%. If this is a long-term backtest, Yahoo Finance likely failed to adjust for a stock split. Returns may be inaccurate.")
         with st.expander("View Massive Jumps"):
-            jump_df = prices.loc[jumps.index, ["TQQQ_close"]].copy()
+            jump_df = prices.loc[jumps.index, ["close"]].copy()
             jump_df["Return"] = jumps * 100
-            st.dataframe(jump_df.style.format({"TQQQ_close": "${:.2f}", "Return": "{:+.1f}%"}))
+            st.dataframe(jump_df.style.format({"close": "${:.2f}", "Return": "{:+.1f}%"}))
             
     if missing_days > expected_missing + 20:
         st.warning(f"⚠️ Found {missing_days} missing business days (expected ~{expected_missing:.0f} for holidays). Data may have gaps.")
@@ -195,7 +195,11 @@ def _check_data_quality(prices: pd.DataFrame, ticker: str) -> None:
     else:
         st.session_state.pop("backtest_warning", None)
     
-    if bad_price_count == 0 and jump_count == 0 and missing_days <= expected_missing + 5:
+    dropped = prices.attrs.get("dropped_ticker_bars", 0)
+    if dropped > 5:
+        st.warning(f"⚠️ {dropped} {ticker} bars were dropped because QQQ or the signal symbol has no matching trading day.")
+
+    if bad_price_count == 0 and jump_count == 0 and missing_days <= expected_missing + 5 and dropped <= 5:
         st.success("✅ Data quality looks excellent. No gaps, bad ticks, or massive split jumps detected.")
 
     st.markdown("---")
@@ -3434,6 +3438,10 @@ def render_tqqq_sqqq_signals():
 def page_my_investments() -> None:
     render_my_investments()
 
+# Leverage vs QQQ for the Sleeves vol overlay when trend signals are read from QQQ.
+LEVERAGED_NASDAQ = {"TQQQ": 3.0, "QLD": 2.0}
+
+
 def page_backtest() -> None:
     render_backtest()
 
@@ -3447,13 +3455,13 @@ def render_backtest() -> None:
     )
     st.markdown(
         "- **Buy and Hold** — fully invested in the target ticker the entire window. The passive baseline.\n"
-        "- **7-Step Strategy** — trades the live regime-aware framework (uses QQQ signals). Goes to cash in bear/neutral regimes.\n"
-        "- **One Percent A Week** — weekly swing strategy. Enters on a 1% dip from Monday's open, exits on a 1% gain or at Friday close.\n"
+        "- **Sleeves (traded live)** — trend-regime sleeve: 80% weight above both the 50- and 250-day MA, 40% between, 0% below both, scaled down when volatility is high and moved at most 10 points a day. Long-or-cash.\n"
+        "- **7-Step Dial (live rules)** — the live 7-vote dial, calling the same vote functions as the app. Holds TQQQ at the dial weight when bullish, cash otherwise (the short leg is not traded).\n"
+        "- **One Percent A Week** — weekly swing. Buys a 1% close below the week's first open; exits on +1%, a 0.5% stop, or at the week's last close. Never held over a weekend.\n"
         "- **Swing - since last exit** — buys when price drops *Swing %* below the running high, and sells when it recovers *Swing %* from entry.\n"
         "- **Swing - 20-day window** — buys when price drops *Swing %* below the 20-day high.\n"
         "- **Swing - 60-day window** — buys when price drops *Swing %* below the 60-day high.\n"
-        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below.\n"
-        "- **Sleeve (NDX Trend)** — the TQQQ Signals page sleeve: ^NDX 50d/250d trend regime with a volatility overlay, moved toward target at most 10%/day. Holds a fractional TQQQ weight, rest in cash (no SQQQ)."
+        "- **Regime-Aware Swing** — combines the Swing strategy with a macro filter. Only buys the *Swing %* dip if QQQ is above its 200-day moving average (bull market). Stays in cash if QQQ is below."
     )
 
     # ---------- Import lazily so the page only loads its deps when opened ----------
@@ -3465,11 +3473,23 @@ def render_backtest() -> None:
         return
 
     # ---------- Input row ----------
-    c0, c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.2, 1.0])
-    
+    c0, c0b, c1, c2, c3, c4 = st.columns([1.2, 1.5, 1.2, 1.4, 1.1, 1.0])
+
     with c0:
         ticker_input = st.text_input("Ticker", value="TQQQ", key="backtest_ticker")
         backtest_ticker = ticker_input.strip().upper()
+
+    with c0b:
+        signal_choice = st.selectbox(
+            "Trend signals read",
+            options=["Traded ticker's own price", "QQQ (Nasdaq-100)"],
+            index=1 if backtest_ticker in LEVERAGED_NASDAQ else 0,
+            help="The regime logic (50/250-day MAs, Bollinger, 200-day filter) reads this price series. "
+                 "Use QQQ for leveraged Nasdaq ETFs like TQQQ, as the live app does. "
+                 "The swing and One Percent A Week rules always use the traded ticker's own price.",
+            key=f"backtest_signal_choice_{backtest_ticker in LEVERAGED_NASDAQ}",
+        )
+        signal_symbol = backtest_ticker if signal_choice.startswith("Traded") else "QQQ"
         
     with c1:
         period_label = st.selectbox("Period", options=["1m", "3m", "6m", "1y", "2y", "3y", "5y", "8y", "10y", "20y", "Max"], index=5)
@@ -3528,7 +3548,7 @@ def render_backtest() -> None:
         try:
             with st.spinner(f"Loading historical prices for {backtest_ticker}…"):
                 try:
-                    prices = load_backtest_data(backtest_ticker, start_date, end_date)
+                    prices = load_backtest_data(backtest_ticker, start_date, end_date, signal_symbol=signal_symbol)
                 except Exception as e:
                     st.error(f"Could not load price data: {e}")
                     st.session_state["backtest_running"] = False
@@ -3542,42 +3562,26 @@ def render_backtest() -> None:
             # --- RUN THE DATA QUALITY CHECK HERE ---
             _check_data_quality(prices, backtest_ticker)
 
-            qqq_close = prices["QQQ_close"]
-            tqqq_close = prices["TQQQ_close"]
-            
-            start_ts = datetime.fromisoformat(start_date)
-            
+            start_ts = pd.Timestamp(start_date)
+            # Sleeves' vol overlay assumes the traded ticker is levered vs the signal series (TQQQ vs QQQ = 3x).
+            leverage = LEVERAGED_NASDAQ.get(backtest_ticker, 1.0) if signal_symbol == "QQQ" else 1.0
+
+            window = prices[prices.index >= start_ts]
+            if len(window) < 30:
+                st.warning(f"Only {len(window)} bars in the window for {backtest_ticker}; pick a longer period.")
+                st.session_state["backtest_running"] = False
+                return
+
             results = {}
-            import inspect
-
             for name, fn in bs.STRATEGIES.items():
-                _params = inspect.signature(fn).parameters
-
-                extra_kwargs = {}
-                if "Swing" in name:
-                    extra_kwargs["threshold"] = swing_pct / 100.0
-                    if "tqqq_open" in _params:
-                        extra_kwargs["tqqq_open"] = prices["TQQQ_open"]
-
-                # 1. Generate signals on the FULL dataset (with warmup)
-                if "progress_callback" in _params:
-                    signal = fn(qqq_close, tqqq_close, progress_callback=None, **extra_kwargs)
-                else:
-                    signal = fn(qqq_close, tqqq_close, **extra_kwargs)
-                
-                # 2. Slice prices and signal to just the user's chosen window
-                prices_sliced = prices[prices.index >= start_ts].copy()
-                signal_sliced = signal.reindex(prices_sliced.index).fillna(0.0).astype(float)
-                
-                # 3. Run a fresh backtest on ONLY the sliced data (no extra warmup needed here)
+                # History before start_ts only warms up indicators; all trade state starts clean there.
+                sig = fn(prices, trade_start=start_ts, swing_pct=swing_pct / 100.0, leverage=leverage)
                 results[name] = run_backtest(
-                    prices_sliced, 
-                    signal_sliced, 
-                    starting_cash=starting_cash, 
-                    warmup_days=0, 
-                    progress_callback=None
+                    window, sig.weight, starting_cash=starting_cash, warmup_days=0,
+                    exit_at_close=sig.exit_at_close, ticker=backtest_ticker,
                 )
 
+            st.session_state["backtest_meta"] = {"ticker": backtest_ticker, "signal_symbol": signal_symbol, "leverage": leverage}
             st.session_state["backtest_results"] = results
             st.session_state["backtest_prices"] = prices
 
@@ -3596,10 +3600,13 @@ def render_backtest() -> None:
         return
 
     first = next(iter(results.values()))
+    meta = st.session_state.get("backtest_meta", {})
+    bt_ticker = first.ticker or "Ticker"
     st.caption(
         f"Window: **{first.start_date.date()} → {first.end_date.date()}** "
         f"({(first.end_date - first.start_date).days} days) · "
-        f"Starting cash: **${first.starting_cash:,.0f}**"
+        f"Starting cash: **${first.starting_cash:,.0f}** · "
+        f"Ticker: **{bt_ticker}** · Trend signals from: **{meta.get('signal_symbol', bt_ticker)}**"
     )
 
     if "backtest_warning" in st.session_state:
@@ -3630,6 +3637,7 @@ def render_backtest() -> None:
             "Calmar **": f"{calmar:.2f}",
             "Trades": f"{r.num_trades}",
             "Win Rate": f"{r.win_rate*100:.0f}%",
+            "Avg Exposure": f"{r.avg_exposure*100:.0f}%",
         })
 
     comparison_df = pd.DataFrame(rows)
@@ -3653,8 +3661,8 @@ def render_backtest() -> None:
     )
     
     st.caption(
-        "\\* **Sharpe** = CAGR ÷ annualized volatility. Measures return per unit of "
-        "day-to-day risk. Higher is better. Realistic range is 0.5 - 2.0 where 2 is excellent. Anything greater than 2 is Very Rare and should be treated with caution.\n\n"
+        "\\* **Sharpe** = √252 × mean daily return ÷ std dev of daily returns (risk-free rate 0). "
+        "Measures return per unit of day-to-day risk. Higher is better. Realistic range is 0.5 - 2.0 where 2 is excellent. Anything greater than 2 is Very Rare and should be treated with caution.\n\n"
         "\\*\\* **Calmar** = CAGR ÷ Max Drawdown. Measures return per unit of "
         "worst-case loss. Higher is better. Realistic range is 0.5 - 1.0 (Good). Between 1-2 is Very good but very rare.\n\n"
         "\\^ **TASC** = Technical Analysis of Stock Charts. a monthly magazine that has been published since 1982. The 1% per week strategy is inspired by its teachings."
@@ -3663,7 +3671,7 @@ def render_backtest() -> None:
     # ---------- Benchmarks ----------
     st.markdown("#### Buy & Hold Benchmarks")
     bc1, bc2 = st.columns(2)
-    bc1.metric("TQQQ Buy & Hold", f"{first.tqqq_buy_hold_return*100:+.2f}%", delta=f"${first.starting_cash * (1 + first.tqqq_buy_hold_return):,.0f}", delta_color="normal" if first.tqqq_buy_hold_return >= 0 else "inverse")
+    bc1.metric(f"{bt_ticker} Buy & Hold", f"{first.ticker_buy_hold_return*100:+.2f}%", delta=f"${first.starting_cash * (1 + first.ticker_buy_hold_return):,.0f}", delta_color="normal" if first.ticker_buy_hold_return >= 0 else "inverse")
     bc2.metric("QQQ Buy & Hold", f"{first.qqq_buy_hold_return*100:+.2f}%", delta=f"${first.starting_cash * (1 + first.qqq_buy_hold_return):,.0f}", delta_color="normal" if first.qqq_buy_hold_return >= 0 else "inverse")
 
     # ---------- Equity curve — all strategies on one chart ----------
@@ -3676,8 +3684,8 @@ def render_backtest() -> None:
         color = strategy_colors[i % len(strategy_colors)]
         fig.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=name, line=dict(color=color, width=2.5)))
 
-    # Add TQQQ buy-and-hold as a dashed reference line
-    fig.add_trace(go.Scatter(x=first.benchmark_tqqq.index, y=first.benchmark_tqqq, name="TQQQ Buy & Hold", line=dict(color="#9AA0A6", width=1.5, dash="dot")))
+    # Buy-and-hold of the traded ticker as a dashed reference line
+    fig.add_trace(go.Scatter(x=first.benchmark_ticker.index, y=first.benchmark_ticker, name=f"{bt_ticker} Buy & Hold", line=dict(color="#9AA0A6", width=1.5, dash="dot")))
 
     fig.update_layout(
         height=440,
@@ -3698,7 +3706,7 @@ def render_backtest() -> None:
     )
 
     from swing_analysis import find_swings
-    tqqq_series = prices["TQQQ_close"]
+    tqqq_series = prices.loc[prices.index >= first.start_date, "close"]
 
     _thr_col1, _thr_col2 = st.columns([1, 4])
     with _thr_col1:
@@ -3751,7 +3759,7 @@ def render_backtest() -> None:
         # Chart with markers
         import plotly.graph_objects as go
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=tqqq_series.index, y=tqqq_series, name="TQQQ Price", line=dict(color="#4DABF7", width=2)))
+        fig2.add_trace(go.Scatter(x=tqqq_series.index, y=tqqq_series, name=f"{bt_ticker} Price", line=dict(color="#4DABF7", width=2)))
 
         # 1. Historical Swing Events (Peak/Troughs)
         ups_dates = [pd.Timestamp(d) for d in swings.loc[swings["direction"] == "UP", "date"]]
@@ -3794,7 +3802,7 @@ def render_backtest() -> None:
             template="plotly_dark", 
             hovermode="x unified", 
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), 
-            yaxis_title="TQQQ Price ($)", 
+            yaxis_title=f"{bt_ticker} Price ($)", 
             margin=dict(l=20, r=20, t=40, b=20)
         )
         st.plotly_chart(fig2, use_container_width=True)
