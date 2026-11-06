@@ -1,38 +1,56 @@
 """
-Standalone alert service for MoatCheck.
-Checks Fidelity positions for three signal types and sends WhatsApp alerts
-via CallMeBot:
+Standalone alert service for MoatCheck. Runs as a Windows service (NSSM).
 
-  1. 52-week high proximity (default: within 2% of the high)
-  2. 52-week low proximity  (default: within 2% of the low)
-  3. MOS buy price hit      (reads from data/investments_signals.json — the
-                             cache the My Investments page builds)
+Alerts go to Telegram (primary) with CallMeBot WhatsApp as the fallback. During NYSE
+market hours (taken from the exchange calendar, so holidays and early closes are
+handled) it sweeps your Fidelity positions every 15 minutes, starting right after
+the open:
 
-The 52-week checks run on every cycle. The MOS check runs at most once per day
-(guarded by a timestamp in .alert_state.json).
+  1. 52-week high proximity (within 2% of the high)
+  2. 52-week low proximity  (within 2% of the low)
+  3. MOS buy price hit
+  4. BNF mean-reversion setup
+  5. TQQQ swing 15% / 20% levels (reference only)
+
+Once per trading day, 20 minutes before the close, it sends the Sleeve strategy
+signal (the strategy actually traded). Per-ticker cooldowns stop repeat alerts.
+Credentials: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID from the environment or from
+data/alert_secrets.json (created by telegram_setup.py).
 
 Run manually:   python investment_alerts.py
 Install as Windows Service with NSSM (see README).
 """
 from __future__ import annotations
 
-import sys
 import io
+import os
+import re
+import sys
 
 # Force UTF-8 encoding for Windows services so emojis don't crash the cycle
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# line_buffering/write_through: under NSSM stdout is a file, and a block-buffered wrapper
+# holds log lines in memory until the buffer fills or the process exits cleanly.
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True, write_through=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True, write_through=True)
     
 import warnings
-warnings.filterwarnings(
-    "ignore",
-    category=DeprecationWarning,
-    module=r".*yfinance_cache.*",
-)
+
+# Third-party libraries (yfinance, yfinance_cache, pandas, numpy) re-enable their own
+# DeprecationWarnings after startup, so a one-time filter does not hold. Silence warnings
+# in three places: the filter list, the warn function, and the logging channel.
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+warnings.warn = lambda *a, **k: None
+warnings.showwarning = lambda *a, **k: None
+warnings.formatwarning = lambda *a, **k: ""
+import logging
+logging.captureWarnings(False)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # "possibly delisted" noise
+logging.getLogger("yfinance_cache").setLevel(logging.CRITICAL)
 
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,25 +85,26 @@ CONFIG = {
     "high_threshold": 0.98,          # within 2% of 52-week high
     "low_threshold": 0.02,           # within 2% of 52-week low (price/low ratio)
 
-    # Cycle timing
-    "check_interval_seconds": 3600,  # 52-week checks: once per hour
-    "mos_interval_hours": 24,        # MOS check: once per day
+    # Market-hours schedule (America/Chicago; the NYSE calendar handles holidays and early closes)
+    "open_delay_minutes": 1,                # first threshold sweep this long after the open
+    "intraday_interval_seconds": 900,       # threshold sweep every 15 minutes while the market is open
+    "post_close_grace_minutes": 5,          # one last sweep just after the close
 
     # Per-ticker cooldown (hours) before re-alerting the same signal
-    "cooldown_hours": 24,
-    
-    "bnf_interval_hours": 24,        # BNF check: once per day
-    "bnf_cooldown_hours": 168,       # 7 days per ticker (panic events cluster)
-    
-    # TQQQ daily signal alert
-    "tqqq_signal_interval_hours": 22,       # once per day
-    "tqqq_signal_target_hour_ct": 14,       # 2 PM Central Time
-    "tqqq_signal_target_minute_ct": 45,     # at 2:45 PM CT
-    "tqqq_signal_window_minutes": 15,       # fire if within ±15 minutes
+    "cooldown_hours": 24,                   # 52-week, MOS, swing
+    "bnf_cooldown_hours": 168,              # 7 days per ticker (panic events cluster)
 
-    # Swing Trading signal alert
-    "swing_interval_hours": 24,      # 0 = run every hour (change to 24 for daily)
-    "swing_thresholds": [0.15, 0.20], # Alert on both 15% and 20% moves
+    # Daily Sleeve signal: sent once per trading day, this long before the close
+    "tqqq_signal_minutes_before_close": 20,
+    "tqqq_signal_retry_seconds": 300,       # retry a failed attempt every 5 minutes
+
+    # Service loop
+    "tick_seconds": 60,
+    "cycle_timeout_seconds": 1500,          # a hung sweep exits so the service manager restarts it
+    "signal_timeout_seconds": 300,
+    "heartbeat_seconds": 1800,
+
+    "swing_thresholds": [0.15, 0.20],       # TQQQ swing levels (15% and 20%)
 }
 
 # Path to the My Investments cache that holds intrinsic values
@@ -96,7 +115,7 @@ STATE_FILE = Path("data/.alert_state.json")
 
 import socket, time
 
-def wait_for_network(hosts=("query1.finance.yahoo.com", "api.callmebot.com"), timeout=180):
+def wait_for_network(hosts=("query1.finance.yahoo.com", "api.telegram.org", "api.callmebot.com"), timeout=180):
     """Block until DNS resolves at least one host, or timeout. Returns bool."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -109,26 +128,91 @@ def wait_for_network(hosts=("query1.finance.yahoo.com", "api.callmebot.com"), ti
         time.sleep(5)
     return False
 
-def _in_signal_window() -> bool:
-    """Return True if we're currently within the target daily window for
-    the TQQQ signal alert. Uses America/Chicago explicitly so the schedule
-    is stable across time zone changes and DST transitions."""
+_TZ_WARNED = False
+
+
+def _now_ct() -> datetime:
+    """Current time in America/Chicago. Falls back to machine time if tzdata is missing."""
+    global _TZ_WARNED
     try:
         from zoneinfo import ZoneInfo
-        now_ct = datetime.now(ZoneInfo("America/Chicago"))
+        return datetime.now(ZoneInfo("America/Chicago"))
     except Exception:
-        # If zoneinfo fails, fall back to the system's local time
-        now_ct = datetime.now()
+        if not _TZ_WARNED:
+            print("[alerts] WARNING: America/Chicago unavailable (pip install tzdata); using machine local time.")
+            _TZ_WARNED = True
+        return datetime.now()
 
-    target_hour = CONFIG.get("tqqq_signal_target_hour_ct", 14)
-    target_min = CONFIG.get("tqqq_signal_target_minute_ct", 45)
-    window = CONFIG.get("tqqq_signal_window_minutes", 15)
 
-    # Minutes since midnight, local Chicago time
-    now_minutes = now_ct.hour * 60 + now_ct.minute
-    target_minutes = target_hour * 60 + target_min
+_CAL = None
 
-    return abs(now_minutes - target_minutes) <= window
+
+def _calendar():
+    """NYSE trading calendar (holidays, early closes). None if the package is unavailable."""
+    global _CAL
+    if _CAL is None:
+        try:
+            import exchange_calendars as xc
+            _CAL = xc.get_calendar("XNYS")
+        except Exception as e:
+            print(f"[alerts] WARNING: exchange_calendars unavailable ({type(e).__name__}); using Mon-Fri 8:30-15:00 CT.")
+            _CAL = False
+    return _CAL or None
+
+
+def market_session(now_ct: datetime | None = None):
+    """(open, close) datetimes in Central Time if now_ct's date is a trading day, else None."""
+    now_ct = now_ct or _now_ct()
+    cal = _calendar()
+    if cal is not None:
+        try:
+            day = pd.Timestamp(now_ct.date())
+            if not cal.is_session(day):
+                return None
+            o = cal.session_open(day).tz_convert("America/Chicago").to_pydatetime()
+            c = cal.session_close(day).tz_convert("America/Chicago").to_pydatetime()
+            if now_ct.tzinfo is None:
+                o, c = o.replace(tzinfo=None), c.replace(tzinfo=None)
+            return o, c
+        except Exception:
+            pass   # date outside the calendar's range -> weekday fallback below
+    if now_ct.weekday() >= 5:
+        return None
+    return (now_ct.replace(hour=8, minute=30, second=0, microsecond=0),
+            now_ct.replace(hour=15, minute=0, second=0, microsecond=0))
+
+
+def is_market_open(now_ct: datetime | None = None) -> bool:
+    now_ct = now_ct or _now_ct()
+    sess = market_session(now_ct)
+    return bool(sess) and sess[0] <= now_ct < sess[1]
+
+
+def _in_signal_window(now_ct: datetime | None = None) -> bool:
+    """True from N minutes before the close until the close, on trading days (early closes included)."""
+    now_ct = now_ct or _now_ct()
+    sess = market_session(now_ct)
+    if not sess:
+        return False
+    return sess[1] - timedelta(minutes=CONFIG["tqqq_signal_minutes_before_close"]) <= now_ct < sess[1]
+
+
+def _intraday_window(now_ct: datetime | None = None) -> bool:
+    """True from open + delay until close + grace on trading days."""
+    now_ct = now_ct or _now_ct()
+    sess = market_session(now_ct)
+    if not sess:
+        return False
+    return (sess[0] + timedelta(minutes=CONFIG["open_delay_minutes"])
+            <= now_ct < sess[1] + timedelta(minutes=CONFIG["post_close_grace_minutes"]))
+
+
+_last_intraday = 0.0
+
+
+def intraday_due(now_ct: datetime | None = None) -> bool:
+    return _intraday_window(now_ct) and time.time() - _last_intraday >= CONFIG["intraday_interval_seconds"]
+
 
 # ============================================================
 # CSV PARSING — Fidelity positions export
@@ -222,34 +306,51 @@ def check_bnf_setups(df: pd.DataFrame) -> list[dict]:
 # 52-WEEK HIGH / LOW CHECKS
 # ============================================================
 
+_RANGE_CACHE: dict = {}
+
+
+def _price_range(sym: str):
+    """(last_price, 52w_high, 52w_low) from daily history, or None if missing or stale.
+
+    Uses price history, not Ticker.info: info's currentPrice can lag by days (SPY showed the
+    close from two sessions earlier), which produced false 52-week alerts. Tickers whose last
+    bar is more than 5 days old (delisted) are skipped.
+    """
+    hit = _RANGE_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    from data_provider import get_ticker
+    result = None
+    h = get_ticker(sym).history(period="1y")
+    if h is not None and not h.empty:
+        h = h.dropna(subset=["Close"])
+    if h is not None and not h.empty:
+        last = pd.Timestamp(h.index[-1])
+        if last.tzinfo is not None:
+            last = last.tz_localize(None)
+        if (pd.Timestamp.now() - last).days <= 5:
+            result = (float(h["Close"].iloc[-1]), float(h["High"].max()), float(h["Low"].min()))
+    _RANGE_CACHE[sym] = (time.time(), result)
+    return result
+
+
 def check_52w_highs(df: pd.DataFrame, threshold: float) -> list[dict]:
     """Positions within `threshold` of their 52-week high."""
-    from data_provider import get_ticker
-
     hits = []
     for _, row in df.iterrows():
         sym = str(row["Symbol"]).strip()
         if not sym:
             continue
         try:
-            info = get_ticker(sym).info or {}
-            high = info.get("fiftyTwoWeekHigh")
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if high is None or price is None:
+            r = _price_range(sym)
+            if r is None:
                 continue
-            high = float(high)
-            price = float(price)
-             # Guard: never alert on missing/zero/nonsense prices.
+            price, high, _low = r
             if high <= 0.1 or price <= 0.1:
                 continue
             pct = price / high
             if pct >= threshold:
-                hits.append({
-                    "symbol": sym,
-                    "price": price,
-                    "high": high,
-                    "pct": pct,
-                })
+                hits.append({"symbol": sym, "price": price, "high": high, "pct": pct})
         except Exception:
             continue
     return hits
@@ -257,32 +358,21 @@ def check_52w_highs(df: pd.DataFrame, threshold: float) -> list[dict]:
 
 def check_52w_lows(df: pd.DataFrame, threshold: float) -> list[dict]:
     """Positions within `threshold` of their 52-week low."""
-    from data_provider import get_ticker
-
     hits = []
     for _, row in df.iterrows():
         sym = str(row["Symbol"]).strip()
         if not sym:
             continue
         try:
-            info = get_ticker(sym).info or {}
-            low = info.get("fiftyTwoWeekLow")
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if low is None or price is None:
+            r = _price_range(sym)
+            if r is None:
                 continue
-            low = float(low)
-            price = float(price)
-            # Guard: never alert on missing/zero/nonsense prices.
+            price, _high, low = r
             if low <= 0.1 or price <= 0.1:
                 continue
             pct = (price - low) / low
             if pct <= threshold:
-                hits.append({
-                    "symbol": sym,
-                    "price": price,
-                    "low": low,
-                    "pct_above": pct,
-                })
+                hits.append({"symbol": sym, "price": price, "low": low, "pct_above": pct})
         except Exception:
             continue
     return hits
@@ -356,7 +446,8 @@ def check_mos_hits(df: pd.DataFrame) -> list[dict]:
                 continue
 
             mos_price = val.mos_price
-            price = float(fin.current_price)
+            rng = _price_range(sym)
+            price = rng[0] if rng else float(fin.current_price)
 
             if price <= mos_price:
                 hits.append({
@@ -406,27 +497,94 @@ def mark_alerted(kind: str, symbol: str, state: dict) -> None:
 
 
 # ============================================================
-# WHATSAPP — CallMeBot
+# MESSAGING - Telegram (primary), CallMeBot WhatsApp (fallback)
 # ============================================================
 
-def send_whatsapp(phone: str, api_key: str, message: str) -> bool:
-    if api_key == "YOUR_API_KEY_HERE":
-        print("[alerts] API key not set — skipping send.")
-        return False
-    print(f"[alerts] Sending WhatsApp message to:", phone)
-    print(f"[alerts] Message content: {message}")
-    url = "https://api.callmebot.com/whatsapp.php"
-    params = {"phone": phone, "text": message, "apikey": api_key}
+def _secret(name: str, default: str = "") -> str:
+    """Read a credential from the environment, then from data/alert_secrets.json."""
+    v = os.environ.get(name)
+    if v and v.strip():
+        return v.strip()
     try:
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code == 200:
-            print(f"[alerts] WhatsApp sent to {phone}")
+        f = Path("data/alert_secrets.json")
+        if f.exists():
+            return str(json.loads(f.read_text(encoding="utf-8")).get(name, default)).strip()
+    except Exception:
+        pass
+    return default
+
+
+def telegram_configured() -> bool:
+    return bool(_secret("TELEGRAM_BOT_TOKEN") and _secret("TELEGRAM_CHAT_ID"))
+
+
+def send_telegram(text: str) -> bool:
+    token, chat = _secret("TELEGRAM_BOT_TOKEN"), _secret("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat, "text": text, "disable_web_page_preview": "true"},
+            timeout=30,
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code == 200 and body.get("ok"):
+            print("[alerts] Telegram sent")
             return True
-        print(f"[alerts] CallMeBot HTTP {r.status_code}: {r.text[:200]}")
+        print(f"[alerts] Telegram failed: HTTP {r.status_code} {str(body.get('description', r.text))[:200]}")
+    except Exception as e:
+        print(f"[alerts] Telegram send failed: {type(e).__name__}: {str(e).replace(token, '***')[:200]}")
+    return False
+
+
+def send_whatsapp(phone: str, api_key: str, message: str) -> bool:
+    """CallMeBot WhatsApp. It answers HTTP 200 even when it refuses ('0 messages left'), so read the body."""
+    if not api_key or api_key == "YOUR_API_KEY_HERE":
+        return False
+    print(f"[alerts] Sending WhatsApp message to: {phone}")
+    try:
+        r = requests.get("https://api.callmebot.com/whatsapp.php",
+                         params={"phone": phone, "text": message, "apikey": api_key}, timeout=30)
+        reply = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text)).strip()
+        low = reply.lower()
+        if r.status_code == 200 and not any(m in low for m in ("message not sent", "0 messages left", "invalid", "error")):
+            print(f"[alerts] WhatsApp accepted by CallMeBot: {reply[:80]}")
+            return True
+        print(f"[alerts] CallMeBot refused (HTTP {r.status_code}): {reply[:200]}")
         return False
     except Exception as e:
-        print(f"[alerts] Send failed: {type(e).__name__}: {e}")
+        print(f"[alerts] WhatsApp send failed: {type(e).__name__}: {str(e).replace(api_key, '***')[:200]}")
         return False
+
+
+def _chunks(text: str, limit: int = 3500) -> list[str]:
+    """Split on line boundaries to stay under Telegram's 4096-character limit."""
+    out, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out
+
+
+def send_alert(message: str) -> bool:
+    """Deliver an alert. Telegram first; CallMeBot only if Telegram is not set up or failed."""
+    print(f"[alerts] Alert:\n{message}")
+    all_ok = True
+    for part in _chunks(message):
+        delivered = telegram_configured() and send_telegram(part)
+        if not delivered:
+            delivered = send_whatsapp(CONFIG["phone"], CONFIG["api_key"], part)
+        all_ok = all_ok and delivered
+    return all_ok
 
 
 # ============================================================
@@ -493,83 +651,67 @@ def check_tqqq_swing_alerts() -> list[dict]:
 # CYCLE
 # ============================================================
 
+def _send_group(title: str, entries: list, state: dict, cooldown_hours: float) -> int:
+    """Send one message for all new hits. entries = [(kind, symbol, line)]. Returns hits delivered."""
+    fresh = [(k, sym, line) for k, sym, line in entries if should_alert(k, sym, state, cooldown_hours)]
+    if not fresh:
+        return 0
+    message = title + "\n" + "\n".join(line for _, _, line in fresh)
+    if not send_alert(message):
+        return 0
+    for k, sym, _ in fresh:
+        mark_alerted(k, sym, state)
+    return len(fresh)
+
+
 def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
-    """High + low checks. Returns number of alerts sent."""
-    print("[alerts] Running 52-week high and low checks.. ")
+    """52-week high and low checks. Returns number of hits delivered."""
+    print("[alerts] Running 52-week high and low checks.")
     cfg = CONFIG
     sent = 0
-
-    # --- 52-week high ---
-    highs = check_52w_highs(df, cfg["high_threshold"])
-    for hit in highs:
-        sym = hit["symbol"]
-        if not should_alert("HIGH", sym, state, cfg["cooldown_hours"]):
-            continue
-        msg = (
-            f"🚨 52-Week High Alert\n"
-            f"{sym}: {hit['price']:.2f} USD "
-            f"({hit['pct']*100:.1f}% of 52w high {hit['high']:.2f} USD)"
-        )
-        if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
-            mark_alerted("HIGH", sym, state)
-            sent += 1
-
-    # --- 52-week low ---
-    lows = check_52w_lows(df, cfg["low_threshold"])
-    for hit in lows:
-        sym = hit["symbol"]
-        if not should_alert("LOW", sym, state, cfg["cooldown_hours"]):
-            continue
-        msg = (
-            f"⚠️ 52-Week Low Alert\n"
-            f"{sym}: {hit['price']:.2f} USD "
-            f"({hit['pct_above']*100:+.1f}% above 52w low {hit['low']:.2f} USD)"
-        )
-        if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
-            mark_alerted("LOW", sym, state)
-            sent += 1
-
+    highs = [("HIGH", h["symbol"],
+              f"{h['symbol']}: {h['price']:.2f} USD ({h['pct']*100:.1f}% of 52w high {h['high']:.2f})")
+             for h in check_52w_highs(df, cfg["high_threshold"])]
+    sent += _send_group("🚨 52-Week High Alert", highs, state, cfg["cooldown_hours"])
+    lows = [("LOW", h["symbol"],
+             f"{h['symbol']}: {h['price']:.2f} USD ({h['pct_above']*100:+.1f}% above 52w low {h['low']:.2f})")
+            for h in check_52w_lows(df, cfg["low_threshold"])]
+    sent += _send_group("⚠️ 52-Week Low Alert", lows, state, cfg["cooldown_hours"])
     return sent
 
 
 def _run_mos_check(df: pd.DataFrame, state: dict) -> int:
-    """MOS hit check. Returns number of alerts sent."""
-    cfg = CONFIG
-    sent = 0
-    hits = check_mos_hits(df)
-    for hit in hits:
-        sym = hit["symbol"]
-        if not should_alert("MOS", sym, state, cfg["cooldown_hours"]):
-            continue
-        msg = (
-            f"🎯 MOS Buy Price Hit\n"
-            f"{sym}: {hit['price']:.2f} USD ≤ MOS {hit['mos_price']:.2f} USD "
-            f"(intrinsic {hit['intrinsic']:.2f} USD, {hit['discount']*100:+.1f}%)"
-        )
-        if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
-            mark_alerted("MOS", sym, state)
-            sent += 1
-    return sent
+    """MOS buy price check. Returns number of hits delivered."""
+    entries = [("MOS", h["symbol"],
+                f"{h['symbol']}: {h['price']:.2f} USD <= MOS {h['mos_price']:.2f} "
+                f"(intrinsic {h['intrinsic']:.2f}, {h['discount']*100:+.1f}%)")
+               for h in check_mos_hits(df)]
+    return _send_group("🎯 MOS Buy Price Hit", entries, state, CONFIG["cooldown_hours"])
+
 
 def _run_bnf_check(df: pd.DataFrame, state: dict) -> int:
-    """BNF reversal scan. Returns number of alerts sent."""
-    cfg = CONFIG
-    sent = 0
-    hits = check_bnf_setups(df)
-    for hit in hits:
-        sym = hit["symbol"]
-        if not should_alert("BNF", sym, state, cfg["bnf_cooldown_hours"]):
-            continue
-        msg = (
-            f"🔄 BNF Reversal Setup\n"
-            f"{sym}: {hit['price']:.2f} USD\n"
-            f"Dislocation: {hit['dislocation']:.1f}% below MA25 ({hit['ma_25']:.2f} USD)\n"
-            f"RSI: {hit['rsi']:.1f}"
-        )
-        if send_whatsapp(cfg["phone"], cfg["api_key"], msg):
-            mark_alerted("BNF", sym, state)
-            sent += 1
-    return sent
+    """BNF reversal scan. Returns number of hits delivered."""
+    entries = [("BNF", h["symbol"],
+                f"{h['symbol']}: {h['price']:.2f} USD, {h['dislocation']:+.1f}% vs MA25 ({h['ma_25']:.2f}), RSI {h['rsi']:.1f}")
+               for h in check_bnf_setups(df)]
+    return _send_group("🔄 BNF Reversal Setup", entries, state, CONFIG["bnf_cooldown_hours"])
+
+
+def _run_swing_check(state: dict) -> int:
+    """TQQQ swing levels (reference only; the traded signal is the Sleeve). Returns hits delivered."""
+    entries = []
+    for h in check_tqqq_swing_alerts():
+        kind = f"SWING:{h['type']}:{h['pct']}"
+        if h["type"] == "SELL":
+            line = (f"SELL level: TQQQ {h['current']:.2f} USD is +{h['pct']*100:.0f}% over entry "
+                    f"{h['entry']:.2f} (target {h['target']:.2f})")
+        else:
+            line = (f"BUY level: TQQQ {h['current']:.2f} USD is -{h['pct']*100:.0f}% from the 20d high "
+                    f"{h['high']:.2f} (target {h['target']:.2f})")
+        entries.append((kind, "TQQQ", line))
+    return _send_group("📈 TQQQ Swing Levels (reference only; the Sleeve is the traded signal)",
+                       entries, state, CONFIG["cooldown_hours"])
+
 
 def check_tqqq_signal() -> dict | None:
     """Run the live TQQQ/SQQQ strategy and compute the daily action."""
@@ -632,6 +774,7 @@ def check_tqqq_signal() -> dict | None:
 
         return {
             "signal": "SLEEVE",
+            "as_of": r["as_of"],
             "regime": f"{r['regime']} (NDX as of {r['as_of']})",
             "target_tqqq_pct": target_tq,
             "target_sqqq_pct": target_sq,
@@ -649,16 +792,15 @@ def check_tqqq_signal() -> dict | None:
         print(f"[alerts] TQQQ signal check failed: {type(e).__name__}: {e}")
         return None
 
-def _run_tqqq_signal_check(state: dict) -> int:
-    """Send the daily TQQQ signal + action summary via WhatsApp."""
+def _run_tqqq_signal_check(today) -> int:
+    """Send the daily TQQQ sleeve signal via WhatsApp. Returns 1 only if it was sent."""
     cfg = CONFIG
     info = check_tqqq_signal()
     if info is None:
         print("[alerts] TQQQ signal check returned no data.")
         return 0
-
-    key = "TQQQ_SIGNAL"
-    if not should_alert(key, "_daily", state, 12):   # 12h cooldown
+    if info["as_of"] != today:
+        print(f"[alerts] Sleeve data is as of {info['as_of']}, not {today} (holiday or data lag); not sending.")
         return 0
 
     action_icon = "🎯" if info["needs_action"] else "😴"
@@ -677,108 +819,123 @@ def _run_tqqq_signal_check(state: dict) -> int:
     ]
     message = "\n".join(lines)
 
-    if send_whatsapp(cfg["phone"], cfg["api_key"], message):
-        state[f"{key}:_daily"] = time.time()
+    if send_alert(message):
         return 1
     return 0
 
-def run_once() -> int:
-    """One full cycle. 52-week checks always run; MOS and BNF run once a day."""
+
+_last_signal_attempt = 0.0
+
+
+def maybe_send_tqqq_signal() -> int:
+    """Called every tick. Sends the sleeve signal once per weekday inside the window.
+
+    The 'sent today' date is saved only after WhatsApp accepts the message, so a data
+    or network failure is retried every tqqq_signal_retry_seconds until the window closes.
+    """
+    global _last_signal_attempt
+    now_ct = _now_ct()
+    if not _in_signal_window(now_ct):
+        return 0
+    today = now_ct.date()
+    state = load_state()
+    if state.get("_tqqq_signal_date") == today.isoformat():
+        return 0
+    if time.time() - _last_signal_attempt < CONFIG["tqqq_signal_retry_seconds"]:
+        return 0
+    _last_signal_attempt = time.time()
+    print(f"[alerts] Running TQQQ sleeve signal (CT {now_ct:%H:%M}).")
+    sent = _run_tqqq_signal_check(today)
+    if sent:
+        state = load_state()
+        state["_tqqq_signal_date"] = today.isoformat()
+        save_state(state)
+    return sent
+
+def run_intraday_cycle() -> int:
+    """One threshold sweep: 52-week highs/lows, MOS, BNF, TQQQ swing. Returns alerts delivered."""
     df = load_positions(CONFIG["csv_path"])
     if df.empty:
         print("[alerts] No positions to check.")
         return 0
-
+    _RANGE_CACHE.clear()
     state = load_state()
     sent = 0
-
-    # 52-week checks every cycle
-    sent += _run_52w_checks(df, state)
-
-    # MOS check — once per mos_interval_hours
-    last_mos = state.get("_last_mos_run", 0)
-    hours_since_mos = (time.time() - last_mos) / 3600
-    if hours_since_mos >= CONFIG["mos_interval_hours"]:
-        print(f"[alerts] Running MOS check (last run {hours_since_mos:.1f}h ago).")
-        sent += _run_mos_check(df, state)
-        state["_last_mos_run"] = time.time()
-    else:
-        print(f"[alerts] MOS check skipped ({hours_since_mos:.1f}h < {CONFIG['mos_interval_hours']}h).")
-
-    # BNF check — once per bnf_interval_hours
-    last_bnf = state.get("_last_bnf_run", 0)
-    hours_since_bnf = (time.time() - last_bnf) / 3600
-    if hours_since_bnf >= CONFIG["bnf_interval_hours"]:
-        print(f"[alerts] Running BNF check (last run {hours_since_bnf:.1f}h ago).")
-        sent += _run_bnf_check(df, state)
-        state["_last_bnf_run"] = time.time()
-    else:
-        print(f"[alerts] BNF check skipped ({hours_since_bnf:.1f}h < {CONFIG['bnf_interval_hours']}h).")
-    
-    # TQQQ daily signal check — fires only inside the target time window
-    last_sig = state.get("_last_tqqq_signal_run", 0)
-    hours_since_sig = (time.time() - last_sig) / 3600
-    in_window = _in_signal_window()
-
-    if hours_since_sig >= CONFIG["tqqq_signal_interval_hours"] and in_window:
-        print(f"[alerts] Running TQQQ signal check (window open, last run {hours_since_sig:.1f}h ago).")
-        sent += _run_tqqq_signal_check(state)
-        state["_last_tqqq_signal_run"] = time.time()
-    elif not in_window:
-        print("[alerts] TQQQ signal check skipped (outside 2:45 PM CT window).")
-    else:
-        print(f"[alerts] TQQQ signal check skipped (already sent {hours_since_sig:.1f}h ago).")
-
-    # TQQQ Swing Trade Alerts
-    last_swing = state.get("_last_swing_run", 0)
-    hours_since_swing = (time.time() - last_swing) / 3600
-    if hours_since_swing >= CONFIG.get("swing_interval_hours", 24):
-        print(f"[alerts] Running TQQQ Swing check (last run {hours_since_swing:.1f}h ago).")
-        swing_hits = check_tqqq_swing_alerts()
-        for hit in swing_hits:
-            cooldown_key = f"SWING:{hit['type']}:{hit['pct']}"
-            if should_alert(cooldown_key, "TQQQ", state, cooldown_hours=24):
-                msg = (
-                    f"📈 TQQQ SWING {hit['type']} ALERT\n"
-                    f"Price: {hit['current']:.2f} USD\n"
-                )
-                if hit['type'] == "SELL":
-                    msg += f"Target: +{hit['pct']*100:.0f}% from entry ({hit['entry']:.2f} USD)\n"
-                    msg += f"Hit: {hit['target']:.2f} USD"
-                else:
-                    msg += f"Target: -{hit['pct']*100:.0f}% from 20d high ({hit['high']:.2f} USD)\n"
-                    msg += f"Hit: {hit['target']:.2f} USD"
-                
-                if send_whatsapp(CONFIG["phone"], CONFIG["api_key"], msg):
-                    mark_alerted(cooldown_key, "TQQQ", state)
-                    sent += 1
-        state["_last_swing_run"] = time.time()
-    else:
-        print(f"[alerts] TQQQ Swing check skipped ({hours_since_swing:.1f}h < 24h).")
-
-    save_state(state)
+    for label, fn in (("52-week", lambda: _run_52w_checks(df, state)),
+                      ("MOS", lambda: _run_mos_check(df, state)),
+                      ("BNF", lambda: _run_bnf_check(df, state)),
+                      ("TQQQ swing", lambda: _run_swing_check(state))):
+        try:
+            sent += fn()
+        except Exception as e:
+            print(f"[alerts] {label} check failed: {type(e).__name__}: {e}")
+        save_state(state)
+    print(f"[alerts] Sweep done: {sent} hit(s) delivered.")
     return sent
 
 
-def main() -> None:
-    print("[alerts] Starting Alert Service... -------------------------------------")
-    print(f"[alerts] CSV: {CONFIG['csv_path']}")
-    print(f"[alerts] Interval: {CONFIG['check_interval_seconds']}s")
-    print(f"[alerts] High threshold: {CONFIG['high_threshold']}")
-    print(f"[alerts] Low threshold:  {CONFIG['low_threshold']}")
+run_once = run_intraday_cycle   # old name, kept for scripts that call it
 
-    while True:
-        if not wait_for_network():
-            print("[alerts] Network not ready after 180s, skipping this cycle.")
-            time.sleep(CONFIG["check_interval_seconds"])
-            continue
 
+def _run_with_watchdog(fn, timeout: int, label: str):
+    """Run fn in a thread. If it hangs past `timeout`, exit so the service manager restarts us."""
+    box = {}
+
+    def target():
         try:
-            run_once()
+            box["result"] = fn()
         except Exception as e:
-            print(f"[alerts] Cycle failed: {type(e).__name__}: {e}")
+            print(f"[alerts] {label} failed: {type(e).__name__}: {e}")
 
-        time.sleep(CONFIG["check_interval_seconds"])
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f"[alerts] {label} hung for more than {timeout}s; exiting so the service restarts.")
+        sys.stdout.flush()
+        os._exit(1)
+    return box.get("result")
+
+
+def main() -> None:
+    global _last_intraday
+    print("[alerts] ================================================================")
+    print("[alerts] Starting Alert Service ---------------------------------")
+    print(f"[alerts] Started at {_now_ct():%Y-%m-%d %H:%M:%S} CT, pid {os.getpid()}")
+    print(f"[alerts] CSV: {CONFIG['csv_path']}")
+    print(f"[alerts] Channels: Telegram {'configured' if telegram_configured() else 'NOT configured'}; "
+          f"CallMeBot WhatsApp fallback {'configured' if CONFIG.get('api_key') else 'off'}")
+    print(f"[alerts] Threshold sweep every {CONFIG['intraday_interval_seconds']}s while the market is open "
+          f"(first sweep {CONFIG['open_delay_minutes']} min after the open); tick {CONFIG['tick_seconds']}s")
+    print(f"[alerts] Daily Sleeve signal: {CONFIG['tqqq_signal_minutes_before_close']} min before the close, once per trading day")
+    print(f"[alerts] High threshold: {CONFIG['high_threshold']}  Low threshold: {CONFIG['low_threshold']}")
+    if telegram_configured():
+        send_telegram(f"🟢 MoatCheck alert service started {_now_ct():%Y-%m-%d %H:%M} CT")
+
+    last_beat = 0.0
+    while True:
+        try:
+            now = _now_ct()
+            if intraday_due(now):
+                if wait_for_network(timeout=60):
+                    _run_with_watchdog(run_intraday_cycle, CONFIG["cycle_timeout_seconds"], "Sweep")
+                else:
+                    print("[alerts] Network not ready after 60s, skipping this sweep.")
+                _last_intraday = time.time()
+
+            _run_with_watchdog(maybe_send_tqqq_signal, CONFIG["signal_timeout_seconds"], "Daily signal")
+
+            if time.time() - last_beat >= CONFIG["heartbeat_seconds"]:
+                st = load_state()
+                sess = market_session(now)
+                mkt = (f"market {'OPEN' if is_market_open(now) else 'closed'} "
+                       f"({sess[0]:%H:%M}-{sess[1]:%H:%M} CT)") if sess else "market closed today"
+                print(f"[alerts] heartbeat: alive, CT {now:%Y-%m-%d %H:%M}, {mkt}, "
+                      f"last daily signal {st.get('_tqqq_signal_date', 'never')}")
+                last_beat = time.time()
+        except Exception as e:
+            print(f"[alerts] Tick failed: {type(e).__name__}: {e}")
+        time.sleep(CONFIG["tick_seconds"])
 
 
 if __name__ == "__main__":
