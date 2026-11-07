@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import json
 import warnings
 from data_provider import get_ticker
-from investments import _metric_html, render_my_investments
+from investments import _metric_html, render_my_investments, get_holding_tickers
 from data_quality import check_data_quality
 
 from trade_manager import (
@@ -635,10 +635,32 @@ def render_analyzer() -> None:
 
     
         
+    _holdings = get_holding_tickers()
+    _NONE = "(none)"
+    st.session_state.setdefault("analyzer_ticker_box", "AAPL")
+
+    def _apply_pick() -> None:
+        """Runs when Analyze is clicked, before the page redraws: copy a chosen holding into the
+        ticker box (a widget's value can't be changed after it is drawn), then reset the list so a
+        stale pick never overrides a ticker typed later."""
+        chosen = st.session_state.get("analyzer_pick", _NONE)
+        if chosen and chosen != _NONE:
+            st.session_state["analyzer_ticker_box"] = chosen
+        st.session_state["analyzer_pick"] = _NONE
+
     with st.form("analyze"):
-        col_a, col_b, col_c = st.columns([2, 1, 5])
+        col_a, col_h, col_b, col_c = st.columns([2, 3, 1, 3])
         with col_a:
-            ticker = st.text_input("Ticker symbol", value="AAPL", max_chars=10).strip().upper()
+            ticker = st.text_input("Ticker symbol", max_chars=10, key="analyzer_ticker_box").strip().upper()
+        with col_h:
+            _pick = st.selectbox(
+                "Or pick from My Investments",
+                key="analyzer_pick",
+                options=[_NONE] + [sym for sym, _ in _holdings],
+                index=0,
+                format_func=lambda s_: s_ if s_ == _NONE else f"{s_}  -  {dict(_holdings).get(s_, '')[:28]}",
+                disabled=not _holdings,
+            )
         with col_b:
             # Blank markdown pushes the button down so it lines up with the input
             # (whose label adds ~28px of height above it).
@@ -647,7 +669,7 @@ def render_analyzer() -> None:
             if "analyzing" in st.session_state and st.session_state["analyzing"]:
                 submitted = st.form_submit_button("⏳ Analyzing...", width="stretch", disabled=True)
             else:
-                submitted = st.form_submit_button("Analyze", width="stretch")
+                submitted = st.form_submit_button("Analyze", width="stretch", on_click=_apply_pick)
 
     if submitted:
         st.session_state["analyzing"] = True

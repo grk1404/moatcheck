@@ -786,6 +786,38 @@ def _find_csv() -> Path | None:
             return matches[-1]
     return None
 
+def get_holding_tickers() -> list[tuple[str, str]]:
+    """Tickers held in the Fidelity positions CSV as [(symbol, description)], largest position first.
+
+    Cash sweeps (SPAXX**, FCASH**...) and CUSIP-style rows are dropped. Returns [] if the file is
+    missing or unreadable, so callers can simply hide the list.
+    """
+    import re
+
+    try:
+        path = _find_csv()
+        if path is None:
+            return []
+        df = _derive(_parse_fidelity_csv(path))
+    except Exception:
+        return []
+    if df.empty or "Symbol" not in df.columns:
+        return []
+
+    pat = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+    best: dict[str, tuple[float, str]] = {}
+    for _, r in df.iterrows():
+        sym = str(r.get("Symbol", "")).strip().upper()
+        if not pat.match(sym) or (len(sym) == 5 and sym.endswith("XX")):
+            continue
+        val = r.get("_value")
+        val = float(val) if val == val and val is not None else 0.0
+        desc = str(r.get("Description", "") or "").strip()
+        tot = best.get(sym, (0.0, desc))[0] + val          # same stock held in several accounts
+        best[sym] = (tot, best.get(sym, (0.0, desc))[1] or desc)
+    return [(sym, d) for sym, (_, d) in sorted(best.items(), key=lambda kv: -kv[1][0])]
+
+
 def _metric_html(label: str, value: str, sub: str = "", help_text: str = "",
                  sub_color: str = "#9aa0a6") -> str:
     """Render a metric card as HTML so we can control the help tooltip glyph."""
