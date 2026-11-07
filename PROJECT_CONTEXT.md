@@ -18,7 +18,9 @@ Streamlit app for value investing + technical analysis. Tabs:
 - sleeves_strategy.py — the LIVE traded strategy (see below)
 - tqqq_sqqq_strategies.py — 7-vote dial + Mallik Sim (reference only)
 - trade_manager.py — target share calculator + trade CSV logging
-- investment_alerts.py — WhatsApp alert service (CallMeBot), runs as a Windows service on a separate machine
+- investment_alerts.py — alert service (Telegram primary, CallMeBot fallback), market-hours sweeps, runs as a Windows service on a separate machine
+- telegram_setup.py — one-time Telegram setup (finds chat id, writes data/alert_secrets.json, sends a test)
+- screener.py — Stock Screener UI + parallel analysis; moatcheck/splits.py — split adjustment for per-share history
 - moatcheck/ — Big 5 / EDGAR / Yahoo fetch code (edgar.py, combined.py, fetcher.py, big5.py, growth.py)
 - data/trade_log.csv — trade history
 
@@ -56,13 +58,19 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 3. Check that the latest ^NDX bar is not intraday before trading.
 4. Place trades in Fidelity, then click the Log buttons (expect signal `SLEEVE ...`, note `sleeve as_of=...`; untested until the first real trade).
 
-## Alerts (investment_alerts.py)
-- Daily TQQQ message now reads the SLEEVE target (changed 2026-11-05; was the dial). If the sleeve target is unavailable it sends nothing and never falls back to the dial. Not committed or pushed as of this note.
-- Dry run (WhatsApp stubbed) produced 52-week high/low, BNF, daily TQQQ and swing alerts correctly. Cycle takes about 3 minutes for 56 positions.
-- Likely reason for missing daily alerts: the TQQQ message only fires in a 14:30-15:00 CT window and the service checks about every 63 minutes, so many days no check lands in the window. Service may also be stopped or asleep. Not yet confirmed on the service machine.
-- Proposed (not done): send once per trading day after 14:45 CT tracked by date; add a heartbeat log line. TQQQ swing BUY alerts (15%/20% below 20-day high) can conflict with the Sleeve.
-- `data/.alert_state.json` is now untracked in git (commit e1e19b5), so pulling deletes the local copy and causes one batch of repeat alerts.
-- Security note: the CallMeBot phone number and API key are hard-coded in investment_alerts.py and are in git history.
+## Alerts (investment_alerts.py, runs as a Windows service via NSSM on a separate machine)
+**Channels:** Telegram is primary (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from env or `data/alert_secrets.json`); CallMeBot WhatsApp is the fallback. As of 2026-11-06 CallMeBot's WhatsApp quota is exhausted ("You have 0 messages left... Message not sent", returned with HTTP 200), so no alert reached the phone. The CallMeBot phone-call test page worked, but that is a different API. `send_whatsapp` now reads the reply text, so a refusal counts as a failure.
+
+**Schedule (America/Chicago, NYSE calendar via `exchange_calendars`, so holidays and early closes are handled):**
+- Threshold sweep starts 1 minute after the open (8:31 AM CT) and repeats every 15 minutes until 5 minutes past the close (about 27 sweeps per trading day). Each sweep checks 52-week highs/lows, MOS buy price, BNF reversal setup and TQQQ swing levels (swing is reference only; the Sleeve is the traded signal).
+- Daily Sleeve signal: once per trading day, 20 minutes before the close (2:40 PM CT; 11:40 AM CT on early-close days). The "sent today" date is saved only after delivery succeeds; failures retry every 5 minutes. It refuses to send if the sleeve data is not dated today.
+- Cooldowns: 24 h per ticker per alert type (52-week, MOS, swing), 7 days for BNF. Hits from one sweep are batched into one message per category (at most 5 messages per sweep). Expect about 1 daily signal plus 0-3 threshold messages on a normal day; a first sweep after deploy sends about 3-4.
+
+**Fixes made:** the old hourly loop caught the 30-minute daily window on only about half of days (simulated ~51% missed, streaks of 4-5 days); a failed attempt blocked retries; CallMeBot refusals counted as success; 52-week/MOS checks used Yahoo `info` prices that lag by days (SPY showed 766.81 vs a latest close of 735.29) and now use price history; hung cycles exit after 25 minutes so NSSM restarts the service; warnings are suppressed (one cycle wrote 738 stderr lines, now 0); stdout is line-buffered (the old wrapper held log lines in memory); startup banner `Starting Alert Service ---`; heartbeat line every 30 minutes; the daily message uses the Sleeve, never the dial.
+
+**Deploy on the service machine:** `git pull origin master`; `python -m pip install tzdata exchange_calendars "pulp<4"`; `python telegram_setup.py <token>` (press Start on the bot first; it writes `data/alert_secrets.json` with the numeric chat id); `nssm restart <service-name>`. Check the log for the banner, "Telegram configured" and the heartbeat. `data/.alert_state.json` is untracked, so a pull deletes it and causes one batch of repeat alerts.
+
+**SECURITY, open:** commit 6b567f8 added `data/alert_secrets.json` to the PUBLIC repo with a real Telegram bot token and `TELEGRAM_CHAT_ID` set to a username ("grk1404") instead of the numeric chat id. Revoke the token with @BotFather (`/revoke`), then `git rm --cached data/alert_secrets.json` and keep it out of git. The CallMeBot phone number and key are also hard-coded in `investment_alerts.py` and are in history.
 
 ## Stock Analyzer data fixes (committed f913c6f, pushed 2026-11-05)
 - CRWD Sales growth was blank because EDGAR concepts lacked `RevenueFromContractWithCustomerIncludingAssessedTax`. Added it (edgar.py) plus `SalesRevenueServicesNet`.
@@ -77,8 +85,9 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 - MACD uses 8, 17, 9 (not standard 12, 26, 9)
 
 ## Open Items / Next Steps
-- Commit and push the investment_alerts.py sleeve change, then pull and restart the service on the alert machine (`nssm restart <service-name>`).
-- Fix the alert timing (once per day after 14:45 CT) and add a heartbeat; confirm service status and logs on the service machine.
+- SECURITY: revoke the Telegram token exposed in commit 6b567f8, untrack `data/alert_secrets.json`, set the numeric chat id (run `telegram_setup.py` with the new token).
+- Deploy the alert service on its machine (see Alerts) and confirm the banner, heartbeat and one Telegram test message. Restore the CallMeBot quota or drop it as fallback.
+- Run a full screener scan (download the SEC bulk file first) and check the Retry/Error counts; rebuild the universe cache once.
 - Back Test page: read ^NDX (not QQQ) for the Sleeves signal; add a cost-per-trade input; `test_backtest.py` is stale.
 - Fix the sleeves_strategy.py docstring (says "TQQQ / SQQQ / cash" and "-56% max drawdown").
 - Replace flat 2% financing in synthetic.py with the actual Fed funds rate.
@@ -86,8 +95,33 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 - Optional: build the 20%-cap mean-reversion SQQQ add-on behind a default-off switch for paper trading; test an RSI-scaled TQQQ size against the volatility overlay.
 - Eventually: automate execution (recommend IBKR over Fidelity for ToS/API reasons)
 
-## Stock Screener rework (2026-11-06)
-- Fixed: user thresholds were ignored (resolve_thresholds only took numbers; screener passes dicts), cache ignored thresholds, NASDAQ stocks were dropped from the universe (case bug; universe now ~7.6k tickers), failed fetches were cached for 7 days, wrong metric-to-threshold match when cash conversion was missing, CAGR windows spanning missing years (now matched by fiscal-year label).
-- Accuracy: EPS and share counts split-adjusted via Yahoo split history (moatcheck/splits.py); annual-duration filter on EDGAR facts; growth fed to value price capped at 30%; cached rows get a fresh price before the verdict.
-- Speed: EDGAR first + one Yahoo info call (full Yahoo statements only as fallback); SEC bulk companyfacts.zip read locally (download from the screener settings, ~1.4 GB); process pool x threads; cached growth numbers so changing thresholds re-scores instantly; saves every 100 stocks. Measured ~70-130 ms/stock (about 9-17 min for a full 7.6k universe cold, seconds when cached).
-- Yahoo throttles (HTTP 429) under heavy parallel load; throttled tickers are marked "Retry" and not cached.
+## Stock Screener rework (committed 3b3b367, pushed 2026-11-06)
+**Bugs fixed**
+- User Big 5 thresholds were ignored: the screener passes `{"revenue": {"min","max"}}` dicts but `resolve_thresholds` only accepted plain numbers (NVDA scored 5.9 under defaults and under absurd 60-70% thresholds). It now accepts dicts or numbers and never mutates the defaults.
+- The result cache was keyed by ticker only for 7 days, so changed thresholds re-served old scores. Rows now cache the threshold-independent growth numbers (`big5_values`) and are re-scored instantly under the current thresholds.
+- NASDAQ stocks were never screened: the SEC list says "Nasdaq", the code upper-cased it then compared to mixed case, dropping 4,358 rows (NVDA, MSFT, AAPL, GOOGL, AMZN, META, COST, CRWD absent). Fixed, universe version 4, now about 7,600 tickers.
+- Failed fetches (737 of 2,993 cached rows, 117 of them rate-limit errors) were cached 7 days. Transient SEC/Yahoo errors are now marked "Retry" and not cached; hard failures expire after 3 days.
+- Metrics were matched to thresholds by list position, so a missing cash-conversion metric made the fair-value discounts use its 80% floor. Now matched by name. Cash conversion and the two discounts count once in the pass rate (they were copied into 4 windows) and are excluded from consistency/trend.
+- CAGR used positional lookback, so a missing year stretched a "5-year" window (NVDA FCF 2012 to 2022). `cagr` now looks up the start year by label and returns None if it is missing; `window_average` requires every year.
+- EDGAR EPS and share counts were not split-adjusted (EDGAR restates only ~3 years: GOOGL EPS 18.00 in 2017 next to 2.93 in 2020; GOOGL 10yr EPS CAGR -6.2%). New `moatcheck/splits.py` adjusts using Yahoo split history and each value's filing date.
+- EDGAR duration facts now must be 340-380 days (COST FY2017 had an 83-day value, NFLX FY2016 a 90-day value).
+- Growth feeding the value price is capped at 30% in the screener; "analyst 5-year growth" is really Yahoo's earningsGrowth/revenueGrowth (latest quarter YoY), not a 5-year estimate.
+
+**Speed (measured on samples; a full 7,600-stock run was not completed)**
+- Per stock before: about 3,100 ms (Yahoo statements ~2.3 s + EDGAR ~0.8 s). Now about 70-130 ms.
+- Light fetch: EDGAR first plus one Yahoo `info` call; full Yahoo statements only when EDGAR has no filings or no EPS series. SEC bulk `companyfacts.zip` (1.4 GB, ~1 min download, stored at `~/.moat_cache/companyfacts.zip`) is read locally (~35 ms/company) with no per-stock SEC request. Shared SEC rate limiter with retries; `EdgarTransientError` separates "SEC busy" from "no filings".
+- Process pool (default 80 workers, ~10 processes x 8 threads) for batches of 150+; threads below that. Saves every 100 stocks (atomic write). Parallel universe metadata build that reuses old cache rows. Prices refreshed only for rows with a valuation.
+- Measured: 400 stocks cold 45 s, warm 3.4 s; 600 stocks 42 s (10 procs x 8 threads) = about 9 min for 7,600 cold.
+- Yahoo returned HTTP 429 after heavy testing, so the batch price refresh could not be verified; throttled rows show "Retry".
+
+**Score/value changes to expect:** AAPL score 7.4 to 6.8, value 112 to 215; CRWD 7.1 to 6.8; ODFL value 449 to 78. Splits and threshold handling both move numbers.
+
+**First run on a machine:** use "Download / refresh SEC bulk data" on the screener page once; the universe rebuilds on first use (about 4,400 new tickers from Yahoo).
+
+**Not changed / open:** Yahoo "analyst growth" is still earningsGrowth/revenueGrowth; multi-class filers rely on the Yahoo EPS fallback; 66 of 300 sampled stocks (foreign filers, trusts) have no usable statements and show Error.
+
+## Technical Analysis page fixes (2026-11-06)
+- Why "Technical BUY Price" was often missing even below support: (1) `_verdict_at_price` changed the last bar but the scores read a stale `current_price`, so the tested price never reached the SMA/MACD/Bollinger scores; (2) even with that fixed, a lower price pushes the SMA and MACD scores to -1, so a stock under its moving averages cannot reach the +0.20 BUY threshold at any price (composite plateaus near +0.04); (3) the page's "Support Level" was the lower Bollinger Band, a moving envelope that sits ABOVE price when the stock is falling, so "below support" could never produce a level.
+- Now: `find_support_resistance()` returns real levels (confirmed swing lows/highs clustered within 1.5%, SMA 50/100/200, 52-week low/high; broken levels flip role). `find_entry_price()` returns the current price if the verdict is already BUY (LEAN BUY counts, matching the page), else the highest price where the model turns BUY (1% steps down to -60%), else the nearest support, with a stop one ATR under the level (clamped 1-2 ATR from entry) and the risk %. It works on a copy and restores all state (verified unchanged). No entry now only when the stock is at new lows with no support below.
+- Math fixes: RSI uses Wilder smoothing (the old 14-bar mean differed up to 6 points, KO 57.8 vs 64.4); Bollinger uses population std (ddof=0); Stochastic %K guards a flat 14-bar range (division by zero). These changed the verdict for 5 of 50 stocks tested (INTC WAIT to LEAN BUY, FTNT LEAN BUY to WAIT, HLI to BUY, CVNA to LEAN BUY, INGM to WAIT).
+- Result on 50 stocks: no entry price for 23 before, 0 now. Support-based entries are price-action levels, not model BUY signals; the page says so and shows the model verdict beside them. The page now analyzes full history ('max'); the Analysis Period selector in the UI is still not wired to it.

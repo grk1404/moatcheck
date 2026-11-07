@@ -2061,17 +2061,32 @@ def render_technical_analysis():
             with col2:
                 support = verdict_data['support_level']
                 if support:
-                    st.metric("Support Level", f"${support:.2f}", 
-                             delta=f"{((verdict_data['current_price'] - support) / verdict_data['current_price'] * 100):.1f}% above")
+                    _sup_src = (verdict_data.get('support_info') or {}).get('source', '')
+                    st.metric("Support Level", f"${support:.2f}",
+                             delta=f"{((verdict_data['current_price'] - support) / verdict_data['current_price'] * 100):.1f}% below price",
+                             delta_color="off")
+                    if _sup_src:
+                        st.caption(f"Nearest support below price: {_sup_src}")
                 else:
                     st.metric("Support Level", "N/A")
+                    st.caption("No support below the price (trading at new lows)")
             with col3:
                 resistance = verdict_data['resistance_level']
                 if resistance:
+                    _res_src = (verdict_data.get('resistance_info') or {}).get('source', '')
                     st.metric("Resistance Level", f"${resistance:.2f}",
-                             delta=f"{((resistance - verdict_data['current_price']) / verdict_data['current_price'] * 100):.1f}% above")
+                             delta=f"{((resistance - verdict_data['current_price']) / verdict_data['current_price'] * 100):.1f}% above price",
+                             delta_color="off")
+                    if _res_src:
+                        st.caption(f"Nearest resistance above price: {_res_src}")
                 else:
                     st.metric("Resistance Level", "N/A")
+            _bbl, _bbu = verdict_data.get('bb_lower'), verdict_data.get('bb_upper')
+            if _bbl and _bbu:
+                _pos = "below the lower band" if verdict_data['current_price'] < _bbl else (
+                    "above the upper band" if verdict_data['current_price'] > _bbu else "inside the bands")
+                st.caption(f"Bollinger Bands: ${_bbl:.2f} - ${_bbu:.2f} (price is {_pos}). The bands move with price; "
+                           "they are shown for reference and are not used as support.")
 
                         # --- Suggested entry price (from inverting the technical verdict) ---
             st.markdown("### 🎯 Technical BUY Price")
@@ -2082,9 +2097,8 @@ def render_technical_analysis():
                 st.info("Not enough data to compute a BUY price.")
             elif entry_info["entry_price"] is None:
                 st.warning(
-                    f"No BUY price found even at 60% below the current price. "
-                    f"The verdict remains {entry_info['entry_verdict']} at "
-                    f"${entry_info['search_range'][0]:.2f}."
+                    "No technical BUY price: the model verdict never turns to BUY at lower prices and there is "
+                    "no support level below the current price (the stock is at its lows). Wait for a base to form."
                 )
             else:
                 tgt = entry_info["entry_price"]
@@ -2092,10 +2106,16 @@ def render_technical_analysis():
                 drop_pct = (tgt - cur) / cur * 100
 
                 # Color depends on how close the current price is to the target
-                if drop_pct >= -0.5:
+                _by_support = entry_info.get("method") == "support"
+                _bearish = "SELL" in str(entry_info.get("current_verdict", ""))
+                if drop_pct >= -0.5 and _by_support and _bearish:
+                    # At a support level, but the model is bearish: not a clean buy
+                    box_bg, box_color = "#4a3a1e", "#FFA726"
+                    status_text = "AT SUPPORT, MODEL BEARISH"
+                elif drop_pct >= -0.5:
                     # Already there — bright green
                     box_bg, box_color = "#1e4620", "#00E676"
-                    status_text = "READY NOW"
+                    status_text = "AT SUPPORT" if _by_support else "READY NOW"
                 elif drop_pct >= -3.0:
                     # Close — light green
                     box_bg, box_color = "#2a3d1e", "#8BC34A"
@@ -2133,15 +2153,22 @@ def render_technical_analysis():
                 </div>
                 """, unsafe_allow_html=True)
 
-                if drop_pct >= -0.5:
-                    st.success(
-                        f"✅ Price is essentially at the BUY level. "
-                        f"A marginal move down flips the verdict to BUY."
-                    )
+                _method = entry_info.get("method")
+                _sup = entry_info.get("support") or {}
+                if _method == "current":
+                    st.success("✅ The technical verdict is already BUY at the current price.")
+                elif _method == "model":
+                    st.info(f"⏳ The technical model flips to BUY at about ${tgt:.2f}.")
                 else:
                     st.info(
-                        f"⏳ Wait for a pullback to ${tgt:.2f} before the "
-                        f"technical rules flip to BUY."
+                        f"📍 Support-based entry: nearest support is **${tgt:.2f}** "
+                        f"({_sup.get('source', 'support')}, touched {_sup.get('touches', 1)}x). The model verdict is "
+                        f"**{entry_info['current_verdict']}**, so this is a price-action level, not a model BUY signal."
+                    )
+                if entry_info.get("stop_price") and _method != "current":
+                    st.caption(
+                        f"Suggested stop: ${entry_info['stop_price']:.2f} (one ATR under the nearest level below the entry), "
+                        f"risking about {entry_info['risk_pct']:.1f}% from the entry."
                     )
 
             # --- 52-week range ---

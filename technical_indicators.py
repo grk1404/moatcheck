@@ -109,19 +109,24 @@ class TechnicalIndicatorAnalyzer:
         # 4. Stochastic Oscillator
         low_min = self.stock_data['Low'].rolling(window=14).min()
         high_max = self.stock_data['High'].rolling(window=14).max()
-        self.stock_data['%K'] = 100 * ((self.stock_data['Close'] - low_min) / (high_max - low_min))
+        rng = (high_max - low_min).replace(0, np.nan)      # flat 14-bar range would divide by zero
+        self.stock_data['%K'] = 100 * ((self.stock_data['Close'] - low_min) / rng)
         self.stock_data['%D'] = self.stock_data['%K'].rolling(window=3).mean()
         
         # 5. RSI
         delta = self.stock_data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        self.stock_data['RSI'] = 100 - (100 / (1 + rs))
+        # Wilder's smoothing (the standard RSI used by charting platforms). A plain 14-bar mean
+        # differed by up to 6 points (KO 57.8 vs 64.4).
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        rsi[(loss == 0) & (gain > 0)] = 100.0                # no down-moves in the window
+        self.stock_data['RSI'] = rsi
         
         # 6. Bollinger Bands
         self.stock_data['BB_Middle'] = self.stock_data['Close'].rolling(window=20).mean()
-        bb_std = self.stock_data['Close'].rolling(window=20).std()
+        bb_std = self.stock_data['Close'].rolling(window=20).std(ddof=0)   # Bollinger's definition (population std)
         self.stock_data['BB_Upper'] = self.stock_data['BB_Middle'] + (bb_std * 2)
         self.stock_data['BB_Lower'] = self.stock_data['BB_Middle'] - (bb_std * 2)
         
@@ -1281,9 +1286,12 @@ class TechnicalIndicatorAnalyzer:
         price = self.current_price
         ind = self.indicators
         
-        # Calculate support and resistance levels
-        support = ind['BB_Lower'] if ind['BB_Lower'] else None
-        resistance = ind['BB_Upper'] if ind['BB_Upper'] else None
+        # Support / resistance: real price levels (swing lows/highs, moving averages, 52-week
+        # extremes). The Bollinger bands are a moving envelope, not support, and are reported
+        # separately so the page can still show them.
+        levels = self.find_support_resistance()
+        support = levels["support"]["price"] if levels["support"] else None
+        resistance = levels["resistance"]["price"] if levels["resistance"] else None
         
         # Build detailed analysis
         analysis_details = {
@@ -1299,6 +1307,10 @@ class TechnicalIndicatorAnalyzer:
             'current_price': price,
             'support_level': support,
             'resistance_level': resistance,
+            'support_info': levels["support"],
+            'resistance_info': levels["resistance"],
+            'bb_lower': ind['BB_Lower'],
+            'bb_upper': ind['BB_Upper'],
             'signal_summary': {
                 'buy_signals': len(buy_signals),
                 'sell_signals': len(sell_signals),
@@ -1666,93 +1678,186 @@ class TechnicalIndicatorAnalyzer:
         }
     def _verdict_at_price(self, price: float) -> str:
         """
-        Recompute indicators with the last Close replaced by `price`,
-        return the resulting trading-signal recommendation.
+        Recompute indicators with the last Close replaced by `price`, return the resulting
+        trading-signal recommendation.
 
-        WARNING: This mutates self.stock_data (the last bar) and leaves
-        it modified. Callers must restore the original Close afterward.
+        Mutates self.stock_data and self.current_price. find_entry_price() works on a copy and
+        restores everything, so callers should not use this directly on live data.
         """
         idx = self.stock_data.index[-1]
         prev_close = float(self.stock_data["Close"].iloc[-2])
         o = prev_close
-        h = max(o, price) * 1.001
-        l = min(o, price) * 0.999
         self.stock_data.loc[idx, "Close"] = price
         self.stock_data.loc[idx, "Open"] = o
-        self.stock_data.loc[idx, "High"] = h
-        self.stock_data.loc[idx, "Low"] = l
+        self.stock_data.loc[idx, "High"] = max(o, price) * 1.001
+        self.stock_data.loc[idx, "Low"] = min(o, price) * 0.999
+        # The scoring reads current_price, not the last bar. Without this the price-based
+        # scores (SMA position, MACD size, Bollinger position) never saw the tested price.
+        self.current_price = price
 
         self.calculate_all_indicators()
         sig = self.get_trading_signals()
         return sig.get("recommendation", "NEUTRAL")
 
+    def find_support_resistance(self, lookback: int = 500, window: int = 5,
+                                cluster_pct: float = 0.015) -> dict:
+        """Nearest real support below the price and resistance above it.
+
+        Candidates: confirmed swing lows/highs (a bar whose low/high is the extreme of the
+        `window` bars on each side, clustered within `cluster_pct`), SMA 50/100/200, and the
+        52-week low/high. Returns {"support": {...}|None, "resistance": {...}|None, "all": [...]}
+        where each level is {"price", "source", "touches"}.
+        """
+        out = {"support": None, "resistance": None, "all": []}
+        df = self.stock_data
+        if df is None or len(df) < 2 * window + 2:
+            return out
+        d = df.tail(lookback)
+        price = float(df["Close"].iloc[-1])
+        w = 2 * window + 1
+
+        def swings(series, fn):
+            extreme = series.rolling(w, center=True).min() if fn == "min" else series.rolling(w, center=True).max()
+            return series[(series == extreme) & extreme.notna()]
+
+        raw = [(float(v), "swing low") for v in swings(d["Low"], "min")]
+        raw += [(float(v), "swing high") for v in swings(d["High"], "max")]
+
+        def cluster(items):
+            items = sorted(items)
+            groups, cur = [], [items[0]] if items else []
+            for it in items[1:]:
+                if it[0] <= cur[0][0] * (1 + cluster_pct):
+                    cur.append(it)
+                else:
+                    groups.append(cur)
+                    cur = [it]
+            if cur:
+                groups.append(cur)
+            return [{"price": sum(x[0] for x in g) / len(g), "source": g[0][1], "touches": len(g)} for g in groups]
+
+        levels = cluster(raw)
+        last = df.iloc[-1]
+        for col, name in (("SMA_50", "SMA 50"), ("SMA_100", "SMA 100"), ("SMA_200", "SMA 200")):
+            v = last.get(col)
+            if v is not None and v == v:
+                levels.append({"price": float(v), "source": name, "touches": 1})
+        yr = df.tail(252)
+        levels.append({"price": float(yr["Low"].min()), "source": "52-week low", "touches": 1})
+        levels.append({"price": float(yr["High"].max()), "source": "52-week high", "touches": 1})
+
+        # Support = highest level at or below the price; resistance = lowest level strictly above it
+        # (so a level can never be both). Price levels above/below flip role once broken, so a swing
+        # high under the price is "former resistance" and a swing low over it is "former support".
+        def relabel(l):
+            if l["source"] == "swing high" and l["price"] <= price:
+                return {**l, "source": "former resistance (swing high)"}
+            if l["source"] == "swing low" and l["price"] > price:
+                return {**l, "source": "former support (swing low)"}
+            return l
+
+        levels = [relabel(l) for l in levels]
+        below = [l for l in levels if l["price"] <= price and l["source"] != "52-week high"]
+        above = [l for l in levels if l["price"] > price and l["source"] != "52-week low"]
+        if below:
+            out["support"] = max(below, key=lambda l: l["price"])
+        if above:
+            out["resistance"] = min(above, key=lambda l: l["price"])
+        levels = sorted(levels, key=lambda l: l["price"])
+        out["all"] = levels
+        return out
+
+    @staticmethod
+    def _is_buy(recommendation: str) -> bool:
+        """True for BUY, STRONG BUY and LEAN BUY: the same rule get_verdict() uses, which shows
+        LEAN BUY as 'BUY'. Using a narrower rule here made the page show a BUY verdict next to a
+        'no BUY price' message."""
+        return "BUY" in (recommendation or "")
 
     def find_entry_price(self) -> dict | None:
         """
-        Find the highest price at which the current technical verdict
-        becomes BUY (or STRONG BUY). Returns None if data is missing;
-        returns entry_price=None if no tested price yields a BUY.
+        Technical BUY price.
+
+        1. If the verdict is already BUY: the current price.
+        2. Else the highest price (scanning down in 1% steps) at which the model verdict becomes BUY.
+        3. Else the nearest real support below the price, with a stop one ATR under it.
+
+        Step 2 rarely finds anything for a stock below its moving averages: a lower price pushes
+        the SMA and MACD scores to -1 and caps the composite near +0.05, below the +0.20 BUY
+        threshold. Step 3 is therefore the usual answer for a falling stock.
+
+        Works on a copy of the data and restores all state, so it never alters the chart or the
+        displayed verdict. Returns None only when there is no data. Keys: current_price,
+        current_verdict, entry_price (None if nothing found), entry_verdict, method
+        ("current" | "model" | "support" | None), support, stop_price, risk_pct,
+        search_range, iterations.
         """
-        if self.stock_data is None or self.stock_data.empty:
+        if self.stock_data is None or self.stock_data.empty or len(self.stock_data) < 30:
             return None
 
-        current_price = float(self.stock_data["Close"].iloc[-1])
+        full = self.stock_data
+        orig_price = self.current_price
+        current_price = float(full["Close"].iloc[-1])
         self.calculate_all_indicators()
         current_verdict = self.get_trading_signals().get("recommendation", "NEUTRAL")
+        levels = self.find_support_resistance()
+        atr = self.indicators.get("ATR")
 
-        # Already BUY — entry is the current price
-        if current_verdict in ("BUY", "STRONG BUY"):
-            return {
-                "current_price": current_price,
-                "current_verdict": current_verdict,
-                "entry_price": current_price,
-                "entry_verdict": current_verdict,
-                "search_range": (current_price, current_price),
-                "iterations": 0,
-            }
+        result = {
+            "current_price": current_price, "current_verdict": current_verdict,
+            "entry_price": None, "entry_verdict": current_verdict, "method": None,
+            "support": levels["support"], "stop_price": None, "risk_pct": None,
+            "search_range": (current_price * 0.40, current_price), "iterations": 0,
+        }
 
-        original_close = self.stock_data["Close"].iloc[-1]
-        low = current_price * 0.40
-        high = current_price
+        if self._is_buy(current_verdict):
+            result.update(entry_price=current_price, method="current", search_range=(current_price, current_price))
+            return result
+
+        # ---- 2. model inversion on a copy (last 600 bars give identical scores and run ~4x faster)
         iterations = 0
-
         try:
-            # Sanity: is there a BUY at the bottom of the range?
-            verdict_low = self._verdict_at_price(low)
-            if verdict_low not in ("BUY", "STRONG BUY"):
-                return {
-                    "current_price": current_price,
-                    "current_verdict": current_verdict,
-                    "entry_price": None,
-                    "entry_verdict": verdict_low,
-                    "search_range": (low, high),
-                    "iterations": 1,
-                }
-
-            # Binary search: invariant is verdict(low)=BUY, verdict(high)!=BUY
-            for _ in range(30):
+            self.stock_data = full.tail(600).copy()
+            for step in range(1, 61):                    # 99% ... 40% of the current price
                 iterations += 1
-                if high - low < 0.01:
+                px = current_price * (1 - step / 100)
+                if self._is_buy(self._verdict_at_price(px)):
+                    result.update(entry_price=px, entry_verdict="BUY", method="model")
                     break
-                mid = (low + high) / 2
-                v = self._verdict_at_price(mid)
-                if v in ("BUY", "STRONG BUY"):
-                    low = mid
-                else:
-                    high = mid
-
-            return {
-                "current_price": current_price,
-                "current_verdict": current_verdict,
-                "entry_price": low,
-                "entry_verdict": "BUY",
-                "search_range": (current_price * 0.40, current_price),
-                "iterations": iterations,
-            }
         finally:
-            # Always restore the original Close, even if an exception fires
-            self.stock_data.loc[self.stock_data.index[-1], "Close"] = original_close
+            self.stock_data = full
+            self.current_price = orig_price
             self.calculate_all_indicators()
+            self.get_trading_signals()
+        result["iterations"] = iterations
+
+        if result["entry_price"] is not None:
+            result["stop_price"], result["risk_pct"] = self._stop_for(result["entry_price"], levels["all"], atr)
+            return result
+
+        # ---- 3. support-based entry
+        sup = levels["support"]
+        if sup is not None:
+            entry = min(sup["price"], current_price)
+            stop, risk = self._stop_for(entry, levels["all"], atr)
+            result.update(entry_price=entry, entry_verdict="SUPPORT", method="support",
+                          stop_price=stop, risk_pct=risk)
+        return result
+
+    @staticmethod
+    def _stop_for(entry: float, levels: list, atr) -> tuple[float, float]:
+        """Stop one ATR under the level the entry sits on (or the nearest level below it), but never
+        more than two ATR from the entry and never closer than one ATR (so daily noise cannot
+        trigger it). With no ATR: 3% under the level."""
+        cands = [l["price"] for l in (levels or []) if l["price"] <= entry * 1.005]
+        base = max(cands) if cands else entry
+        if atr:
+            stop = max(base - atr, entry - 2 * atr)
+            stop = min(stop, entry - atr)
+        else:
+            stop = min(base * 0.97, entry * 0.995)
+        return float(stop), float((entry - stop) / entry * 100)
+
 
 # Standalone function for quick analysis
 def quick_technical_analysis(ticker, period='1y'):
