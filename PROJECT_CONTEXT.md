@@ -21,6 +21,7 @@ Streamlit app for value investing + technical analysis. Tabs:
 - investment_alerts.py — alert service (Telegram primary, CallMeBot fallback), market-hours sweeps, runs as a Windows service on a separate machine
 - telegram_setup.py — one-time Telegram setup (finds chat id, writes data/alert_secrets.json, sends a test)
 - screener.py — Stock Screener UI + parallel analysis; moatcheck/splits.py — split adjustment for per-share history
+- technical_indicators.py — indicators, weighted verdict, find_support_resistance(), find_entry_price()
 - moatcheck/ — Big 5 / EDGAR / Yahoo fetch code (edgar.py, combined.py, fetcher.py, big5.py, growth.py)
 - data/trade_log.csv — trade history
 
@@ -88,6 +89,7 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 - SECURITY: revoke the Telegram token exposed in commit 6b567f8, untrack `data/alert_secrets.json`, set the numeric chat id (run `telegram_setup.py` with the new token).
 - Deploy the alert service on its machine (see Alerts) and confirm the banner, heartbeat and one Telegram test message. Restore the CallMeBot quota or drop it as fallback.
 - Run a full screener scan (download the SEC bulk file first) and check the Retry/Error counts; rebuild the universe cache once.
+- Technical Analysis: wire the Analysis Period selector to the analyzer; consider a per-stock volatility-based search floor instead of a fixed -60%.
 - Back Test page: read ^NDX (not QQQ) for the Sleeves signal; add a cost-per-trade input; `test_backtest.py` is stale.
 - Fix the sleeves_strategy.py docstring (says "TQQQ / SQQQ / cash" and "-56% max drawdown").
 - Replace flat 2% financing in synthetic.py with the actual Fed funds rate.
@@ -120,8 +122,20 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 
 **Not changed / open:** Yahoo "analyst growth" is still earningsGrowth/revenueGrowth; multi-class filers rely on the Yahoo EPS fallback; 66 of 300 sampled stocks (foreign filers, trusts) have no usable statements and show Error.
 
-## Technical Analysis page fixes (2026-11-06)
+## Technical Analysis page fixes (committed 9478d5b, pushed 2026-11-06)
 - Why "Technical BUY Price" was often missing even below support: (1) `_verdict_at_price` changed the last bar but the scores read a stale `current_price`, so the tested price never reached the SMA/MACD/Bollinger scores; (2) even with that fixed, a lower price pushes the SMA and MACD scores to -1, so a stock under its moving averages cannot reach the +0.20 BUY threshold at any price (composite plateaus near +0.04); (3) the page's "Support Level" was the lower Bollinger Band, a moving envelope that sits ABOVE price when the stock is falling, so "below support" could never produce a level.
 - Now: `find_support_resistance()` returns real levels (confirmed swing lows/highs clustered within 1.5%, SMA 50/100/200, 52-week low/high; broken levels flip role). `find_entry_price()` returns the current price if the verdict is already BUY (LEAN BUY counts, matching the page), else the highest price where the model turns BUY (1% steps down to -60%), else the nearest support, with a stop one ATR under the level (clamped 1-2 ATR from entry) and the risk %. It works on a copy and restores all state (verified unchanged). No entry now only when the stock is at new lows with no support below.
 - Math fixes: RSI uses Wilder smoothing (the old 14-bar mean differed up to 6 points, KO 57.8 vs 64.4); Bollinger uses population std (ddof=0); Stochastic %K guards a flat 14-bar range (division by zero). These changed the verdict for 5 of 50 stocks tested (INTC WAIT to LEAN BUY, FTNT LEAN BUY to WAIT, HLI to BUY, CVNA to LEAN BUY, INGM to WAIT).
 - Result on 50 stocks: no entry price for 23 before, 0 now. Support-based entries are price-action levels, not model BUY signals; the page says so and shows the model verdict beside them. The page now analyzes full history ('max'); the Analysis Period selector in the UI is still not wired to it.
+- Page behaviour: Key Levels shows real support/resistance with the level's source (swing low, SMA 50, 52-week low, "former resistance"...), and the Bollinger band range as a reference line. The Technical BUY Price card says whether the entry is "current" (verdict already BUY), "model" (verdict flips to BUY at that price) or "support" (price-action level; model verdict shown beside it). A SELL-rated stock at support shows "AT SUPPORT, MODEL BEARISH" in amber. Stop = one ATR under the level, 1-2 ATR from the entry.
+- Examples (2026-11-06): MU $690 entry $652.01 (support), stop $593; NVDA $186.64 entry $184.05; AVGO $293.69 entry $293.68, model SELL; AMD entry $435.57 (model); KO/TGT/DIS already BUY. Timing: 0 ms when already BUY, about 30-70 ms by model, about 250 ms on the support fallback.
+- Not changed: the Analysis Period selector does nothing (page loads 'max'). `check_bnf_reversal_setup` and `get_mr_signal` read the same RSI and Bollinger columns, so the BNF alert counts can shift slightly after the math corrections.
+- Backups of pre-fix files are in the .temp folder under the user profile (technical_indicators.before_ta_fix.py, app.before_ta_fix.py, plus .before_ files from the screener rework).
+
+## Stock Analyzer valuation page changes (2026-11-06)
+- Value Price method (moatcheck/valuation.py): growth rate, future P/E = min(trailing P/E, 2 x growth%), future EPS = EPS x (1+g)^10, future price = EPS x P/E, discount 15% for 10 years, MOS = 50%. Arithmetic verified against a hand calculation. The growth cap in value_price() (`#growth = min(growth, 0.15) #RG`) is deliberately left commented out by the user; the Analyzer already limits Big 5 growth to 30% (floor 2%) and analyst growth to 25%.
+- Default growth source is now "Model: lower of Big 5 & analyst" (what the valuation function does on its own; MSFT 21.5% to $870.21). "Value conservative: 15%" stays as the second radio option; Big 5, Analyst and Custom are unchanged. The page resets to the model default on each new ticker. Falls back to Value conservative when no growth rate exists.
+- Analyst 5Y growth is Yahoo earningsGrowth/revenueGrowth (latest YoY), not a 5-year forecast. AAPL under that option: 25% growth gives Value $817 and MOS $409 (verdict BUY at $345) versus $215/$108 (AVOID) under the model. Open decision: relabel the option "Latest YoY growth (Yahoo)" with a warning when it is far above the 5-year record, cap it at 15%, or leave as is.
+- UI: "Growth used: X% (source)" line under the Value Price (single line, no wrap); all DEBUG lines removed; step 1 text of the calculation expander corrected (it wrongly said "capped at 15%").
+- Analyst Rating was always n/a because the quick Yahoo snapshot (used when full Yahoo statements fail, e.g. the pulp 4.x issue) never copied the analyst fields. Fixed with a shared `_analyst_fields()` helper; the same fix also fills sector, industry, country, business summary and 52-week range in that snapshot, which is why the Company Summary now shows. The Analyst Rating cell also shows "Analyst growth: X%".
+- Loss-making companies (e.g. IONQ, EPS negative every year): all earnings-based options give n/a, Custom cannot help. The warning now says so and points to the P/S valuation. Still open: "Value conservative" substitutes a fake $0.01 EPS (IONQ shows $0.30); an optional "expected EPS in 10 years" input for Custom was proposed and not built.

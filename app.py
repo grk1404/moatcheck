@@ -676,7 +676,7 @@ def render_analyzer() -> None:
 
     if "valuation_ticker" not in st.session_state or st.session_state["valuation_ticker"] != symbol:
         st.session_state["valuation_ticker"] = symbol
-        st.session_state["valuation_growth_mode"] = "Value conservative"
+        st.session_state.pop("valuation_growth_mode", None)     # default is chosen once the growth rates are known
         st.session_state["valuation_growth_result"] = None
 
     # --- Detect instrument type before doing anything expensive ---
@@ -814,7 +814,17 @@ def render_analyzer() -> None:
         # Always return 15% - this is Buffett's standard conservative rate
         return 0.15
 
+    _MODEL_MODE = "Model (lower of Big 5 & analyst)"
+
+    def _model_growth() -> float | None:
+        """The growth the valuation model picks on its own: the lower of the positive Big 5 and analyst rates."""
+        cands = [g for g in (big5_eps_g, fin.analyst_5yr_growth) if g is not None and g > 0]
+        return min(cands) if cands else None
+
     def _valuation_growth_rate_label(mode: str) -> str:
+        if mode == _MODEL_MODE:
+            g = _model_growth()
+            return f"Model: lower of Big 5 & analyst: {_fmt_pct(g) if g is not None else 'n/a'}"
         if mode == "Value conservative":
             rate = _moat_conservative_growth()
             return f"Value conservative: {_fmt_pct(rate) if rate is not None else 'n/a'}"
@@ -828,7 +838,8 @@ def render_analyzer() -> None:
         return mode
 
     def _valuation_growth_mode_options() -> list[str]:
-        options = ["Value conservative"]
+        options = [_MODEL_MODE] if _model_growth() is not None else []
+        options.append("Value conservative")
         if big5_eps_g is not None:
             options.append("Big 5 EPS growth")
         if fin.analyst_5yr_growth is not None:
@@ -837,7 +848,15 @@ def render_analyzer() -> None:
         return options
 
     def _compute_valuation_value(mode: str):
-        # st.write("DEBUG COMPUTE:", mode, "analyst=", fin.analyst_5yr_growth, "custom=", st.session_state.get("custom_growth_rate"))
+        if mode == _MODEL_MODE:
+            # The model's own rule: value_price() takes the lower of the two growth rates.
+            return value_price(
+                current_eps=eps_for_valuation,
+                big5_eps_growth=big5_eps_g,
+                analyst_growth=fin.analyst_5yr_growth,
+                historical_pe=fin.pe_ratio_ttm,
+            )
+
         if mode == "Custom":
             custom_growth_pct = float(st.session_state.get("custom_growth_rate", 0) or 0)
             if custom_growth_pct <= 0:
@@ -903,13 +922,14 @@ def render_analyzer() -> None:
 
     mode_options = _valuation_growth_mode_options()
     if "valuation_growth_mode" not in st.session_state or st.session_state["valuation_growth_mode"] not in mode_options:
-        st.session_state["valuation_growth_mode"] = "Value conservative"
+        st.session_state["valuation_growth_mode"] = mode_options[0]    # the model's own rule if computable
     selected_growth_mode = st.session_state["valuation_growth_mode"]
 
     val = st.session_state.get("valuation_growth_result")
     if val is None:
         val = _compute_valuation_value(selected_growth_mode)
         st.session_state["valuation_growth_result"] = val
+        st.session_state["valuation_calculated_mode"] = selected_growth_mode
 
     # --- MOVED UP: Define the rendering helpers before calling them ---
     _VERDICT_TOOLTIPS = {
@@ -939,7 +959,9 @@ def render_analyzer() -> None:
             col.markdown(
                 '<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
                 '<div style="font-size: 1.5rem; color: #9AA0A6;">n/a</div>'
-                '<div style="font-size: 0.72rem; color: #9aa0a6;">no analyst coverage</div>',
+                '<div style="font-size: 0.72rem; color: #9aa0a6;">no analyst coverage</div>'
+                + (f'<div style="font-size: 0.72rem; color: #9aa0a6;">Analyst growth: {fin.analyst_5yr_growth * 100:.1f}%</div>'
+                   if fin.analyst_5yr_growth is not None else ""),
                 unsafe_allow_html=True,
             )
             return
@@ -951,6 +973,8 @@ def render_analyzer() -> None:
             upside = (tgt - fin.current_price) / fin.current_price * 100
             detail_parts.append(f"target ${tgt:.0f} ({upside:+.0f}%)")
         detail = " · ".join(detail_parts)
+        if fin.analyst_5yr_growth is not None:
+            detail += f"<br>Analyst growth: {fin.analyst_5yr_growth * 100:.1f}%"
 
         col.markdown(
             f'<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
@@ -973,10 +997,20 @@ def render_analyzer() -> None:
     # ---------------------------------------------------------------------
 
     if val is None:
-        st.warning(
-            "⚠️ Cannot compute standard Value Price — this company has negative earnings or missing growth data. "
-            "Use the **Custom** growth source below to manually input a growth rate and calculate a theoretical value."
-        )
+        # Every earnings-based option needs a positive EPS to grow. Custom only changes the growth
+        # rate, so it cannot help a company that has never been profitable.
+        _has_positive_eps = (not fin.eps.empty) and bool((fin.eps > 0).any())
+        if not _has_positive_eps:
+            st.warning(
+                "⚠️ No Value Price: this company has no profitable year on record, so an earnings-based "
+                "valuation isn't meaningful (changing the growth rate can't fix that). "
+                "See the **Price-to-Sales (P/S) Valuation** further down the page instead."
+            )
+        else:
+            st.warning(
+                "⚠️ Cannot compute a Value Price with the selected growth source — the growth data it needs is missing. "
+                "Pick another source above, or use **Custom** to enter a growth rate."
+            )
 
     # Safe evaluation (checks if val is None before trying to read val.mos_price)
     v_verdict, v_detail, v_color = _verdict_price(
@@ -1178,6 +1212,16 @@ def render_analyzer() -> None:
     
     v1, v2, v3, v4, v5 = st.columns(5)
     v1.metric("Value Price / Intrinsic Value", _fmt_money(val.value_price, fin.exchange, fin.ticker) if val else "n/a")
+    if val:
+        _src_label = {
+            _MODEL_MODE: "model", "Value conservative": "conservative", "Custom": "custom",
+            "Big 5 EPS growth": "Big 5 EPS", "Analyst 5Y growth": "analyst",
+        }.get(st.session_state.get("valuation_calculated_mode"), val.growth_source)
+        v1.markdown(
+            f'<div style="font-size:0.8rem; color:#9aa0a6; white-space:nowrap; overflow:visible;">'
+            f'Growth used: {val.growth_rate * 100:.1f}% ({_src_label})</div>',
+            unsafe_allow_html=True,
+        )
     v2.metric("Margin of Safety (MOS) Buy Price", _fmt_money(val.mos_price, fin.exchange, fin.ticker) if val else "n/a")
     v3.metric("Current Price", _fmt_money(fin.current_price, fin.exchange, fin.ticker))
     _render_verdict_cell(v4, v_verdict, v_detail, v_color)
@@ -1241,8 +1285,6 @@ def render_analyzer() -> None:
                 help="Recalculate with selected growth rate"
             )
 
-    st.caption(f"DEBUG — mode: {selected_growth_mode} | custom box: {st.session_state.get('custom_growth_rate')}")
-
     if revalue_button:
         st.session_state["valuation_growth_result"] = _compute_valuation_value(selected_growth_mode)
         st.session_state["valuation_calculated_mode"] = selected_growth_mode
@@ -1259,10 +1301,10 @@ def render_analyzer() -> None:
 
             st.markdown(
                 f"""
-    **Step 1 — Pick the growth rate (the lower of two, capped at 15%)**
-    - Big 5 EPS growth (median of 5yr/3yr): **{_big5_g_txt}**
-    - Analyst 5yr growth: **{_analyst_g_txt}**
-    - Chosen: **{_fmt_pct(val.growth_rate)}** *(source: {val.growth_source}, capped at 15%)*
+    **Step 1 — Growth rate (from the source selected above; not capped). The default "Model" option uses the lower of the Big 5 and analyst rates**
+    - Big 5 EPS growth (median of the 10/5/3-year windows): **{_big5_g_txt}**
+    - Analyst growth: **{_analyst_g_txt}**
+    - Used: **{_fmt_pct(val.growth_rate)}** *(source: {val.growth_source}; "Value conservative" fixes this at 15%)*
 
     **Step 2 — Estimate future P/E (the lower of two)**
     - Historical TTM P/E: **{_hist_pe_txt}**
@@ -1324,8 +1366,6 @@ def render_analyzer() -> None:
             key="dcf_terminal_slider",
         ) / 100
 
-    st.caption(f"DEBUG: discount={dcf_discount:.4f}, terminal={dcf_terminal:.4f}")
-
     # Run the two-stage DCF with these inputs
     _fcf_ttm_dcf = float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None
     _growth_dcf = big5_eps_g if big5_eps_g is not None else fin.analyst_5yr_growth
@@ -1337,7 +1377,6 @@ def render_analyzer() -> None:
         discount_rate=dcf_discount,
         terminal_growth=dcf_terminal,
     )
-    st.caption(f"DEBUG: dcf fair_value={_dcf_val.fair_value if _dcf_val else None}")
     if _dcf_val is None:
         st.info("DCF not computable — needs positive TTM free cash flow and shares outstanding.")
     else:
@@ -3908,8 +3947,7 @@ def compute_annualized_returns(yft, symbol: str) -> dict:
 
     try:
         hist = yft.history(period="max")
-    except Exception as e:
-        st.write("DEBUG history error:", repr(e))
+    except Exception:
         return {}
 
     if hist is None or hist.empty:

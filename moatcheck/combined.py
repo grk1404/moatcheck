@@ -94,6 +94,20 @@ def _edgar_reporting_currency(edgar) -> str | None:
                     return key
     return None
 
+def _analyst_fields(info: dict) -> dict:
+    """Analyst rating, count and price targets from a Yahoo `info` dict (all optional)."""
+    key = info.get("recommendationKey")
+    n = _num(info.get("numberOfAnalystOpinions"))
+    return {
+        "analyst_rec_key": key if isinstance(key, str) and key != "none" else None,
+        "analyst_rec_mean": _num(info.get("recommendationMean")),
+        "analyst_count": int(n) if n is not None else None,
+        "analyst_target_mean": _num(info.get("targetMeanPrice")),
+        "analyst_target_high": _num(info.get("targetHighPrice")),
+        "analyst_target_low": _num(info.get("targetLowPrice")),
+    }
+
+
 _YAHOO_SLOTS = threading.BoundedSemaphore(10)   # max concurrent Yahoo `info` calls per process
 
 
@@ -150,6 +164,7 @@ def _info_snapshot(ticker: str) -> "Financials | None":
         company_country=info.get("country") or "",
         exchange=info.get("exchange", "") or info.get("fullExchangeName", ""),
         data_source="yfinance-snapshot",
+        **_analyst_fields(info),
     )
 
 
@@ -231,6 +246,13 @@ def fetch(ticker: str, light: bool = False, persist: bool = True) -> Financials:
                     info.get("exchange", "") or info.get("fullExchangeName", "")
                 ),
                 data_source="yfinance-snapshot",
+                company_sector=info.get("sector") or "",
+                company_industry=info.get("industry") or "",
+                company_country=info.get("country") or "",
+                company_summary=info.get("longBusinessSummary") or "",
+                week52_high=_num(info.get("fiftyTwoWeekHigh")),
+                week52_low=_num(info.get("fiftyTwoWeekLow")),
+                **_analyst_fields(info),
             )
         except Exception:
             snapshot = None  # truly no snapshot; EDGAR-only branch below
