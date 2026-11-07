@@ -26,7 +26,6 @@ from moatcheck.tickerlist import (
 
 import json
 from pathlib import Path
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 SCREENER_CACHE = Path("data/screener_results.json")
 SCREENER_TTL = 7 * 24 * 3600      # a successful analysis stays valid for 7 days (prices are refreshed every run)
@@ -37,6 +36,8 @@ UNIVERSE_CACHE = Path("data/screener_universe_v2.csv")      # v2: includes NASDA
 _OLD_UNIVERSE_CACHE = Path("data/screener_universe_cache.csv")
 UNIVERSE_CACHE_TTL = timedelta(days=7)
 UNIVERSE_WORKERS = 12
+UNIVERSE_MAX_BLANK = 0.10                      # more than this share of empty rows = incomplete list
+UNIVERSE_RETRY_AFTER = timedelta(hours=1)      # how soon an incomplete list may be re-fetched
 MAX_VALUATION_GROWTH = 0.30       # growth fed to the value price is capped here (same bound the alert service uses)
 
 # Yahoo exchange codes -> the names shown in the Exchange dropdown
@@ -76,6 +77,15 @@ def _fetch_meta(sym: str) -> dict:
             "market_cap": 0, "quote_type": ""}
 
 
+def _blank_share(df: pd.DataFrame) -> float:
+    """Share of rows with neither an exchange nor a market cap (Yahoo returned nothing for them)."""
+    if df is None or df.empty:
+        return 0.0
+    no_exch = df["exchange"].fillna("").astype(str).str.strip() == ""
+    no_cap = pd.to_numeric(df["market_cap"], errors="coerce").fillna(0) <= 0
+    return float((no_exch & no_cap).mean())
+
+
 def _seed_rows() -> dict[str, dict]:
     """Rows from earlier universe files that already have usable metadata (so a rebuild only
     fetches tickers it has never seen, or ones that failed last time)."""
@@ -104,8 +114,14 @@ def _build_universe_cache(force: bool = False) -> pd.DataFrame:
     """
     if not force and UNIVERSE_CACHE.exists():
         age = datetime.now() - datetime.fromtimestamp(UNIVERSE_CACHE.stat().st_mtime)
-        if age < UNIVERSE_CACHE_TTL:
-            return pd.read_csv(UNIVERSE_CACHE)
+        cached = pd.read_csv(UNIVERSE_CACHE)
+        blank = _blank_share(cached)
+        # A list built while Yahoo was throttling has many empty rows (no exchange, no size), which
+        # no filter can match. Do not trust it for a week: re-fetch just the empty rows, but not more
+        # often than once an hour so a throttled Yahoo is not hammered on every page load.
+        incomplete = blank > UNIVERSE_MAX_BLANK and age > UNIVERSE_RETRY_AFTER
+        if age < UNIVERSE_CACHE_TTL and not incomplete:
+            return cached
 
     with st.spinner("📊 Loading raw ticker list from SEC..."):
         raw = get_us_stock_universe()
@@ -737,447 +753,452 @@ def _safe_float(v) -> float | None:
         return None
 
 
-def rows_to_dataframe(rows: list[ScreenerRow]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Company": r.company,
-                "Ticker": r.ticker,
-                "Sector": r.sector or "n/a",
-                "Industry": r.industry or "n/a",
-                "Exchange": r.exchange or "n/a",
-                "Market Cap": fmt_money(_safe_float(r.market_cap), r.ticker),
-                "Wonderfulness": f"{_safe_float(r.score):.1f}/10" if _safe_float(r.score) is not None else "n/a",
-                "Stock Price": fmt_price(_safe_float(r.stock_price), r.ticker),
-                "Value Price": fmt_price(_safe_float(r.value_price), r.ticker),
-                "MOS Price": fmt_price(_safe_float(r.mos_price), r.ticker),
-                "P/E": f"{_safe_float(r.pe_ratio):.1f}" if _safe_float(r.pe_ratio) is not None else "n/a",
-                "Verdict": r.verdict,
-            }
-            for r in rows
-        ]
-    )
+def rows_to_dataframe(rows):                    # kept so older callers do not break
+    return rows_to_frame(rows)
 
 
-def style_screener_table(df: pd.DataFrame):
-    def style_row(row):
-        style = _VERDICT_COLORS.get(row["Verdict"], "")
-        return [style] * len(row)
+# ==================== SAVED RESULTS (CSV in the data folder) ====================
+RESULTS_CSV = Path("data/screener_results_latest.csv")
+RESULTS_META = Path("data/screener_results_latest.json")
+RESULTS_STALE_DAYS = 7
 
-    return df.style.apply(style_row, axis=1)
+# Session key -> default (in percent). Same keys the page has always used.
+_THRESHOLD_DEFAULTS = {
+    "scr_rev_min": 10.0, "scr_rev_max": 50.0,
+    "scr_eps_min": 10.0, "scr_eps_max": 50.0,
+    "scr_eq_min": 10.0, "scr_eq_max": 50.0,
+    "scr_ocf_min": 10.0, "scr_ocf_max": 50.0,
+    "scr_roic_min": 10.0, "scr_roic_max": 50.0,
+    "scr_cash_conv": 80.0, "scr_disc_fcf": 30.0, "scr_disc_np": 30.0,
+}
+_BIG5_ROWS = [
+    ("Revenue", "scr_rev_min", "scr_rev_max"),
+    ("EPS", "scr_eps_min", "scr_eps_max"),
+    ("Equity (BVPS)", "scr_eq_min", "scr_eq_max"),
+    ("Operating cash flow", "scr_ocf_min", "scr_ocf_max"),
+    ("ROIC", "scr_roic_min", "scr_roic_max"),
+]
 
-def _render_aggrid(df: pd.DataFrame) -> None:
-    gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_default_column(
-        filter=True,
-        sortable=True,
-        resizable=True,
-        floatingFilter=True,
-    )
-    gb.configure_column("Ticker", pinned="left", width=100)
-    gb.configure_column("Company", pinned="left", width=200)
-    gb.configure_column("Verdict", width=130)
+_FRAME_COLS = ["ticker", "company", "verdict", "score", "stock_price", "value_price", "mos_price",
+               "pe_ratio", "market_cap", "sector", "industry", "exchange", "error"]
 
-    grid_options = gb.build()
-    
-    # --- MUTE CONSOLE DURING AGGrid RENDER ---
-    # st_aggrid dumps massive amounts of debug info to the terminal. 
-    # We temporarily redirect sys.stdout to silence it.
-    import sys
-    import os
-    _original_stdout = sys.stdout
-    sys.stdout = open(os.devnull, 'w')
-    
+_VERDICT_BADGE = {
+    "BARGAIN BUY": "💎 BARGAIN BUY", "BUY": "🟢 BUY", "WATCH": "🟡 WATCH", "AVOID": "🔴 AVOID",
+    "Unknown": "⚪ Unknown", "Error": "⚠️ Error", "Retry": "🔁 Retry",
+}
+_MAIN_VERDICTS = ["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown"]
+
+
+def rows_to_frame(rows: list[ScreenerRow]) -> pd.DataFrame:
+    """Results as a plain numeric table (this is what is saved to CSV)."""
+    recs = [{
+        "ticker": r.ticker, "company": r.company, "verdict": r.verdict,
+        "score": _safe_float(r.score), "stock_price": _safe_float(r.stock_price),
+        "value_price": _safe_float(r.value_price), "mos_price": _safe_float(r.mos_price),
+        "pe_ratio": _safe_float(r.pe_ratio), "market_cap": _safe_float(r.market_cap),
+        "sector": r.sector or "", "industry": r.industry or "", "exchange": r.exchange or "",
+        "error": r.error or "",
+    } for r in rows]
+    return pd.DataFrame(recs, columns=_FRAME_COLS)
+
+
+def frame_to_rows(df: pd.DataFrame) -> list[ScreenerRow]:
+    def f(v):
+        return None if v is None or (isinstance(v, float) and v != v) else float(v)
+
+    def s(v):
+        return "" if v is None or (isinstance(v, float) and v != v) else str(v)
+
+    rows = []
+    for rec in df.to_dict("records"):
+        rows.append(ScreenerRow(
+            company=s(rec.get("company")) or s(rec.get("ticker")),
+            ticker=s(rec.get("ticker")),
+            score=f(rec.get("score")), stock_price=f(rec.get("stock_price")),
+            value_price=f(rec.get("value_price")), mos_price=f(rec.get("mos_price")),
+            verdict=s(rec.get("verdict")) or "Unknown",
+            pe_ratio=f(rec.get("pe_ratio")),
+            exchange=s(rec.get("exchange")) or None, sector=s(rec.get("sector")) or None,
+            industry=s(rec.get("industry")) or None, market_cap=f(rec.get("market_cap")),
+            error=s(rec.get("error")) or None,
+        ))
+    return rows
+
+
+def save_results(rows: list[ScreenerRow], meta: dict) -> bool:
+    """Write the results CSV and its settings file atomically. Returns False if a file is locked
+    (for example open in Excel), so the caller can say so instead of failing silently."""
     try:
-        AgGrid(
-            df,
-            gridOptions=grid_options,
-            height=600,
-            theme="streamlit",
-            update_mode=GridUpdateMode.NO_UPDATE,
-            allow_unsafe_jscode=False,
+        RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESULTS_CSV.with_suffix(f".{os.getpid()}.tmp")
+        rows_to_frame(rows).to_csv(tmp, index=False, encoding="utf-8")
+        tmp.replace(RESULTS_CSV)
+        tmpm = RESULTS_META.with_suffix(f".{os.getpid()}.tmp")
+        tmpm.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        tmpm.replace(RESULTS_META)
+        return True
+    except OSError:
+        return False
+
+
+def load_saved_results() -> tuple[list[ScreenerRow], dict] | None:
+    """The last saved screen as (rows, meta), or None if there is none (or it cannot be read)."""
+    if not RESULTS_CSV.exists():
+        return None
+    try:
+        df = pd.read_csv(
+            RESULTS_CSV, keep_default_na=False, na_values=[""],
+            dtype={c: str for c in ("ticker", "company", "verdict", "sector", "industry", "exchange", "error")},
         )
-    finally:
-        # ALWAYS restore stdout, even if AgGrid crashes
-        sys.stdout.close()
-        sys.stdout = _original_stdout
+        rows = frame_to_rows(df)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    try:
+        meta = json.loads(RESULTS_META.read_text(encoding="utf-8")) if RESULTS_META.exists() else {}
+    except (OSError, ValueError):
+        meta = {}
+    if not meta.get("finished_at"):
+        meta["finished_at"] = datetime.fromtimestamp(RESULTS_CSV.stat().st_mtime).isoformat(timespec="seconds")
+    return rows, meta
 
-def display_screener_stats(rows: list[ScreenerRow]):
-    col1, col2, col3, col4 = st.columns(4)
 
-    total = len(rows)
-    successful = len([r for r in rows if r.error is None])
-    bargain_buys = len([r for r in rows if r.verdict == "BARGAIN BUY"])
-    buys = len([r for r in rows if r.verdict in ["BARGAIN BUY", "BUY"]])
+# ==================== PAGE ====================
+def _init_settings_state(meta: dict) -> None:
+    """First visit in a session: put every control back to what produced the saved list."""
+    ss = st.session_state
+    if ss.get("scr_init"):
+        return
+    saved = meta.get("settings") or {}
+    pct = meta.get("thresholds_pct") or {}
+    size = saved.get("size")
+    ss.setdefault("scr_size", size if size in MARKET_CAP_RANGES else "All Sizes")
+    exch = saved.get("exchange")
+    ss.setdefault("scr_exchange", exch if exch in EXCHANGES else "All Exchanges")
+    secs = [x for x in (saved.get("sectors") or []) if x in SECTORS]
+    ss.setdefault("scr_sectors", secs)
+    ss.setdefault("scr_india", bool(saved.get("include_india", False)))
+    ss.setdefault("scr_workers", DEFAULT_MAX_WORKERS)
+    ss.setdefault("scr_live", True)
+    ss.setdefault("scr_force", False)
+    for key, default in _THRESHOLD_DEFAULTS.items():
+        try:
+            ss.setdefault(key, float(pct.get(key, default)))
+        except (TypeError, ValueError):
+            ss.setdefault(key, default)
+    ss.setdefault("scr_v_verdicts", list(_MAIN_VERDICTS))
+    ss.setdefault("scr_v_min", 0.0)
+    ss.setdefault("scr_v_search", "")
+    ss["scr_init"] = True
 
-    with col1:
-        st.metric("Total Analyzed", total)
-    with col2:
-        st.metric("Successful", successful)
-    with col3:
-        st.metric("Buy Candidates", buys)
-    with col4:
-        st.metric("Bargain Buys", bargain_buys)
 
-# ==================== MAIN SCREENER UI ====================
-def render_stock_screener() -> None:
-    """Main screener UI — shows results LIVE as companies are analyzed."""
+def _thresholds_from_state() -> dict:
+    ss = st.session_state
+    g = lambda k: float(ss[k]) / 100.0
+    return {
+        "revenue": {"min": g("scr_rev_min"), "max": g("scr_rev_max")},
+        "eps": {"min": g("scr_eps_min"), "max": g("scr_eps_max")},
+        "equity": {"min": g("scr_eq_min"), "max": g("scr_eq_max")},
+        "ocf": {"min": g("scr_ocf_min"), "max": g("scr_ocf_max")},
+        "roic": {"min": g("scr_roic_min"), "max": g("scr_roic_max")},
+        "cash_conversion": {"min": g("scr_cash_conv"), "max": 999.0},
+        "discount_fcf": {"min": g("scr_disc_fcf"), "max": 999.0},
+        "discount_np": {"min": g("scr_disc_np"), "max": 999.0},
+    }
 
-    st.markdown("### 🏦 Stock Screener - Find Wonderful Businesses")
-    st.caption(
-      "**Full-universe screening:** Scans every US-listed stock via SEC EDGAR + "
-        "yFinance. Results are cached for 7 days — reruns are incremental."
+
+def _describe_settings(meta: dict) -> str:
+    s = meta.get("settings") or {}
+    parts = [s.get("size", "All Sizes"), s.get("exchange", "All Exchanges")]
+    secs = s.get("sectors") or []
+    parts.append(", ".join(secs) if secs else "All sectors")
+    if s.get("include_india"):
+        parts.append("incl. India")
+    return " · ".join(parts)
+
+
+def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
+    """Scan the stocks that match the current filters, save the result, and return (rows, meta)."""
+    ss = st.session_state
+    size, exchange, sectors = ss["scr_size"], ss["scr_exchange"], list(ss["scr_sectors"])
+    include_india = bool(ss["scr_india"])
+    min_mcap, max_mcap = MARKET_CAP_RANGES[size]
+    start = time.time()
+
+    if ss["scr_force"]:
+        st.cache_data.clear()
+        if SCREENER_CACHE.exists():
+            SCREENER_CACHE.unlink()
+
+    universe_df = load_stock_universe()
+    if not include_india:
+        universe_df = universe_df[~universe_df["ticker"].str.endswith((".NS", ".BO"), na=False)]
+    else:
+        try:
+            india_tickers = get_indian_stock_tickers()
+            india_df = pd.DataFrame({
+                "ticker": india_tickers,
+                "exchange": ["NSE" if t.endswith(".NS") else "BSE" for t in india_tickers],
+                "sector": [""] * len(india_tickers),
+                "market_cap": [0] * len(india_tickers),
+            })
+            universe_df = pd.concat([universe_df, india_df], ignore_index=True)
+        except Exception:
+            pass                                    # carry on with US only
+
+    if sectors:
+        universe_df = universe_df[universe_df["sector"].isin(sectors)]
+    if exchange and exchange != "All Exchanges":
+        universe_df = universe_df[universe_df["exchange"] == exchange]
+    if min_mcap > 0:
+        universe_df = universe_df[universe_df["market_cap"] >= min_mcap]
+    if max_mcap < float("inf"):
+        universe_df = universe_df[universe_df["market_cap"] <= max_mcap]
+
+    tickers = universe_df["ticker"].tolist()
+    if not tickers:
+        st.warning("No stocks match the company filters (size, exchange, sector). Loosen them and run again.")
+        return None
+
+    st.info(f"📊 Screening **{len(tickers):,}** stocks that match your company filters.")
+    results = deep_analyze_batch(tickers, int(ss["scr_workers"]), bool(ss["scr_live"]), thresholds=thresholds)
+
+    elapsed = time.time() - start
+    meta = {
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_s": round(elapsed, 1),
+        "n_tickers": len(tickers),
+        "settings": {"size": size, "exchange": exchange, "sectors": sectors, "include_india": include_india},
+        "thresholds_pct": {k: float(ss[k]) for k in _THRESHOLD_DEFAULTS},
+    }
+    if save_results(results, meta):
+        st.success(f"✅ Screened {len(results):,} stocks in {elapsed:.0f}s and saved to `{RESULTS_CSV}`.")
+    else:
+        st.warning(f"Screened {len(results):,} stocks, but `{RESULTS_CSV}` could not be written "
+                   "(is it open in Excel?). The results are shown below but were not saved.")
+    return results, meta
+
+
+def _render_settings() -> None:
+    """Company filters, Big 5 thresholds and quality filters, in that order."""
+    st.markdown("##### Company filters")
+    c1, c2, c3 = st.columns(3)
+    c1.selectbox("Company size", options=list(MARKET_CAP_RANGES.keys()), key="scr_size")
+    c2.selectbox("Exchange", options=EXCHANGES, key="scr_exchange")
+    c3.multiselect(
+        "Sector", options=[s for s in SECTORS if s != "All Sectors"], key="scr_sectors",
+        placeholder="All sectors", help="Pick one or more sectors, or leave empty for all.",
     )
 
-    with st.expander("⚙️ Screener Settings", expanded=True):
-        # Elegant single-row filter layout
-        col1, col2, col3 = st.columns(3)
+    st.markdown("##### Big 5 growth thresholds")
+    st.caption("Annual growth a company must reach (**min**) and must not exceed (**max**), in %. "
+               "A company passes a metric only if every window (10, 5, 3 and 1 year) falls inside the range.")
+    cols = st.columns(5)
+    for col, (label, kmin, kmax) in zip(cols, _BIG5_ROWS):
+        with col:
+            st.markdown(f"**{label}**")
+            a, b = st.columns(2)
+            a.number_input("Min %", key=kmin, min_value=0.0, max_value=100.0, step=1.0, format="%.0f")
+            b.number_input("Max %", key=kmax, min_value=0.0, max_value=100.0, step=1.0, format="%.0f")
 
-        with col1:
-            st.markdown("**Company Size**")
-            mcap_preset = st.selectbox(
-                "Market Cap Range",
-                options=list(MARKET_CAP_RANGES.keys()),
-                index=0,
-                label_visibility="collapsed",
-            )
-            min_mcap, max_mcap = MARKET_CAP_RANGES[mcap_preset]
+    st.markdown("##### Additional quality filters")
+    st.caption("Minimums, in %. A company passes if its value is at or above the number.")
+    q1, q2, q3 = st.columns(3)
+    q1.number_input("Cash conversion at least", key="scr_cash_conv", min_value=0.0, max_value=500.0,
+                    step=5.0, format="%.0f", help="Operating cash flow as a share of net income, 10-year average.")
+    q2.number_input("Discount to fair value (FCF) at least", key="scr_disc_fcf", min_value=-100.0,
+                    max_value=100.0, step=5.0, format="%.0f")
+    q3.number_input("Discount to fair value (NP) at least", key="scr_disc_np", min_value=-100.0,
+                    max_value=100.0, step=5.0, format="%.0f")
 
-        with col2:
-            st.markdown("**Exchange**")
-            exchange = st.selectbox(
-                "Exchange",
-                options=EXCHANGES,
-                index=0,
-                label_visibility="collapsed",
-            )
 
-        with col3:
-            st.markdown("**Sector**")
-            # Multi-select for sectors
-            sector_filter = st.multiselect(
-                "Select Sectors",
-                options=[s for s in SECTORS if s != "All Sectors"],
-                default=[],
-                label_visibility="collapsed",
-                help="Select one or more sectors. Leave empty for all sectors.",
-                placeholder="All Sectors",
-            )        
-        # Performance settings in a secondary row
-        col4, col5 = st.columns([1, 3])
-        with col4:
-            max_workers = st.slider(
-                "Workers",
-                min_value=5,
-                max_value=128,
-                value=DEFAULT_MAX_WORKERS,
-                step=8,
-                help="Parallel processing speed"
-            )        
-        with col5:
-            show_live_results = st.checkbox(
-                "📡 Show LIVE results as they come in",
-                value=True,
-                help="Display each company immediately after analysis (recommended)"
-            )
-        include_india = st.checkbox(
-            "🇮🇳 Include Indian stocks (NSE)",
-            value=False,
-            help=(
-                "Adds ~2,000 NSE-listed tickers. Note: EDGAR doesn't cover Indian "
-                "companies, so the Big 5 will show n/a for long-history metrics. "
-                "Technical signals and intrinsic value still work."
-            ),
-        )
-
+def _render_advanced() -> None:
+    """Rarely used controls and data upkeep, kept out of the way."""
+    a1, a2 = st.columns(2)
+    with a1:
+        st.slider("Parallel workers", min_value=8, max_value=128, step=8, key="scr_workers",
+                  help="How many stocks are fetched at once. More is faster until Yahoo or SEC start throttling.")
+        st.checkbox("Show results live while screening", key="scr_live")
+    with a2:
+        st.checkbox("Include Indian stocks (NSE)", key="scr_india",
+                    help="Adds about 2,000 NSE tickers. SEC EDGAR has no data for them, so long-history metrics show n/a.")
+        st.checkbox("Re-analyze everything (ignore cached analysis)", key="scr_force",
+                    help="Throws away the cached per-stock analysis and starts from scratch. Much slower; "
+                         "normally not needed, because changing a threshold re-scores the cache instantly.")
+    st.divider()
+    m1, m2 = st.columns(2)
+    with m1:
         from moatcheck import edgar as _edgar_mod
-        _zip = _edgar_mod._BULK_ZIP
-        _zip_ok = _zip.exists() and (time.time() - _zip.stat().st_mtime) < _edgar_mod._BULK_MAX_AGE
-        if _zip_ok:
-            _age_d = (time.time() - _zip.stat().st_mtime) / 86400
-            st.caption(f"⚡ SEC bulk data present ({_age_d:.0f} days old): full scans need no per-stock SEC requests.")
+        zp = _edgar_mod._BULK_ZIP
+        zip_ok = zp.exists() and (time.time() - zp.stat().st_mtime) < _edgar_mod._BULK_MAX_AGE
+        st.markdown("**SEC bulk data**")
+        if zip_ok:
+            st.caption(f"Present, {(time.time() - zp.stat().st_mtime) / 86400:.0f} day(s) old. "
+                       "Full scans need no per-stock SEC requests.")
         else:
-            st.warning("SEC bulk data not downloaded: scans fall back to one rate-limited SEC request per stock "
-                       "(much slower). Download it once (about 1.4 GB, 1-2 minutes).")
-        if st.button("⬇️ Download / refresh SEC bulk data"):
-            _bar = st.progress(0.0, text="Downloading SEC companyfacts.zip…")
+            st.caption("⚠️ Not downloaded. Scans fall back to one SEC request per stock (much slower).")
+        if st.button("Download / refresh SEC data (1.4 GB)", key="scr_btn_sec"):
+            bar = st.progress(0.0, text="Downloading SEC companyfacts.zip…")
             try:
-                _edgar_mod.refresh_bulk_facts(
-                    progress=lambda d, t: _bar.progress(min(1.0, d / t) if t else 0.0,
-                                                        text=f"Downloading… {d / 1048576:,.0f} MB"))
-                _bar.empty()
+                _edgar_mod.refresh_bulk_facts(progress=lambda d, t: bar.progress(
+                    min(1.0, d / t) if t else 0.0, text=f"Downloading… {d / 1048576:,.0f} MB"))
+                bar.empty()
                 st.success("SEC bulk data updated.")
-            except Exception as _e:
-                _bar.empty()
-                st.error(f"Download failed: {_e}")
-
-        force_refresh = st.checkbox(
-            "🔄 Force fresh scan (ignore cache)",
-            value=False,
-            help="Ignore all cached results and re-analyze every ticker from scratch."
-        )
-        
-        if st.button("🔨 Rebuild universe cache", help="Refresh sector/exchange metadata. Takes ~10 min."):
+            except Exception as e:
+                bar.empty()
+                st.error(f"Download failed: {e}")
+    with m2:
+        st.markdown("**Stock list**")
+        if UNIVERSE_CACHE.exists():
+            age = (time.time() - UNIVERSE_CACHE.stat().st_mtime) / 86400
+            st.caption(f"Sector, exchange and size for every ticker, {age:.0f} day(s) old. Refreshes itself weekly.")
+        else:
+            st.caption("Not built yet. It is built automatically on the first run (about 10 minutes).")
+        if st.button("Rebuild stock list now", key="scr_btn_universe",
+                     help="Re-fetches sector, exchange and market cap for every ticker."):
             _build_universe_cache(force=True)
             st.cache_data.clear()
             st.rerun()
 
-        # --- Big 5 growth thresholds ---
-        with st.expander("📊 Big 5 growth thresholds", expanded=False):
-            st.caption(
-                "Set a minimum and maximum acceptable growth rate for each metric. "
-                "A company passes a metric only if its CAGR falls within [Min, Max] "
-                "for **every** computed window. Changes take effect on the next run."
-            )
 
-            tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
+def _view_table(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """The display table (real numbers, so sorting works) and its column formats."""
+    india = df["ticker"].astype(str).str.endswith((".NS", ".BO")).any()
+    px_fmt = "%.2f" if india else "$%.2f"
+    view = pd.DataFrame({
+        "Ticker": df["ticker"],
+        "Company": df["company"],
+        "Verdict": df["verdict"].map(lambda v: _VERDICT_BADGE.get(v, v)),
+        "Score": df["score"],
+        "Price": df["stock_price"],
+        "Value Price": df["value_price"],
+        "MOS Price": df["mos_price"],
+        "P/E": df["pe_ratio"],
+        "Market Cap (B)": df["market_cap"] / 1e9,
+        "Sector": df["sector"],
+        "Industry": df["industry"],
+        "Exchange": df["exchange"],
+    })
+    cfg = {
+        "Ticker": st.column_config.TextColumn(width="small"),
+        "Company": st.column_config.TextColumn(width="medium"),
+        "Verdict": st.column_config.TextColumn(width="medium"),
+        "Score": st.column_config.ProgressColumn("Score (0-10)", min_value=0.0, max_value=10.0, format="%.1f"),
+        "Price": st.column_config.NumberColumn(format=px_fmt),
+        "Value Price": st.column_config.NumberColumn(format=px_fmt),
+        "MOS Price": st.column_config.NumberColumn(format=px_fmt),
+        "P/E": st.column_config.NumberColumn(format="%.1f"),
+        "Market Cap (B)": st.column_config.NumberColumn(format="%.2f"),
+    }
+    return view, cfg
 
-            with tcol1:
-                st.markdown("**Revenue**")
-                rev_min = st.number_input(
-                    "Rev min", min_value=0.0, max_value=100.0,
-                    value=10.0, step=1.0, format="%.0f",
-                    key="scr_rev_min", label_visibility="collapsed",
-                ) / 100
-                rev_max = st.number_input(
-                    "Rev max", min_value=0.0, max_value=100.0,
-                    value=50.0, step=1.0, format="%.0f",
-                    key="scr_rev_max", label_visibility="collapsed",
-                ) / 100
 
-            with tcol2:
-                st.markdown("**EPS**")
-                eps_min = st.number_input(
-                    "EPS min", min_value=0.0, max_value=100.0,
-                    value=10.0, step=1.0, format="%.0f",
-                    key="scr_eps_min", label_visibility="collapsed",
-                ) / 100
-                eps_max = st.number_input(
-                    "EPS max", min_value=0.0, max_value=100.0,
-                    value=50.0, step=1.0, format="%.0f",
-                    key="scr_eps_max", label_visibility="collapsed",
-                ) / 100
+def _render_results(rows: list[ScreenerRow], meta: dict, source: str) -> None:
+    df = rows_to_frame(rows)
+    ok = df["error"] == ""
+    n_buy = int(df["verdict"].isin(["BUY", "BARGAIN BUY"]).sum())
+    n_bargain = int((df["verdict"] == "BARGAIN BUY").sum())
 
-            with tcol3:
-                st.markdown("**Equity**")
-                eq_min = st.number_input(
-                    "Eq min", min_value=0.0, max_value=100.0,
-                    value=10.0, step=1.0, format="%.0f",
-                    key="scr_eq_min", label_visibility="collapsed",
-                ) / 100
-                eq_max = st.number_input(
-                    "Eq max", min_value=0.0, max_value=100.0,
-                    value=50.0, step=1.0, format="%.0f",
-                    key="scr_eq_max", label_visibility="collapsed",
-                ) / 100
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Stocks screened", f"{len(df):,}")
+    m2.metric("With a valuation", f"{int(df['value_price'].notna().sum()):,}")
+    m3.metric("Buy candidates", f"{n_buy:,}", help="Verdict BUY or BARGAIN BUY: price at or below the MOS buy price.")
+    m4.metric("Bargain buys", f"{n_bargain:,}", help="Price at or below half the MOS buy price.")
 
-            with tcol4:
-                st.markdown("**OCF**")
-                ocf_min = st.number_input(
-                    "OCF min", min_value=0.0, max_value=100.0,
-                    value=10.0, step=1.0, format="%.0f",
-                    key="scr_ocf_min", label_visibility="collapsed",
-                ) / 100
-                ocf_max = st.number_input(
-                    "OCF max", min_value=0.0, max_value=100.0,
-                    value=50.0, step=1.0, format="%.0f",
-                    key="scr_ocf_max", label_visibility="collapsed",
-                ) / 100
+    st.markdown("#### Results")
+    present = [v for v in _MAIN_VERDICTS + ["Error", "Retry"] if (df["verdict"] == v).any()]
+    f1, f2, f3, f4 = st.columns([3, 3, 2, 2])
+    search = f1.text_input("Search", key="scr_v_search", placeholder="Ticker or company",
+                           label_visibility="collapsed")
+    verdicts = f2.multiselect("Verdict", options=present, key="scr_v_verdicts", label_visibility="collapsed",
+                              placeholder="Verdict")
+    min_score = f3.slider("Min score", 0.0, 10.0, step=0.5, key="scr_v_min", help="Hide companies scoring below this.")
 
-            with tcol5:
-                st.markdown("**ROIC**")
-                roic_min = st.number_input(
-                    "ROIC min", min_value=0.0, max_value=100.0,
-                    value=10.0, step=1.0, format="%.0f",
-                    key="scr_roic_min", label_visibility="collapsed",
-                ) / 100
-                roic_max = st.number_input(
-                    "ROIC max", min_value=0.0, max_value=100.0,
-                    value=50.0, step=1.0, format="%.0f",
-                    key="scr_roic_max", label_visibility="collapsed",
-                ) / 100
+    mask = df["verdict"].isin(verdicts) if verdicts else pd.Series(True, index=df.index)
+    if min_score > 0:
+        mask &= df["score"].fillna(-1) >= min_score
+    if search.strip():
+        q = search.strip().lower()
+        mask &= (df["ticker"].str.lower().str.contains(q, regex=False)
+                 | df["company"].str.lower().str.contains(q, regex=False))
+    shown = df[mask]
 
-        # --- Additional quality filters ---
-        with st.expander("📊 Additional quality filters", expanded=False):
-            st.caption(
-                "One-sided floors. A company passes if its metric is **at or above** "
-                "the value entered here. Changes take effect on the next run."
-            )
-
-            acol1, acol2, acol3 = st.columns(3)
-
-            with acol1:
-                st.markdown("**Cash Conversion ≥**")
-                cash_conv_min = st.number_input(
-                    "Cash Conversion", min_value=0.0, max_value=500.0,
-                    value=80.0, step=5.0, format="%.0f",
-                    key="scr_cash_conv", label_visibility="collapsed",
-                ) / 100
-
-            with acol2:
-                st.markdown("**Discount to FV (FCF) ≥**")
-                disc_fcf_min = st.number_input(
-                    "Discount FCF", min_value=-100.0, max_value=100.0,
-                    value=30.0, step=5.0, format="%.0f",
-                    key="scr_disc_fcf", label_visibility="collapsed",
-                ) / 100
-
-            with acol3:
-                st.markdown("**Discount to FV (NP) ≥**")
-                disc_np_min = st.number_input(
-                    "Discount NP", min_value=-100.0, max_value=100.0,
-                    value=30.0, step=5.0, format="%.0f",
-                    key="scr_disc_np", label_visibility="collapsed",
-                ) / 100
-
-        # --- Combine into the thresholds dict (after both expanders) ---
-        screener_thresholds = {
-            "revenue":         {"min": rev_min,       "max": rev_max},
-            "eps":             {"min": eps_min,       "max": eps_max},
-            "equity":          {"min": eq_min,        "max": eq_max},
-            "ocf":             {"min": ocf_min,       "max": ocf_max},
-            "roic":            {"min": roic_min,      "max": roic_max},
-            "cash_conversion": {"min": cash_conv_min, "max": 999.0},
-            "discount_fcf":    {"min": disc_fcf_min,  "max": 999.0},
-            "discount_np":     {"min": disc_np_min,   "max": 999.0},
-        }
-
-    st.caption(
-        "**Active filters:** "
-        f"Revenue {screener_thresholds['revenue']['min']*100:.0f}–{screener_thresholds['revenue']['max']*100:.0f}% · "
-        f"EPS {screener_thresholds['eps']['min']*100:.0f}–{screener_thresholds['eps']['max']*100:.0f}% · "
-        f"Equity {screener_thresholds['equity']['min']*100:.0f}–{screener_thresholds['equity']['max']*100:.0f}% · "
-        f"OCF {screener_thresholds['ocf']['min']*100:.0f}–{screener_thresholds['ocf']['max']*100:.0f}% · "
-        f"ROIC {screener_thresholds['roic']['min']*100:.0f}–{screener_thresholds['roic']['max']*100:.0f}% · "
-        f"Cash Conversion ≥ {screener_thresholds['cash_conversion']['min']*100:.0f}% · "
-        f"Discount FCF ≥ {screener_thresholds['discount_fcf']['min']*100:.0f}% · "
-        f"Discount NP ≥ {screener_thresholds['discount_np']['min']*100:.0f}%"
+    f4.download_button(
+        "⬇️ Download CSV", data=shown.to_csv(index=False).encode("utf-8"),
+        file_name=f"screener_{datetime.now():%Y%m%d_%H%M}.csv", mime="text/csv", width="stretch",
+        help="Downloads the rows currently shown, with plain numbers.",
     )
+    st.caption(f"Showing **{len(shown):,}** of {len(df):,} stocks"
+               + ("" if source == "fresh" else " · loaded from the saved file"))
 
-    if st.button("🔍 Start Screening", type="primary"):
-        start_time = time.time()
+    if shown.empty:
+        st.info("No stocks match the view filters above.")
+    else:
+        view, cfg = _view_table(shown)
+        st.dataframe(view, column_config=cfg, hide_index=True, width="stretch",
+                     height=min(680, 36 * len(view) + 42))
 
-        if force_refresh:
-            # Nuke both caches
-            st.cache_data.clear()                # Streamlit memory cache
-            if SCREENER_CACHE.exists():
-                SCREENER_CACHE.unlink()          # Disk cache
-        
-        # ---- Pre-scan filter: only analyze tickers that pass the settings filters ----
-        universe_df = load_stock_universe()   # cached DataFrame with sector/exchange/mcap
+    errs = df[~ok]
+    if len(errs):
+        with st.expander(f"⚠️ {len(errs):,} stocks could not be analyzed"):
+            st.caption("Usually funds, trusts or foreign filers with no usable statements. "
+                       "\"Retry\" means SEC or Yahoo was busy; run again to retry those.")
+            st.dataframe(errs[["ticker", "company", "verdict", "error"]].head(300),
+                         hide_index=True, width="stretch", height=300)
 
-        if not include_india:
-            universe_df = universe_df[
-                ~universe_df["ticker"].str.endswith((".NS", ".BO"), na=False)
-            ]
-        if include_india:
-            try:
-                india_tickers = get_indian_stock_tickers()
-                india_df = pd.DataFrame({
-                    "ticker": india_tickers,
-                    "exchange": [
-                        "NSE" if t.endswith(".NS") else "BSE"
-                        for t in india_tickers
-                    ],
-                    "sector": [""] * len(india_tickers),
-                    "market_cap": [0] * len(india_tickers),
-                })
-                universe_df = pd.concat([universe_df, india_df], ignore_index=True)
-            except Exception:
-                pass  # if India fetch fails, continue with US only
 
-        if sector_filter:
-            universe_df = universe_df[universe_df["sector"].isin(sector_filter)]
+def render_stock_screener() -> None:
+    """Stock Screener: shows the last saved list, with settings and a single Run button."""
+    ss = st.session_state
+    st.header("🏦 Stock Screener")
+    st.caption("Scores every US-listed stock on the Big 5 growth rates and estimates its value. "
+               "Your latest results are saved and shown whenever you open this page.")
 
-        if exchange and exchange != "All Exchanges":
-            universe_df = universe_df[universe_df["exchange"] == exchange]
+    if "screener_results" not in ss:
+        loaded = load_saved_results()
+        if loaded:
+            ss["screener_results"], ss["screener_meta"] = loaded
+            ss["screener_source"] = "saved"
+    rows = ss.get("screener_results")
+    meta = ss.get("screener_meta") or {}
+    _init_settings_state(meta)
 
-        if min_mcap > 0:
-            universe_df = universe_df[universe_df["market_cap"] >= min_mcap]
-        if max_mcap < float("inf"):
-            universe_df = universe_df[universe_df["market_cap"] <= max_mcap]
+    status_area = st.container()                    # filled in after the settings, so it can hold the Run button
 
-        all_tickers = universe_df["ticker"].tolist()
-        region = "US + India" if include_india else "US"
+    with st.expander("⚙️ Screener settings", expanded=not rows):
+        _render_settings()
+    with st.expander("🔧 Advanced options & data maintenance", expanded=False):
+        _render_advanced()
 
-        if not all_tickers:
-            st.warning("No tickers match the current Company Size / Exchange / Sector filters.")
-            st.stop()
+    with status_area:
+        s_col, b_col = st.columns([5, 1])
+        with s_col:
+            if meta.get("finished_at"):
+                try:
+                    done = datetime.fromisoformat(meta["finished_at"])
+                    age_d = (datetime.now() - done).total_seconds() / 86400
+                    stale = f" · ⚠️ {age_d:.0f} days old, consider re-running" if age_d > RESULTS_STALE_DAYS else ""
+                    st.markdown(f"**Last screened:** {done:%b %d, %Y %H:%M} · "
+                                f"{meta.get('n_tickers', len(rows or [])):,} stocks · {_describe_settings(meta)}{stale}")
+                except ValueError:
+                    st.markdown("**Saved results loaded.**")
+            else:
+                st.markdown("**No saved results yet.** Click **Run screener**.")
+        run_clicked = b_col.button("▶ Run screener", type="primary", width="stretch", key="scr_run")
 
-        st.info(
-            f"📊 **Universe after pre-filters:** {len(all_tickers):,} {region}-listed stocks "
-            f"— running scan on the filtered set"
-        )
-
-        results = deep_analyze_batch(
-            all_tickers,
-            max_workers,
-            show_live_results,
-            thresholds=screener_thresholds,
-        )
-
-        elapsed = time.time() - start_time
-        st.session_state["screener_results"] = results
-        st.session_state["screener_time"] = elapsed
-        st.success(f"✅ Scanned **{len(all_tickers):,}** stocks in **{elapsed:.1f}s**")
-
-    # Display final results
-    if "screener_results" not in st.session_state:
-        st.info("👆 Click **Start Screening** to find wonderful businesses!")
-        return
-
-    rows: list[ScreenerRow] = st.session_state["screener_results"]
+    if run_clicked:
+        bad = [label for label, kmin, kmax in _BIG5_ROWS if ss[kmin] > ss[kmax]]
+        if bad:
+            st.error("Min is higher than Max for: " + ", ".join(bad) + ". Fix the Big 5 thresholds and run again.")
+        else:
+            out = _run_screen(_thresholds_from_state())
+            if out:
+                rows, meta = out
+                ss["screener_results"], ss["screener_meta"], ss["screener_source"] = rows, meta, "fresh"
 
     if not rows:
-        st.warning("No results to display.")
+        st.info("Nothing to show yet. The first run builds the stock list (about 10 minutes) and analyzes each stock; "
+                "after that, runs reuse the cached analysis and finish in a few minutes at most.")
         return
-
-    # Stats
-    display_screener_stats(rows)
-    
-    # All filtering is handled by the results table itself (column filters)
-    filtered_rows = rows
-
-    # Show count
-    st.caption(f"📊 Showing **{len(filtered_rows)}** of **{len(rows)}** results")
-    
-    # Display filtered results
-    if filtered_rows:
-        df_filtered = rows_to_dataframe(filtered_rows)
-        _render_aggrid(df_filtered)
-    else:
-        st.warning("No results match your filters. Try adjusting the criteria above.")
-        df_filtered = pd.DataFrame()
-
-    # ========== EXPORT AND CLEAR ==========
-    col_export, col_clear = st.columns(2)
-    
-    with col_export:
-        if st.button("📥 Export to CSV"):
-            # Export the filtered results
-            if filtered_rows:
-                csv_data = rows_to_dataframe(filtered_rows)
-            else:
-                csv_data = rows_to_dataframe(rows)
-            csv = csv_data.to_csv(index=False)
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name=f"screener_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-            )
-
-    with col_clear:
-        if st.button("🗑️ Clear Results"):
-            st.session_state.pop("screener_results", None)
-            st.session_state.pop("screener_time", None)
-            st.rerun()
-
-    # ========== ERRORS ==========
-    errors = [r for r in rows if r.error]
-    if errors and st.checkbox(f"⚠️ Show {len(errors)} errors"):
-        with st.expander(f"❌ {len(errors)} ticker(s) had errors"):
-            for r in errors[:50]:
-                st.markdown(f"**{r.ticker}** — {r.error}")
-            if len(errors) > 50:
-                st.markdown(f"... and {len(errors) - 50} more errors")
+    _render_results(rows, meta, ss.get("screener_source", "saved"))
