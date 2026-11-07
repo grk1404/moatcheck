@@ -818,6 +818,109 @@ def get_holding_tickers() -> list[tuple[str, str]]:
     return [(sym, d) for sym, (_, d) in sorted(best.items(), key=lambda kv: -kv[1][0])]
 
 
+def _position_cols(df: pd.DataFrame) -> dict:
+    """Names of the columns this CSV uses (Fidelity has renamed them over time)."""
+    def first(*names):
+        return next((n for n in names if n in df.columns), None)
+    return {
+        "today": first("Today's gain/loss dollar", "Today's Gain/Loss Dollar", "Today's gain/loss $"),
+        "today_pct": first("Today's gain/loss percent", "Today's Gain/Loss Percent", "Today's gain/loss %"),
+        "total": first("Total gain/loss dollar", "Total Gain/Loss Dollar", "Total gain/loss $"),
+        "total_pct": first("Total gain/loss percent", "Total Gain/Loss Percent", "Total gain/loss %"),
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_live_closes(symbols: tuple) -> dict:
+    """{symbol: (latest_close, previous_close, date)} from Yahoo, cached for 5 minutes.
+
+    One batched download per 200 symbols (about 0.6 s for 8). Symbols Yahoo cannot price are
+    simply absent from the result.
+    """
+    import yfinance as yf
+    from data_provider import _shared_session
+
+    out: dict = {}
+    syms = list(symbols)
+    for i in range(0, len(syms), 200):
+        part = syms[i:i + 200]
+        try:
+            d = yf.download(part, period="10d", progress=False, threads=True,
+                            session=_shared_session, auto_adjust=False)
+            close = d["Close"] if isinstance(d.columns, pd.MultiIndex) else d[["Close"]].rename(columns={"Close": part[0]})
+        except Exception:
+            continue
+        for sym in part:
+            if sym not in close.columns:
+                continue
+            col = close[sym].dropna()
+            if len(col) < 2:
+                continue
+            last, prev = float(col.iloc[-1]), float(col.iloc[-2])
+            if last > 0 and prev > 0:
+                out[sym] = (last, prev, pd.Timestamp(col.index[-1]).strftime("%Y-%m-%d"))
+    return out
+
+
+def apply_live_prices(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Re-price the CSV positions with the latest Yahoo close.
+
+    For every row with a ticker-like symbol and a quantity, sets Last price, Current value, Today's
+    gain/loss and Total gain/loss from the latest close (cost basis stays from the CSV). Cash
+    sweeps, CUSIP rows and anything Yahoo cannot price keep the CSV values, so the totals never
+    lose a row. Returns (dataframe, info) where info has: live (rows repriced), total (priced rows
+    attempted), as_of (latest price date), csv_value and live_value (portfolio totals).
+    """
+    import re
+
+    info = {"live": 0, "total": 0, "as_of": None, "csv_value": float(pd.to_numeric(raw.get("Current value"), errors="coerce").fillna(0).sum()),
+            "live_value": None}
+    df = raw.copy()
+    cols = _position_cols(df)
+    pat = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+
+    # Only rows the export already values: a row with no current value (a written-off or delisted
+    # holding like ESINQ) is not turned into a position by a $0.00004 quote.
+    cand = df[df["Symbol"].astype(str).str.strip().str.upper().map(lambda x: bool(pat.match(x)))
+              & (pd.to_numeric(df["Quantity"], errors="coerce") > 0)
+              & (pd.to_numeric(df["Current value"], errors="coerce").fillna(0) > 0)]
+    if cand.empty:
+        info["live_value"] = info["csv_value"]
+        return df, info
+    syms = tuple(sorted({str(x).strip().upper() for x in cand["Symbol"]}))
+    info["total"] = int(len(cand))
+    px = _fetch_live_closes(syms)
+    if not px:
+        info["live_value"] = info["csv_value"]
+        return df, info
+
+    for idx, r in cand.iterrows():
+        sym = str(r["Symbol"]).strip().upper()
+        if sym not in px:
+            continue
+        last, prev, when = px[sym]
+        qty = float(r["Quantity"])
+        basis = r.get("Cost basis total")
+        value = qty * last
+        df.at[idx, "Last price"] = last
+        df.at[idx, "Current value"] = value
+        if cols["today"]:
+            df.at[idx, cols["today"]] = qty * (last - prev)
+        if cols["today_pct"]:
+            df.at[idx, cols["today_pct"]] = (last / prev - 1) * 100
+        if basis == basis and basis is not None and float(basis) > 0:
+            if cols["total"]:
+                df.at[idx, cols["total"]] = value - float(basis)
+            if cols["total_pct"]:
+                df.at[idx, cols["total_pct"]] = (value / float(basis) - 1) * 100
+        info["live"] += 1
+        if info["as_of"] is None or when > info["as_of"]:
+            info["as_of"] = when
+
+    info["live_value"] = float(pd.to_numeric(df["Current value"], errors="coerce").fillna(0).sum())
+    return df, info
+
+
 def _metric_html(label: str, value: str, sub: str = "", help_text: str = "",
                  sub_color: str = "#9aa0a6") -> str:
     """Render a metric card as HTML so we can control the help tooltip glyph."""
@@ -1322,7 +1425,25 @@ def render_my_investments() -> None:
         st.warning("CSV parsed to zero rows.")
         return
 
-    df = _derive(raw)
+    csv_df = _derive(raw)                      # as exported (kept for the comparison line)
+    try:
+        raw_live, live_info = apply_live_prices(raw)
+    except Exception as e:                    # never let a price problem blank the page
+        raw_live, live_info = raw, {"live": 0, "total": 0, "as_of": None, "csv_value": None, "live_value": None, "error": str(e)}
+    df = _derive(raw_live)
+
+    if live_info.get("live"):
+        diff = (live_info["live_value"] or 0) - (live_info["csv_value"] or 0)
+        st.caption(
+            f"💲 Live prices as of **{live_info['as_of']}** close for {live_info['live']} of {live_info['total']} holdings "
+            f"(cash and unpriced rows keep their CSV values). The export itself shows ${live_info['csv_value']:,.0f}; "
+            f"live value is ${live_info['live_value']:,.0f} ({diff:+,.0f}). Cost basis comes from the CSV."
+        )
+    else:
+        st.warning(
+            "⚠️ Could not get live prices; showing the CSV values from the export "
+            "(Portfolio Value, Today's Change and returns will not follow the market until prices load)."
+        )
 
     _hero_strip(df)                 # Hero Strip
     _render_52w_alert(df)           # 52-week high stock alerts    
