@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import threading
 import time
 
 import pandas as pd
@@ -12,6 +14,8 @@ from data_provider import get_ticker
 from datetime import datetime, timedelta
 
 from moatcheck import compute_big5, fetch, value_price
+from moatcheck.big5 import resolve_thresholds
+from moatcheck.edgar import EdgarTransientError
 from moatcheck.fetcher import FetchError
 from moatcheck.tickerlist import (
     get_combined_tickers,
@@ -25,23 +29,83 @@ from pathlib import Path
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 SCREENER_CACHE = Path("data/screener_results.json")
-SCREENER_TTL = 7 * 24 * 3600  # 7 days
-UNIVERSE_CACHE = Path("data/screener_universe_cache.csv")
+SCREENER_TTL = 7 * 24 * 3600      # a successful analysis stays valid for 7 days (prices are refreshed every run)
+ERROR_TTL = 3 * 24 * 3600         # a hard failure (no SEC filings / bad data) is re-tried after 3 days
+CACHE_VERSION = 3                 # bump when scoring/valuation logic changes; older rows are recomputed
+SAVE_EVERY = 100                  # write progress to disk every N finished tickers
+UNIVERSE_CACHE = Path("data/screener_universe_v2.csv")      # v2: includes NASDAQ + quote type
+_OLD_UNIVERSE_CACHE = Path("data/screener_universe_cache.csv")
 UNIVERSE_CACHE_TTL = timedelta(days=7)
+UNIVERSE_WORKERS = 12
+MAX_VALUATION_GROWTH = 0.30       # growth fed to the value price is capped here (same bound the alert service uses)
+
+# Yahoo exchange codes -> the names shown in the Exchange dropdown
+EXCHANGE_DISPLAY = {
+    "NSI": "NSE", "BSE": "BSE",
+    "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ", "NASDAQ": "NASDAQ",
+    "NYQ": "NYSE", "NYSE": "NYSE", "PCX": "NYSE Arca", "ASE": "AMEX", "AMEX": "AMEX",
+    "BTS": "BATS", "BATS": "BATS", "OQB": "OTC", "OQX": "OTC", "PNK": "OTC",
+}
+
+
+def _fetch_meta(sym: str) -> dict:
+    """Sector / exchange / market cap / quote type for one ticker (one cheap Yahoo info call)."""
+    from data_provider import get_ticker
+
+    info = None
+    for attempt in range(4):
+        try:
+            info = get_ticker(sym).info or {}
+            break
+        except Exception as e:
+            throttled = "ratelimit" in type(e).__name__.lower() or "too many" in str(e).lower() or "429" in str(e)
+            if not throttled:
+                break
+            time.sleep(2 ** attempt + 1)      # 2s, 3s, 5s, 9s
+    if info is not None:
+        return {
+            "ticker": sym,
+            "company": info.get("longName") or info.get("shortName") or sym,
+            "exchange": info.get("exchange") or "",
+            "sector": info.get("sector") or "",
+            "industry": info.get("industry") or "",
+            "market_cap": info.get("marketCap") or 0,
+            "quote_type": info.get("quoteType") or "",
+        }
+    return {"ticker": sym, "company": sym, "exchange": "", "sector": "", "industry": "",
+            "market_cap": 0, "quote_type": ""}
+
+
+def _seed_rows() -> dict[str, dict]:
+    """Rows from earlier universe files that already have usable metadata (so a rebuild only
+    fetches tickers it has never seen, or ones that failed last time)."""
+    seed: dict[str, dict] = {}
+    for path in (UNIVERSE_CACHE, _OLD_UNIVERSE_CACHE):
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if "quote_type" not in df.columns:
+            df["quote_type"] = ""
+        for r in df.to_dict(orient="records"):
+            ok = (r.get("market_cap") or 0) > 0 or str(r.get("exchange") or "").strip()
+            if ok and r.get("ticker") not in seed:
+                seed[r["ticker"]] = {k: ("" if pd.isna(v) else v) for k, v in r.items()}
+    return seed
 
 
 def _build_universe_cache(force: bool = False) -> pd.DataFrame:
-    """Build or refresh the screener universe cache with yfinance metadata.
+    """Build or refresh the screener universe (sector, exchange, market cap, quote type).
 
-    Fetches sector, industry, exchange, and market cap for every ticker in
-    the SEC universe. Saves to CSV. Takes ~10-15 minutes on a cold run.
+    Metadata is fetched in parallel and reused from earlier builds, so after the first build
+    a refresh only fetches new tickers (about 3 minutes for 7,600 tickers cold, seconds warm).
     """
     if not force and UNIVERSE_CACHE.exists():
         age = datetime.now() - datetime.fromtimestamp(UNIVERSE_CACHE.stat().st_mtime)
         if age < UNIVERSE_CACHE_TTL:
             return pd.read_csv(UNIVERSE_CACHE)
-
-    from data_provider import get_ticker
 
     with st.spinner("📊 Loading raw ticker list from SEC..."):
         raw = get_us_stock_universe()
@@ -50,47 +114,110 @@ def _build_universe_cache(force: bool = False) -> pd.DataFrame:
         else:
             tickers = list(raw)
 
-    st.info(f"Building universe cache for {len(tickers):,} tickers. This takes 10–15 minutes on first run.")
-    progress = st.progress(0.0, text="Fetching metadata…")
+    seed = {} if force else _seed_rows()
+    todo = [t for t in tickers if t not in seed]
+    st.info(f"Universe: {len(tickers):,} tickers ({len(tickers) - len(todo):,} reused, {len(todo):,} to fetch).")
 
-    rows = []
-    for i, sym in enumerate(tickers):
-        progress.progress((i + 1) / len(tickers), text=f"Fetching {sym} ({i+1}/{len(tickers)})")
-        try:
-            info = get_ticker(sym).info or {}
-            rows.append({
-                "ticker": sym,
-                "company": info.get("longName") or info.get("shortName") or sym,
-                "exchange": info.get("exchange") or "",
-                "sector": info.get("sector") or "",
-                "industry": info.get("industry") or "",
-                "market_cap": info.get("marketCap") or 0,
-            })
-        except Exception:
-            rows.append({
-                "ticker": sym, "company": sym, "exchange": "",
-                "sector": "", "industry": "", "market_cap": 0,
-            })
+    fetched: dict[str, dict] = {}
+    if todo:
+        progress = st.progress(0.0, text="Fetching metadata…")
+        with ThreadPoolExecutor(max_workers=UNIVERSE_WORKERS) as ex:
+            futs = {ex.submit(_fetch_meta, t): t for t in todo}
+            for i, fut in enumerate(as_completed(futs), 1):
+                try:
+                    row = fut.result()
+                except Exception:
+                    t = futs[fut]
+                    row = {"ticker": t, "company": t, "exchange": "", "sector": "", "industry": "",
+                           "market_cap": 0, "quote_type": ""}
+                fetched[row["ticker"]] = row
+                if i % 25 == 0 or i == len(todo):
+                    progress.progress(i / len(todo), text=f"Fetched {i:,}/{len(todo):,}")
+        progress.empty()
 
-    progress.empty()
-    df = pd.DataFrame(rows)
+    cols = ["ticker", "company", "exchange", "sector", "industry", "market_cap", "quote_type"]
+    rows = [{c: (seed.get(t) or fetched.get(t) or {}).get(c, "") for c in cols} for t in tickers]
+    df = pd.DataFrame(rows, columns=cols)
     UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(UNIVERSE_CACHE, index=False)
+    tmp = UNIVERSE_CACHE.with_suffix(".csv.tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(UNIVERSE_CACHE)
+    failed = sum(1 for t in todo if not (fetched.get(t) or {}).get("exchange") and not (fetched.get(t) or {}).get("market_cap"))
+    if todo and failed / len(todo) > 0.10:
+        st.warning(f"⚠️ {failed:,} of {len(todo):,} new tickers returned no metadata (Yahoo throttling?). "
+                   "Click 'Rebuild universe cache' again later; only those tickers are re-fetched.")
     st.success(f"✅ Cached {len(df):,} tickers → {UNIVERSE_CACHE}")
     return df
+
+
+_CACHE_LOCK = threading.Lock()
+
 
 def _load_screener_cache() -> dict[str, dict]:
     if not SCREENER_CACHE.exists():
         return {}
     try:
-        return json.loads(SCREENER_CACHE.read_text())
+        data = json.loads(SCREENER_CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
 
 
 def _save_screener_cache(cache: dict[str, dict]) -> None:
+    """Atomic write (temp file + replace), so a stop mid-save can't corrupt the cache."""
     SCREENER_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    SCREENER_CACHE.write_text(json.dumps(cache))
+    tmp = SCREENER_CACHE.with_suffix(f".{os.getpid()}.tmp")
+    with _CACHE_LOCK:
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        tmp.replace(SCREENER_CACHE)
+
+
+_METRIC_LABELS = {
+    "roic": "ROIC", "sales": "Sales", "eps": "EPS", "equity": "Equity (BVPS)", "fcf": "Free Cash Flow",
+    "cash_conversion": "Cash Conversion Ratio", "discount_fcf": "Discount to Fair Value (FCF)",
+    "discount_np": "Discount to Fair Value (NP)",
+}
+
+
+def _big5_values(b) -> dict:
+    """Growth numbers per metric and window. They do not depend on the pass/fail thresholds, so
+    they are cached and the score is recomputed from them whenever the thresholds change."""
+    out: dict = {}
+    for key in _METRIC_LABELS:
+        m = getattr(b, key, None)
+        if m is not None:
+            out[key] = {str(w): v for w, v in m.values.items()}
+    return out
+
+
+def score_from_values(vals: dict | None, thresholds: dict | None) -> float | None:
+    """Wonderfulness score from cached growth numbers under the given thresholds (microseconds)."""
+    from moatcheck.big5 import Big5Result, MetricResult
+
+    if not vals:
+        return None
+
+    def mk(key: str) -> MetricResult:
+        v = vals.get(key) or {}
+        return MetricResult(label=_METRIC_LABELS[key],
+                            values={w: v.get(str(w)) for w in (10, 5, 3, 1)}, passes=False)
+
+    b = Big5Result(
+        roic=mk("roic"), sales=mk("sales"), eps=mk("eps"), equity=mk("equity"), fcf=mk("fcf"),
+        cash_conversion=mk("cash_conversion") if "cash_conversion" in vals else None,
+        discount_fcf=mk("discount_fcf") if "discount_fcf" in vals else None,
+        discount_np=mk("discount_np") if "discount_np" in vals else None,
+        thresholds=resolve_thresholds(thresholds),
+    )
+    return b.wonderfulness().overall
+
+
+def _cache_entry_valid(entry: dict | None, now: float) -> bool:
+    if not entry or entry.get("v") != CACHE_VERSION:
+        return False
+    row = entry.get("row") or {}
+    ttl = ERROR_TTL if row.get("error") else SCREENER_TTL
+    return now - entry.get("cached_at", 0) < ttl
 
 def _row_to_dict(r: ScreenerRow) -> dict:
     return {
@@ -100,6 +227,7 @@ def _row_to_dict(r: ScreenerRow) -> dict:
         "pe_ratio": r.pe_ratio, "exchange": r.exchange,
         "sector": r.sector, "industry": r.industry,
         "market_cap": r.market_cap, "error": r.error,
+        "big5_values": r.big5_values,
     }
 
 
@@ -129,10 +257,13 @@ def _row_from_dict(d: dict) -> ScreenerRow:
         industry=d.get("industry"),
         market_cap=_f(d.get("market_cap")),
         error=d.get("error"),
+        big5_values=d.get("big5_values"),
     )
 
 # ==================== CONFIGURATION ====================
-DEFAULT_MAX_WORKERS = 20
+DEFAULT_MAX_WORKERS = 80          # total concurrent fetches (processes x threads)
+PROCESS_MIN_BATCH = 150           # below this, threads in one process are quicker than starting workers
+THREADS_PER_PROCESS = 8
 DEFAULT_MAX_CANDIDATES = 100
 
 # Filter Options
@@ -181,6 +312,8 @@ class ScreenerRow:
     industry: str | None = None
     market_cap: float | None = None
     error: str | None = None
+    transient: bool = False    # SEC/Yahoo hiccup: retry, never cache
+    big5_values: dict | None = None   # growth numbers per metric/window (independent of thresholds)
 
 
 _VERDICT_COLORS = {
@@ -225,8 +358,15 @@ def fmt_money(v: float | None, ticker: str = "") -> str:
 # ==================== LOAD UNIVERSE (NO API KEY) ====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_stock_universe() -> pd.DataFrame:
-    """Load the enriched stock universe (with sector/exchange/market cap)."""
-    return _build_universe_cache(force=False)
+    """Load the enriched stock universe: exchange names normalized to the dropdown values and
+    funds / ETFs removed (they have no financial statements and used to be 15% of all errors)."""
+    df = _build_universe_cache(force=False).copy()
+    df["exchange"] = df["exchange"].fillna("").astype(str).map(lambda x: EXCHANGE_DISPLAY.get(x.strip().upper(), x.strip()))
+    if "quote_type" in df.columns:
+        qt = df["quote_type"].fillna("").astype(str).str.upper()
+        df = df[(qt == "") | (qt == "EQUITY")]
+    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce").fillna(0)
+    return df.reset_index(drop=True)
 
 # ==================== DEEP ANALYSIS ====================
 def big5_eps_growth(big5) -> float | None:
@@ -279,151 +419,160 @@ def verdict_price(current: float | None, mos: float | None, value: float | None)
     return "AVOID"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def deep_analyze_ticker(ticker: str, thresholds_tuple: tuple) -> ScreenerRow:
-    """Full MoatCheck analysis on a single ticker."""
-    # Reconstruct thresholds dict from the tuple (Streamlit cache needs hashable args)
-    thresholds = dict(thresholds_tuple) if thresholds_tuple else None
+def _error_row(ticker: str, err: Exception, transient: bool) -> ScreenerRow:
+    """Row for a failed analysis, with whatever basic Yahoo info is available."""
+    company, price, cap, exch, sector, industry, pe = ticker, None, None, None, None, None, None
     try:
-        # Get the financial data
-        fin = fetch(ticker)
-        # Normalize exchange for display and exchange-based filtering
-        _EXCHANGE_DISPLAY = {
-            "NSI": "NSE", "BSE": "BSE",
-            "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ",
-            "NYQ": "NYSE", "PCX": "NYSE Arca", "ASE": "AMEX",
-        }
+        info = get_ticker(ticker).info or {}
+        company = info.get("longName") or info.get("shortName") or ticker
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        cap = info.get("marketCap")
+        exch = EXCHANGE_DISPLAY.get(str(info.get("exchange", "")).upper(), info.get("exchange"))
+        sector, industry, pe = info.get("sector"), info.get("industry"), info.get("trailingPE")
+    except Exception:
+        pass
+    return ScreenerRow(
+        company=company, ticker=ticker, score=None, stock_price=price, value_price=None,
+        mos_price=None, verdict="Retry" if transient else "Error", pe_ratio=pe, exchange=exch,
+        sector=sector, industry=industry, market_cap=cap, error=str(err)[:300], transient=transient,
+    )
+
+
+def analyze_ticker(ticker: str, thresholds: dict | None) -> ScreenerRow:
+    """Full MoatCheck analysis of one ticker. Pure (no Streamlit), so it can be tested and reused."""
+    try:
+        fin = fetch(ticker, light=True, persist=False)
         big5 = compute_big5(fin, thresholds=thresholds)
         score = big5.wonderfulness().overall
 
-        # Get valuation
         current_eps = positive_eps(fin)
-         # Sanity guard: EPS must be plausibly per-share.
-        # A per-share EPS cannot exceed the stock price by more than ~2×
-        # (even the richest company has a P/E above 0.5). If it does,
-        # the data source returned a total, not a per-share value.
-        if current_eps is not None and fin.current_price and fin.current_price > 0:
-            eps_to_price = current_eps / fin.current_price
-            if eps_to_price > 0.5 or eps_to_price < -0.5:
-                current_eps = None
 
-         # --- Sanity guard: P/E must be plausible ---
         historical_pe = fin.pe_ratio_ttm
         if historical_pe is not None and (historical_pe <= 0 or historical_pe > 200):
             historical_pe = None
-            
-        big5_eps_g = big5_eps_growth(big5)
+
+        def _clamp(g):
+            return None if g is None else min(g, MAX_VALUATION_GROWTH)
 
         val = value_price(
             current_eps=current_eps,
-            big5_eps_growth=big5_eps_g,
-            analyst_growth=fin.analyst_5yr_growth,
+            big5_eps_growth=_clamp(big5_eps_growth(big5)),
+            analyst_growth=_clamp(fin.analyst_5yr_growth),
             historical_pe=historical_pe,
         )
-
         value_price_val = val.value_price if val else None
         mos_price_val = val.mos_price if val else None
-        verdict = verdict_price(fin.current_price, mos_price_val, value_price_val)
 
-        # Sanity guard: an intrinsic value more than 5× the market price is
-        # almost always bad input data, not a real opportunity.
+        # An intrinsic value more than 5x the market price is almost always bad input data.
         if value_price_val is not None and fin.current_price and fin.current_price > 0:
             if value_price_val / fin.current_price > 5.0:
                 value_price_val = None
                 mos_price_val = None
-
         verdict = verdict_price(fin.current_price, mos_price_val, value_price_val)
 
-        # Always fetch additional info from yfinance as fallback
-        sector = None
-        industry = None
-        market_cap = fin.market_cap
-        exchange = fin.exchange
-        stock_price = fin.current_price
-        pe_ratio = fin.pe_ratio_ttm
-        company_name = fin.company_name or ticker
-
-        # Get fresh info from yfinance for sector/industry
-        try:
-            stock = get_ticker(ticker)
-            info = stock.info
-            sector = info.get("sector")
-            industry = info.get("industry")
-            
-            if ticker.upper().endswith(".NS"):
-                exchange = "NSE"
-            elif ticker.upper().endswith(".BO"):
-                exchange = "BSE"
-            elif exchange in _EXCHANGE_DISPLAY:
-                exchange = _EXCHANGE_DISPLAY[exchange]
-            
-            if market_cap is None:
-                market_cap = info.get("marketCap")
-            
-            if stock_price is None:
-                stock_price = info.get("currentPrice") or info.get("regularMarketPrice")
-            
-            if company_name == ticker:
-                company_name = info.get("longName") or info.get("shortName") or ticker
-                
-        except Exception:
-            pass
-
-        #print(f"DEBUG {ticker}: current_eps={current_eps}, big5_eps_g={big5_eps_g}, value_price={value_price_val}, mos_price={mos_price_val}, market_cap={market_cap}")
+        exch = fin.exchange
+        t_up = ticker.upper()
+        if t_up.endswith(".NS"):
+            exch = "NSE"
+        elif t_up.endswith(".BO"):
+            exch = "BSE"
+        else:
+            exch = EXCHANGE_DISPLAY.get(str(exch).upper(), exch)
 
         return ScreenerRow(
-            company=company_name,
+            company=fin.company_name or ticker,
             ticker=fin.ticker,
             score=score,
-            stock_price=stock_price,
+            stock_price=fin.current_price,
             value_price=value_price_val,
             mos_price=mos_price_val,
             verdict=verdict,
-            pe_ratio=pe_ratio,
-            exchange=exchange,
-            sector=sector,
-            industry=industry,
-            market_cap=market_cap,
+            pe_ratio=fin.pe_ratio_ttm,
+            exchange=exch,
+            sector=fin.company_sector or None,
+            industry=fin.company_industry or None,
+            market_cap=fin.market_cap,
             error=None,
+            big5_values=_big5_values(big5),
         )
-    except (FetchError, Exception) as e:
-        # If analysis fails, try to get at least basic info from yfinance
-        company_name = ticker
-        stock_price = None
-        market_cap = None
-        exchange = None
-        sector = None
-        industry = None
-        pe_ratio = None
-        
-        try:
-            stock = get_ticker(ticker)
-            info = stock.info
-            company_name = info.get("longName") or info.get("shortName") or ticker
-            stock_price = info.get("currentPrice") or info.get("regularMarketPrice")
-            market_cap = info.get("marketCap")
-            exchange = info.get("exchange")
-            sector = info.get("sector")
-            industry = info.get("industry")
-            pe_ratio = info.get("trailingPE")
-        except Exception:
-            pass
+    except EdgarTransientError as e:
+        return _error_row(ticker, e, transient=True)
+    except FetchError as e:
+        return _error_row(ticker, e, transient=False)
+    except Exception as e:      # unexpected bug: report it, but do not let one ticker stop the scan
+        return _error_row(ticker, f"{type(e).__name__}: {e}", transient=False)
 
-        return ScreenerRow(
-            company=company_name,
-            ticker=ticker,
-            score=None,
-            stock_price=stock_price,
-            value_price=None,
-            mos_price=None,
-            verdict="Error",
-            pe_ratio=pe_ratio,
-            exchange=exchange,
-            sector=sector,
-            industry=industry,
-            market_cap=market_cap,
-            error=str(e),
-        )
+
+def _worker_init(sec_rate: float) -> None:
+    """Runs once in each worker process: quiet warnings and take this process's SEC rate share."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    from moatcheck.edgar import set_sec_rate
+    set_sec_rate(sec_rate)
+
+
+def _analyze_chunk(tickers: list[str], thresholds: dict | None, threads: int) -> list[ScreenerRow]:
+    """Analyze a chunk of tickers inside a worker process, overlapping the network waits with
+    threads. Processes give real CPU parallelism (the parsing is CPU-bound; threads share one core)."""
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        return list(ex.map(lambda t: analyze_ticker(t, thresholds), tickers))
+
+
+def deep_analyze_ticker(ticker: str, thresholds_tuple: tuple) -> ScreenerRow:
+    """Backward-compatible wrapper (takes the hashable thresholds tuple)."""
+    return analyze_ticker(ticker, dict(thresholds_tuple) if thresholds_tuple else None)
+
+
+def refresh_prices(rows: list[ScreenerRow], chunk: int = 200) -> int:
+    """Replace each row's price with the latest close and recompute its verdict.
+
+    Cached rows are up to 7 days old and Yahoo's `info` price can lag by days, so the
+    verdict (price vs MOS) must not come from them. One batch download covers 200 tickers
+    in about 5 seconds. Rows whose download fails keep their previous price. Returns the
+    number of rows updated.
+    """
+    import yfinance as yf
+    from data_provider import _shared_session
+
+    # Only stocks with a valuation need a fresh price (their verdict is price vs MOS). That is
+    # about a quarter of the list, which cuts a 7,600-stock refresh from ~3 min to under a minute.
+    targets = [r for r in rows if r.error is None and r.value_price and r.mos_price]
+    by_sym = {r.ticker: r for r in targets}
+    syms = list(by_sym)
+
+    def _one(part: list[str]) -> int:
+        try:
+            d = yf.download(part, period="5d", progress=False, threads=True,
+                            session=_shared_session, auto_adjust=False)
+            close = d["Close"] if isinstance(d.columns, pd.MultiIndex) else d[["Close"]].rename(columns={"Close": part[0]})
+        except Exception:
+            return 0
+        n = 0
+        for sym in part:
+            if sym not in close.columns:
+                continue
+            col = close[sym].dropna()
+            if col.empty:
+                continue
+            last = pd.Timestamp(col.index[-1])
+            if last.tzinfo is not None:
+                last = last.tz_localize(None)
+            if (pd.Timestamp.now() - last).days > 7:
+                continue
+            px = float(col.iloc[-1])
+            if px <= 0:
+                continue
+            r = by_sym[sym]
+            r.stock_price = px
+            r.verdict = verdict_price(px, r.mos_price, r.value_price)
+            n += 1
+        return n
+
+    chunks = [syms[i:i + chunk] for i in range(0, len(syms), chunk)]
+    if not chunks:
+        return 0
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
+        return sum(ex.map(_one, chunks))
 
 
 def deep_analyze_batch(
@@ -432,121 +581,146 @@ def deep_analyze_batch(
     show_live: bool = True,
     thresholds: dict | None = None,
 ) -> list[ScreenerRow]:
-    """Run deep analysis in parallel with LIVE results display."""
+    """Analyze tickers in parallel with live results, periodic saves and one retry pass for
+    transient failures. Cached rows are reused only if their thresholds and version match."""
     if not tickers:
         return []
 
-    cache = _load_screener_cache()
     now = time.time()
+    cache = {k: v for k, v in _load_screener_cache().items() if _cache_entry_valid(v, now)}   # drops stale/old-format rows
 
     to_run: list[str] = []
     from_cache: list[ScreenerRow] = []
     for t in tickers:
         entry = cache.get(t)
-        if entry and (now - entry.get("cached_at", 0) < SCREENER_TTL):
-            from_cache.append(_row_from_dict(entry["row"]))
+        if entry:
+            row = _row_from_dict(entry["row"])
+            if row.big5_values:                      # re-score under the CURRENT thresholds
+                row.score = score_from_values(row.big5_values, thresholds)
+            from_cache.append(row)
         else:
             to_run.append(t)
 
+    def _finish(rows_: list[ScreenerRow]) -> list[ScreenerRow]:
+        n = refresh_prices(rows_)
+        if n:
+            st.caption(f"💲 Refreshed latest prices for {n:,} stocks")
+        rows_.sort(key=lambda r: (r.score is None, -(r.score or 0)))
+        return rows_
+
     if not to_run:
         st.info("✅ All results loaded from cache")
-        all_results = list(from_cache)
-        all_results.sort(key=lambda r: (r.score is None, -(r.score or 0)))
-        return all_results
+        return _finish(list(from_cache))
 
-    st.write(f"🔄 Deep analysis of **{len(tickers)}** candidates (parallel processing)...")
+    st.write(f"🔄 Deep analysis of **{len(to_run):,}** of {len(tickers):,} stocks "
+             f"({len(from_cache):,} reused from cache)...")
 
-    # --- Live results container ---
     live_container = st.empty() if show_live else None
-
-    results = []
-    completed = 0
+    results: list[ScreenerRow] = []
     total = len(to_run)
-
     progress_bar = st.progress(0)
     status_text = st.empty()
+    new_cache = dict(cache)
+    since_save = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        thresholds_tuple = tuple(sorted((thresholds or {}).items()))
-        future_to_ticker = {
-            executor.submit(deep_analyze_ticker, ticker, thresholds_tuple): ticker
-            for ticker in to_run
-        }
+    def _store(row: ScreenerRow) -> None:
+        nonlocal since_save
+        if row.transient:
+            return                       # never cache a hiccup
+        new_cache[row.ticker] = {"cached_at": time.time(), "v": CACHE_VERSION, "row": _row_to_dict(row)}
+        since_save += 1
+        if since_save >= SAVE_EVERY:
+            _save_screener_cache(new_cache)
+            since_save = 0
 
-        for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
+    def _show_live() -> None:
+        good = sorted([r for r in results if r.error is None], key=lambda x: -(x.score or 0))
+        if not good:
+            live_container.info(f"⏳ Waiting for first results... ({len(results)}/{total})")
+            return
+        df_live = pd.DataFrame([
+            {
+                "Company": r.company[:30] + "..." if len(r.company) > 30 else r.company,
+                "Ticker": r.ticker,
+                "Score": f"{_safe_float(r.score):.1f}/10" if _safe_float(r.score) is not None else "n/a",
+                "Price": fmt_price(_safe_float(r.stock_price), r.ticker),
+                "Value": fmt_price(_safe_float(r.value_price), r.ticker),
+                "MOS Price": fmt_price(_safe_float(r.mos_price), r.ticker),
+                "Verdict": r.verdict,
+            }
+            for r in good[:20]
+        ])
+        live_container.dataframe(
+            df_live.style.apply(lambda row: [_VERDICT_COLORS.get(row["Verdict"], "")] * len(row), axis=1),
+            use_container_width=True, hide_index=True, height=min(400, 25 * len(df_live) + 40),
+        )
+
+    def _record(row: ScreenerRow, out: list, label: str) -> None:
+        out.append(row)
+        results.append(row)
+        _store(row)
+        if len(results) % 10 == 0 or len(results) == total:
+            progress_bar.progress(min(1.0, len(results) / total))
+            status_text.text(f"{label}: {len(results)}/{total} - {row.ticker}")
+        if show_live and live_container is not None and len(results) % 25 == 0:
+            _show_live()
+
+    def _run_threads(batch: list[str], workers: int, label: str, out: list) -> None:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futs = {executor.submit(analyze_ticker, t, thresholds): t for t in batch}
+            for fut in as_completed(futs):
+                t = futs[fut]
+                try:
+                    row = fut.result()
+                except Exception as e:
+                    row = _error_row(t, e, transient=False)
+                _record(row, out, label)
+
+    def _run_processes(batch: list[str], workers: int, label: str, out: list) -> None:
+        """Worker processes (real CPU parallelism) each running several fetch threads."""
+        from concurrent.futures import ProcessPoolExecutor
+
+        procs = max(2, min((os.cpu_count() or 4) - 2, -(-workers // THREADS_PER_PROCESS), 12))
+        threads = max(2, -(-workers // procs))
+        chunks = [batch[i:i + 12] for i in range(0, len(batch), 12)]
+        with ProcessPoolExecutor(max_workers=procs, initializer=_worker_init, initargs=(8.0 / procs,)) as ex:
+            futs = [ex.submit(_analyze_chunk, c, thresholds, threads) for c in chunks]
+            for fut in as_completed(futs):
+                for row in fut.result():
+                    _record(row, out, label)
+
+    def _run_pass(batch: list[str], workers: int, label: str) -> list[ScreenerRow]:
+        out: list[ScreenerRow] = []
+        if len(batch) >= PROCESS_MIN_BATCH:
             try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append(
-                    ScreenerRow(
-                        company=ticker,
-                        ticker=ticker,
-                        score=None,
-                        stock_price=None,
-                        value_price=None,
-                        mos_price=None,
-                        verdict="Error",
-                        error=str(e),
-                    )
-                )
+                _run_processes(batch, workers, label, out)
+                return out
+            except Exception as e:           # pool could not start or broke: finish with threads
+                st.caption(f"ℹ️ Process pool unavailable ({type(e).__name__}); continuing with threads.")
+        done = {r.ticker for r in out}
+        _run_threads([t for t in batch if t not in done], workers, label, out)
+        return out
 
-            completed += 1
-            progress_bar.progress(completed / total)
-            status_text.text(f"Analyzing: {completed}/{total} - {ticker}")
-
-            # --- LIVE UPDATE: Show results as they come in ---
-            if show_live and live_container is not None:
-                # Sort current results by score
-                sorted_results = sorted(
-                    [r for r in results if r.error is None],
-                    key=lambda x: -(x.score or 0)
-                )
-                
-                # Create DataFrame from current results
-                if sorted_results:
-                    df_live = pd.DataFrame([
-                        {
-                            "Company": r.company[:30] + "..." if len(r.company) > 30 else r.company,
-                            "Ticker": r.ticker,
-                            "Score": f"{_safe_float(r.score):.1f}/10" if _safe_float(r.score) is not None else "n/a",
-                            "Price": fmt_price(_safe_float(r.stock_price), r.ticker),
-                            "Value": fmt_price(_safe_float(r.value_price), r.ticker),
-                            "MOS Price": fmt_price(_safe_float(r.mos_price), r.ticker),
-                            "Verdict": r.verdict,
-                        }
-                        for r in sorted_results[:20]
-                    ])
-                    
-                    def style_live_row(row):
-                        style = _VERDICT_COLORS.get(row["Verdict"], "")
-                        return [style] * len(row)
-                    
-                    live_container.dataframe(
-                        df_live.style.apply(style_live_row, axis=1),
-                        use_container_width=True,
-                        hide_index=True,
-                        height=min(400, 25 * len(df_live) + 40),
-                    )
-                else:
-                    live_container.info(f"⏳ Waiting for first results... ({completed}/{total})")
+    try:
+        first = _run_pass(to_run, max_workers, "Analyzing")
+        retry = [r.ticker for r in first if r.transient]
+        if retry:
+            status_text.text(f"Retrying {len(retry)} tickers that hit a temporary SEC/Yahoo error...")
+            time.sleep(5)
+            results[:] = [r for r in results if not r.transient]
+            total = len(results) + len(retry)
+            _run_pass(retry, max(2, max_workers // 5), "Retrying")
+        if show_live and live_container is not None:
+            _show_live()
+    finally:
+        _save_screener_cache(new_cache)      # keep progress even if the run is interrupted
 
     progress_bar.empty()
     status_text.empty()
-
-    # After analysis, merge and save cache
-    all_results = from_cache + results
-    new_cache = {**cache}
-    for r in results:
-        new_cache[r.ticker] = {
-            "cached_at": now,
-            "row": _row_to_dict(r),
-        }
-    _save_screener_cache(new_cache)
-
-    all_results.sort(key=lambda r: (r.score is None, -(r.score or 0)))
-    return all_results
+    still = sum(1 for r in results if r.transient)
+    if still:
+        st.warning(f"⚠️ {still} stock(s) could not be fetched (SEC/Yahoo busy). They were not cached; run again to retry them.")
+    return _finish(from_cache + results)
 
 
 # ==================== DISPLAY ====================
@@ -695,9 +869,9 @@ def render_stock_screener() -> None:
             max_workers = st.slider(
                 "Workers",
                 min_value=5,
-                max_value=50,
-                value=20,
-                step=5,
+                max_value=128,
+                value=DEFAULT_MAX_WORKERS,
+                step=8,
                 help="Parallel processing speed"
             )        
         with col5:
@@ -715,6 +889,27 @@ def render_stock_screener() -> None:
                 "Technical signals and intrinsic value still work."
             ),
         )
+
+        from moatcheck import edgar as _edgar_mod
+        _zip = _edgar_mod._BULK_ZIP
+        _zip_ok = _zip.exists() and (time.time() - _zip.stat().st_mtime) < _edgar_mod._BULK_MAX_AGE
+        if _zip_ok:
+            _age_d = (time.time() - _zip.stat().st_mtime) / 86400
+            st.caption(f"⚡ SEC bulk data present ({_age_d:.0f} days old): full scans need no per-stock SEC requests.")
+        else:
+            st.warning("SEC bulk data not downloaded: scans fall back to one rate-limited SEC request per stock "
+                       "(much slower). Download it once (about 1.4 GB, 1-2 minutes).")
+        if st.button("⬇️ Download / refresh SEC bulk data"):
+            _bar = st.progress(0.0, text="Downloading SEC companyfacts.zip…")
+            try:
+                _edgar_mod.refresh_bulk_facts(
+                    progress=lambda d, t: _bar.progress(min(1.0, d / t) if t else 0.0,
+                                                        text=f"Downloading… {d / 1048576:,.0f} MB"))
+                _bar.empty()
+                st.success("SEC bulk data updated.")
+            except Exception as _e:
+                _bar.empty()
+                st.error(f"Download failed: {_e}")
 
         force_refresh = st.checkbox(
             "🔄 Force fresh scan (ignore cache)",

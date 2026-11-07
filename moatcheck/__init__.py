@@ -1,7 +1,7 @@
 from .fetcher import Financials, FetchError
 from .fetcher import fetch as yfinance_fetch
 from .combined import fetch  # hybrid EDGAR + yfinance — the default
-from .edgar import EdgarError, fetch_edgar, EdgarData
+from .edgar import EdgarError, EdgarTransientError, fetch_edgar, EdgarData, refresh_bulk_facts
 from .big5 import compute_big5, Big5Result
 from .valuation import value_price, payback_time, debt_to_fcf, ValuationResult
 from .growth import cagr
@@ -19,6 +19,8 @@ __all__ = [
     "yfinance_fetch",
     "fetch_edgar",
     "EdgarError",
+    "EdgarTransientError",
+    "refresh_bulk_facts",
     "EdgarData",
     "Financials",
     "FetchError",

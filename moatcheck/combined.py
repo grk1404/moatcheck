@@ -10,10 +10,11 @@ recent IPOs before their first 10-K, etc.).
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from .edgar import EdgarError, fetch_edgar
+from .edgar import EdgarError, EdgarTransientError, fetch_edgar
 from .fetcher import Financials, FetchError, fetch as yf_fetch
 import xml.etree.ElementTree as ET
 
@@ -93,8 +94,75 @@ def _edgar_reporting_currency(edgar) -> str | None:
                     return key
     return None
 
-def fetch(ticker: str) -> Financials:    
+_YAHOO_SLOTS = threading.BoundedSemaphore(10)   # max concurrent Yahoo `info` calls per process
+
+
+def _num(v):
+    """float(v) or None (handles None, NaN, strings)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def _info_snapshot(ticker: str) -> "Financials | None":
+    """Minimal snapshot (price, cap, P/E, sector...) from one cheap Yahoo `info` call, with no
+    statements. ~0.3 s, versus ~2.3 s for the full statement fetch."""
+    import pandas as pd
+    from data_provider import get_ticker
+
+    try:
+        with _YAHOO_SLOTS:
+            info = get_ticker(ticker).info or {}
+    except Exception as e:
+        # Throttled or temporarily unreachable is NOT "no data": surface it as transient so the
+        # row is retried later and never cached as a success with a missing price and sector.
+        name, msg = type(e).__name__, str(e).lower()
+        if "ratelimit" in name.lower() or "too many" in msg or "429" in msg or isinstance(e, (TimeoutError, ConnectionError))                 or name in ("Timeout", "ConnectionError", "ReadTimeout", "ConnectTimeout"):
+            raise EdgarTransientError(f"Yahoo temporarily unavailable ({name})") from e
+        return None
+    if not info:
+        return None
+    empty = pd.Series(dtype=float)
+    price = _num(info.get("currentPrice")) or _num(info.get("regularMarketPrice"))
+    dy = _num(info.get("dividendYield"))
+    return Financials(
+        ticker=ticker.upper(),
+        revenue=empty, net_income=empty, eps=empty, equity=empty,
+        shares=empty, operating_cash_flow=empty, capex=empty,
+        free_cash_flow=empty, long_term_debt=empty, tax_rate=empty,
+        ebit=empty,
+        current_price=price,
+        market_cap=_num(info.get("marketCap")),
+        pe_ratio_ttm=_num(info.get("trailingPE")),
+        analyst_5yr_growth=_num(info.get("earningsGrowth")) or _num(info.get("revenueGrowth")),
+        shares_outstanding=_num(info.get("sharesOutstanding")),
+        dividend_yield=dy / 100.0 if dy is not None else None,
+        beta=_num(info.get("beta")),
+        book_value_per_share=_num(info.get("bookValue")),
+        week52_high=_num(info.get("fiftyTwoWeekHigh")),
+        week52_low=_num(info.get("fiftyTwoWeekLow")),
+        company_name=info.get("longName") or info.get("shortName") or ticker,
+        company_summary=info.get("longBusinessSummary") or "",
+        company_sector=info.get("sector") or "",
+        company_industry=info.get("industry") or "",
+        company_country=info.get("country") or "",
+        exchange=info.get("exchange", "") or info.get("fullExchangeName", ""),
+        data_source="yfinance-snapshot",
+    )
+
+
+def fetch(ticker: str, light: bool = False, persist: bool = True) -> Financials:
     """Return a Financials object combining EDGAR history + yfinance snapshot.
+
+    light=True is for bulk screening: EDGAR for history plus one Yahoo `info` call for the
+    snapshot (about 3x faster). Full Yahoo statements are fetched only when EDGAR has no
+    filings for the company, or when EDGAR lacks an EPS series (multi-class filers).
+    persist=False keeps per-ticker EDGAR JSON off disk during a full-universe scan.
+
+    Raises EdgarTransientError (not FetchError) when SEC is throttling or unreachable, so a
+    scan can retry the ticker later instead of recording it as having no data.
 
     Behavior:
       - EDGAR success + yfinance success      → merged (history from EDGAR)
@@ -112,7 +180,12 @@ def fetch(ticker: str) -> Financials:
     snapshot: Financials | None = None
     snapshot_err: Exception | None = None
     try:
-        snapshot = yf_fetch(ticker)
+        if light:
+            snapshot = _info_snapshot(ticker)
+            if snapshot is None:
+                raise FetchError(f"No Yahoo quote data for {ticker}.")
+        else:
+            snapshot = yf_fetch(ticker)
     except FetchError as e:
         snapshot_err = e
         # Foreign filers (20-F) don't expose income_stmt via yfinance, so
@@ -126,8 +199,8 @@ def fetch(ticker: str) -> Financials:
             fi = yft.fast_info
 
             _price = fi.get("last_price") or fi.get("lastPrice")
-            if _price is not None and isinstance(_price, float) and np.isnan(_price):
-                _price = None
+            if _price is None or (isinstance(_price, float) and np.isnan(_price)):
+                _price = info.get("currentPrice") or info.get("regularMarketPrice")
             _cap = fi.get("market_cap") or fi.get("marketCap")
             _cap = float(_cap) if _cap is not None else None
 
@@ -166,9 +239,21 @@ def fetch(ticker: str) -> Financials:
     edgar = None
     edgar_err: Exception | None = None
     try:
-        edgar = fetch_edgar(ticker)
+        edgar = fetch_edgar(ticker, persist=persist)
     except EdgarError as e:
-        edgar_err = e    
+        edgar_err = e
+    # EdgarTransientError is intentionally not caught: SEC being down must not be reported
+    # as "no filings" (that would send us to the 4-year Yahoo fallback and cache a wrong score).
+
+    # Light mode: EDGAR has no filings (foreign filer, fund, new IPO). Pull Yahoo's statements once
+    # and continue to the Yahoo-only branch below, without repeating the EDGAR lookup.
+    if light and edgar is None:
+        try:
+            snapshot = yf_fetch(ticker)
+        except FetchError as e:
+            raise FetchError(
+                f"No SEC EDGAR filings and no Yahoo statements for {ticker} ({edgar_err or e})"
+            ) from e
 
     # ---- Both sources failed ----
     if snapshot is None and edgar is None:
@@ -202,6 +287,13 @@ def fetch(ticker: str) -> Financials:
         _eps_note = ""
         _latest = max((int(s.index.max()) for s in (rev, ni) if not s.empty), default=None)
         _yf_eps = snapshot.eps if snapshot is not None else pd.Series(dtype=float)
+        if light and _yf_eps.empty and _latest is not None and (
+            eps_s.empty or int(eps_s.index.max()) < _latest - 1
+        ):
+            try:
+                _yf_eps = yf_fetch(ticker).eps       # full Yahoo statements, only for this gap
+            except FetchError:
+                _yf_eps = pd.Series(dtype=float)
         if _latest is not None and not _yf_eps.empty and (
             eps_s.empty or int(eps_s.index.max()) < _latest - 1
         ):
@@ -245,6 +337,8 @@ def fetch(ticker: str) -> Financials:
             note_parts.append("shares count from Yahoo Finance")
         if _eps_note:
             note_parts.append(_eps_note)
+        if getattr(edgar, "split_note", ""):
+            note_parts.append(edgar.split_note)
         note_parts.append(
             "Yahoo Finance (price, market cap, P/E, dividend yield, analyst est.)"
         )

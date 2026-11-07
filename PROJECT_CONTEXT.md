@@ -85,3 +85,9 @@ Rule (sleeves_strategy.py): ^NDX regime weight +1 above both the 50d and 250d MA
 - Verify the Log buttons write `SLEEVE` rows on the first real trade.
 - Optional: build the 20%-cap mean-reversion SQQQ add-on behind a default-off switch for paper trading; test an RSI-scaled TQQQ size against the volatility overlay.
 - Eventually: automate execution (recommend IBKR over Fidelity for ToS/API reasons)
+
+## Stock Screener rework (2026-11-06)
+- Fixed: user thresholds were ignored (resolve_thresholds only took numbers; screener passes dicts), cache ignored thresholds, NASDAQ stocks were dropped from the universe (case bug; universe now ~7.6k tickers), failed fetches were cached for 7 days, wrong metric-to-threshold match when cash conversion was missing, CAGR windows spanning missing years (now matched by fiscal-year label).
+- Accuracy: EPS and share counts split-adjusted via Yahoo split history (moatcheck/splits.py); annual-duration filter on EDGAR facts; growth fed to value price capped at 30%; cached rows get a fresh price before the verdict.
+- Speed: EDGAR first + one Yahoo info call (full Yahoo statements only as fallback); SEC bulk companyfacts.zip read locally (download from the screener settings, ~1.4 GB); process pool x threads; cached growth numbers so changing thresholds re-scores instantly; saves every 100 stocks. Measured ~70-130 ms/stock (about 9-17 min for a full 7.6k universe cold, seconds when cached).
+- Yahoo throttles (HTTP 429) under heavy parallel load; throttled tickers are marked "Retry" and not cached.

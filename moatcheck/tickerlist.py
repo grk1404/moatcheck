@@ -11,7 +11,7 @@ import re
 # Disk cache for the universe — survives Streamlit restarts
 UNIVERSE_CACHE = Path("data/universe.json")
 UNIVERSE_TTL = 7 * 24 * 3600  # 7 days
-UNIVERSE_VERSION = 3   # bump whenever the filter logic changes
+UNIVERSE_VERSION = 4   # bump whenever the filter logic changes (4: NASDAQ rows were dropped by a case bug)
 
 
 def _load_disk_cache() -> pd.DataFrame | None:
@@ -108,15 +108,19 @@ def get_us_stock_universe(force_refresh: bool = False) -> pd.DataFrame:
     # Keep major US exchanges
     # --------------------------------------------------------
 
+    # Compare case-insensitively: the SEC file says "Nasdaq" and "CBOE". The exchange column
+    # was upper-cased above, so the old mixed-case set matched only "NYSE" and silently
+    # dropped every NASDAQ-listed company (NVDA, MSFT, AAPL, GOOGL, AMZN, META, COST, ...).
     allowed_exchanges = {
-        "Nasdaq",
+        "NASDAQ",
         "NYSE",
-        "NYSE American",
-        "NYSE Arca",
-        "Cboe BZX",
-        "Cboe BYX",
-        "Cboe EDGA",
-        "Cboe EDGX",
+        "NYSE AMERICAN",
+        "NYSE ARCA",
+        "CBOE",
+        "CBOE BZX",
+        "CBOE BYX",
+        "CBOE EDGA",
+        "CBOE EDGX",
     }
 
     df = df[

@@ -6,8 +6,12 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -16,6 +20,15 @@ import requests
 
 class EdgarError(Exception):
     """Ticker not covered by EDGAR (foreign filer, delisted, or invalid)."""
+
+
+class EdgarTransientError(Exception):
+    """SEC was unreachable or throttled us (429/5xx/timeout) after retries.
+
+    Deliberately NOT an EdgarError: callers fall back to Yahoo-only data on EdgarError, and
+    silently scoring a company on 4 years of Yahoo data because SEC hiccuped is worse than
+    reporting the failure and retrying later.
+    """
 
 
 # SEC's edge requires an email address in the User-Agent (they reject UAs that
@@ -28,6 +41,13 @@ FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 _CACHE_DIR = Path.home() / ".moat_cache"
 _TICKERS_TTL = 30 * 24 * 3600  # 30 days
 _FACTS_TTL = 24 * 3600         # 1 day
+
+# SEC publishes every company's XBRL facts as one nightly zip (~1.4 GB). Reading one company
+# from it takes ~35 ms with no network call, which removes the per-ticker request (and its
+# rate limit) from full-universe scans. Created by refresh_bulk_facts().
+BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
+_BULK_ZIP = _CACHE_DIR / "companyfacts.zip"
+_BULK_MAX_AGE = 28 * 24 * 3600   # ignore a zip older than this and fall back to HTTP
 
 IFRS_CONCEPTS: dict[str, list[str]] = {
     "revenue": [
@@ -216,6 +236,7 @@ class EdgarData:
     currency: str = "USD"          # reporting currency detected from XBRL units
     taxonomy: str = "us-gaap"      # "us-gaap" or "ifrs-full"
     raw: dict = field(default_factory=dict)
+    split_note: str = ""           # non-empty when per-share history was split-adjusted
 
 
 def _cache_read(path: Path, ttl: int) -> dict | None:
@@ -242,13 +263,54 @@ def _cache_write(path: Path, data: dict) -> None:
         pass
 
 
+class _RateLimiter:
+    """Spaces calls at least 1/per_second apart across all threads (SEC allows ~10 req/s)."""
+
+    def __init__(self, per_second: float):
+        self._interval = 1.0 / per_second
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + self._interval
+        if start > now:
+            time.sleep(start - now)
+
+
+_SEC_LIMITER = _RateLimiter(8.0)
+
+
+def set_sec_rate(per_second: float) -> None:
+    """Set this process's share of the SEC request budget (SEC allows ~10 requests/second in total;
+    when a scan runs N worker processes each gets 8/N)."""
+    global _SEC_LIMITER
+    _SEC_LIMITER = _RateLimiter(max(0.5, float(per_second)))
+
+
 def _sec_get(url: str) -> dict:
-    """GET a JSON URL from SEC with the required User-Agent."""
-    r = requests.get(url, headers={"User-Agent": SEC_UA, "Accept": "application/json"}, timeout=15)
-    if r.status_code == 404:
-        raise EdgarError(f"SEC returned 404 for {url}")
-    r.raise_for_status()
-    return r.json()
+    """GET a JSON URL from SEC: shared rate limit, retries with backoff on 429/5xx/timeouts."""
+    last = "no response"
+    for attempt in range(5):
+        _SEC_LIMITER.wait()
+        try:
+            r = requests.get(url, headers={"User-Agent": SEC_UA, "Accept": "application/json"}, timeout=30)
+        except requests.RequestException as e:
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+            time.sleep(min(30.0, 2 ** attempt + random.random()))
+            continue
+        if r.status_code == 404:
+            raise EdgarError(f"SEC returned 404 for {url}")
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = f"HTTP {r.status_code}"
+            ra = r.headers.get("Retry-After", "")
+            time.sleep(min(60.0, float(ra) if ra.isdigit() else 2 ** attempt + random.random()))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise EdgarTransientError(f"SEC request failed after retries ({last}): {url}")
 
 
 _TICKER_MAP: dict[str, dict] | None = None
@@ -289,29 +351,97 @@ def _resolve_ticker(ticker: str) -> tuple[int, str]:
     return entry["cik"], entry["name"]
 
 
-def _load_facts(cik: int) -> dict:
+_ZIP_LOCK = threading.Lock()
+_ZIP_STATE: dict = {"zf": None, "mtime": None}
+
+
+def _bulk_zip():
+    """Open handle on the bulk companyfacts zip, or None if absent, stale or unreadable."""
+    try:
+        st = _BULK_ZIP.stat()
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > _BULK_MAX_AGE:
+        return None
+    with _ZIP_LOCK:
+        if _ZIP_STATE["zf"] is None or _ZIP_STATE["mtime"] != st.st_mtime:
+            try:
+                _ZIP_STATE["zf"] = zipfile.ZipFile(_BULK_ZIP)
+                _ZIP_STATE["mtime"] = st.st_mtime
+            except (zipfile.BadZipFile, OSError):
+                _ZIP_STATE["zf"] = None
+                return None
+        return _ZIP_STATE["zf"]
+
+
+def refresh_bulk_facts(progress=None) -> Path:
+    """Download SEC's nightly companyfacts.zip (~1.4 GB, ~1 min). Atomic: the old file stays
+    usable until the new one is complete. `progress(done_bytes, total_bytes)` is optional."""
+    _BULK_ZIP.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _BULK_ZIP.with_suffix(".zip.tmp")
+    done = 0
+    with requests.get(BULK_URL, headers={"User-Agent": SEC_UA}, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+    if total and done != total:
+        tmp.unlink(missing_ok=True)
+        raise EdgarTransientError(f"bulk download incomplete ({done} of {total} bytes)")
+    with _ZIP_LOCK:
+        if _ZIP_STATE["zf"] is not None:
+            _ZIP_STATE["zf"].close()
+            _ZIP_STATE["zf"] = None
+        tmp.replace(_BULK_ZIP)
+    return _BULK_ZIP
+
+
+def _load_facts(cik: int, persist: bool = True) -> dict:
+    """Company facts: fresh per-ticker cache, else the bulk zip, else a rate-limited HTTP call.
+
+    persist=False skips writing the per-ticker cache (~3 MB each; a full-universe scan would
+    otherwise write tens of GB)."""
     cache = _CACHE_DIR / "edgar" / f"CIK{cik:010d}.json"
     data = _cache_read(cache, _FACTS_TTL)
     if data is not None:
         return data
+    zf = _bulk_zip()
+    if zf is not None:
+        try:
+            with _ZIP_LOCK:
+                raw = zf.read(f"CIK{cik:010d}.json")
+            return json.loads(raw)
+        except KeyError:
+            pass                     # company not in the bulk file -> ask SEC directly
+        except (zipfile.BadZipFile, OSError, ValueError):
+            pass
     url = FACTS_URL.format(cik=f"{cik:010d}")
     data = _sec_get(url)
-    _cache_write(cache, data)
+    if persist:
+        _cache_write(cache, data)
     return data
 
 
-def _series_for_concepts(
+def _series_and_filed(
     taxonomy: dict,
     concepts: list[str],
     form_prefixes: tuple[str, ...] = ("10-K",),
     unit_priority: tuple[str, ...] = ("USD", "USD/shares", "shares", "pure"),
-) -> pd.Series:
-    """Merge multiple XBRL concepts into one year-indexed pandas Series.
+) -> tuple[pd.Series, dict[int, str]]:
+    """Merge multiple XBRL concepts into one year-indexed Series plus {year: filing date}.
 
     form_prefixes: which SEC form types count as "annual" for this taxonomy.
         US GAAP filers use 10-K. IFRS filers use 20-F.
     unit_priority: preferred unit keys, in order. Falls back to the first
         available unit if none of these match.
+
+    Duration facts must cover a full fiscal year (340-380 days). Without this a 10-K that
+    also tags a quarter (COST FY2017: 83 days, NFLX FY2016: 90 days) can win as the "annual"
+    value. Point-in-time facts (equity, debt) have no start date and are unaffected.
     """
     year_value: dict[int, tuple[str, float]] = {}
 
@@ -341,6 +471,14 @@ def _series_for_concepts(
             end = entry.get("end")
             if not end:
                 continue
+            start = entry.get("start")
+            if start:
+                try:
+                    days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+                except ValueError:
+                    continue
+                if not 340 <= days <= 380:
+                    continue
             try:
                 year = int(end[:4])
             except (TypeError, ValueError):
@@ -359,18 +497,23 @@ def _series_for_concepts(
                     year_value[year] = (filed, float(val))
 
     if not year_value:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float), {}
 
-    return pd.Series({y: v for y, (_, v) in year_value.items()}, dtype=float,).sort_index()
+    series = pd.Series({y: v for y, (_, v) in year_value.items()}, dtype=float).sort_index()
+    return series, {y: f for y, (f, _) in year_value.items()}
 
 
-def fetch_edgar(ticker: str) -> EdgarData:
+def _series_for_concepts(*args, **kwargs) -> pd.Series:
+    return _series_and_filed(*args, **kwargs)[0]
+
+
+def fetch_edgar(ticker: str, persist: bool = True, adjust_splits: bool = True) -> EdgarData:
     """Pull annual facts (10-K US GAAP or 20-F IFRS) for a ticker from SEC EDGAR."""
     if not ticker or not ticker.strip():
         raise EdgarError("Please provide a ticker symbol.")
 
     cik, name = _resolve_ticker(ticker.strip().upper())
-    facts = _load_facts(cik)
+    facts = _load_facts(cik, persist=persist)
     all_facts = facts.get("facts", {})
 
     gaap = all_facts.get("us-gaap")
@@ -421,10 +564,26 @@ def fetch_edgar(ticker: str) -> EdgarData:
             unit_priority=unit_priority,
         )
 
+    def _series_f(key: str):
+        return _series_and_filed(
+            taxonomy, concepts[key],
+            form_prefixes=form_prefixes,
+            unit_priority=unit_priority,
+        )
+
     revenue = _series("revenue")
     net_income = _series("net_income")
-    eps = _series("eps")
-    shares = _series("shares")
+    eps, eps_filed = _series_f("eps")
+    shares, shares_filed = _series_f("shares")
+
+    # Put per-share history on today's share basis (EDGAR only restates ~3 years after a split).
+    split_note = ""
+    if adjust_splits and taxonomy_name == "us-gaap":
+        try:
+            from .splits import adjust_edgar_per_share
+            eps, shares, split_note = adjust_edgar_per_share(ticker, eps, shares, eps_filed, shares_filed)
+        except Exception:
+            split_note = "split adjustment skipped (error)"
     equity = _series("equity")
 
     # Fallback: derive EPS from net income / shares when the filer doesn't
@@ -489,4 +648,5 @@ def fetch_edgar(ticker: str) -> EdgarData:
         years_available=(int(revenue.shape[0]) if not revenue.empty else int(net_income.shape[0]) if not net_income.empty else 0),
         currency=_currency,
         taxonomy=taxonomy_name,
+        split_note=split_note,
     )

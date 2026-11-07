@@ -32,15 +32,34 @@ DEFAULT_THRESHOLDS: dict[str, dict[str, float]] = {
 }
 
 
-def resolve_thresholds(user_thresholds: dict | None) -> dict[str, float]:
-    """Merge user-supplied thresholds over the defaults.
+def resolve_thresholds(user_thresholds: dict | None) -> dict[str, dict[str, float]]:
+    """Merge user-supplied thresholds over the defaults (never mutates the defaults).
 
-    Accepts keys: 'revenue', 'eps', 'equity', 'ocf', 'roic'.
-    Unknown keys are ignored. Values must be floats in decimal form (0.10 = 10%).
+    Keys: 'revenue', 'eps', 'equity', 'ocf', 'roic', 'cash_conversion', 'discount_fcf',
+    'discount_np'. Each value may be
+      - a dict {"min": x, "max": y} (either bound optional; the other keeps its default), or
+      - a plain number, taken as the minimum.
+    Values are decimals (0.10 = 10%). Unknown keys and unparseable values are ignored.
     """
-    resolved = dict(DEFAULT_THRESHOLDS)
+    resolved = {k: dict(v) for k, v in DEFAULT_THRESHOLDS.items()}
     if not user_thresholds:
         return resolved
+    for k, v in user_thresholds.items():
+        if k not in resolved or v is None:
+            continue
+        if isinstance(v, dict):
+            for bound in ("min", "max"):
+                if v.get(bound) is not None:
+                    try:
+                        resolved[k][bound] = float(v[bound])
+                    except (TypeError, ValueError):
+                        continue
+        else:
+            try:
+                resolved[k]["min"] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return resolved
     for k, v in user_thresholds.items():
         if k in resolved and v is not None:
             try:
@@ -196,79 +215,90 @@ def _trend_penalty(values: dict[int, float]) -> float:
 # Wonderfulness scoring
 # ============================================================
 
+# Metrics computed once per company (not per time window). They are stored under all four
+# window keys for display, but must count as ONE check each, and say nothing about
+# consistency or trend across windows.
+_SINGLE_VALUE_KEYS = ("cash_conversion", "discount_fcf", "discount_np")
+
+# metric key -> key in the thresholds dict
+_THRESHOLD_KEY = {
+    "roic": "roic", "sales": "revenue", "eps": "eps", "equity": "equity", "fcf": "ocf",
+    "cash_conversion": "cash_conversion", "discount_fcf": "discount_fcf", "discount_np": "discount_np",
+}
+
+
+def _named_metrics(big5: "Big5Result") -> list[tuple[str, MetricResult]]:
+    """(key, metric) pairs for every metric present. Keyed by name, never by position."""
+    pairs = [("roic", big5.roic), ("sales", big5.sales), ("eps", big5.eps),
+             ("equity", big5.equity), ("fcf", big5.fcf)]
+    for key in _SINGLE_VALUE_KEYS:
+        m = getattr(big5, key, None)
+        if m is not None:
+            pairs.append((key, m))
+    return pairs
+
+
+def _valid(values) -> list[float]:
+    return [v for v in values if v is not None and not math.isnan(v)]
+
+
 def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     """Compute a 0-10 wonderfulness score from a Big5Result.
 
-    Thresholds are read from big5.thresholds (set by compute_big5).
+    Thresholds are read from big5.thresholds (set by compute_big5). Each metric is matched
+    to its threshold by NAME. (An earlier version matched by list position, so when cash
+    conversion was missing the fair-value discounts were judged against its 80% floor.)
     """
-    metrics = [big5.roic, big5.sales, big5.eps, big5.equity, big5.fcf]
-    for extra in (big5.cash_conversion, big5.discount_fcf, big5.discount_np):
-        if extra is not None:
-            metrics.append(extra)
-    thresholds = getattr(big5, "thresholds", DEFAULT_THRESHOLDS)
+    named = _named_metrics(big5)
+    thresholds = getattr(big5, "thresholds", None) or DEFAULT_THRESHOLDS
 
-    # Map metric object -> its threshold key
-    metric_threshold_map = {
-        "roic":            thresholds.get("roic",            DEFAULT_THRESHOLDS["roic"]),
-        "sales":           thresholds.get("revenue",         DEFAULT_THRESHOLDS["revenue"]),
-        "eps":             thresholds.get("eps",             DEFAULT_THRESHOLDS["eps"]),
-        "equity":          thresholds.get("equity",          DEFAULT_THRESHOLDS["equity"]),
-        "fcf":             thresholds.get("ocf",             DEFAULT_THRESHOLDS["ocf"]),
-        "cash_conversion": thresholds.get("cash_conversion", DEFAULT_THRESHOLDS["cash_conversion"]),
-        "discount_fcf":    thresholds.get("discount_fcf",    DEFAULT_THRESHOLDS["discount_fcf"]),
-        "discount_np":     thresholds.get("discount_np",     DEFAULT_THRESHOLDS["discount_np"]),
-    }
-    metric_key_order = ["roic", "sales", "eps", "equity", "fcf",
-                        "cash_conversion", "discount_fcf", "discount_np"]
+    def thr_for(key: str) -> dict[str, float]:
+        tk = _THRESHOLD_KEY[key]
+        return thresholds.get(tk) or DEFAULT_THRESHOLDS[tk]
 
-    # ---------- Pass rate ----------
-    computed = []
-    for i, m in enumerate(metrics):
-        key = metric_key_order[i]
-        thr = metric_threshold_map[key]
-        for w, v in m.values.items():
-            if v is not None and not math.isnan(v):
-                computed.append((m, w, v, thr))
-    checks_total = len(computed)
-    checks_passed = sum(1 for _, _, v, thr in computed if thr["min"] <= v <= thr["max"])
+    def in_range(v: float, thr: dict[str, float]) -> bool:
+        return thr["min"] <= v <= thr["max"]
+
+    # ---------- Pass rate: one check per window, one check per single-value metric ----------
+    checks_total = checks_passed = 0
+    for key, m in named:
+        thr = thr_for(key)
+        vals = _valid(m.values.values())
+        if key in _SINGLE_VALUE_KEYS:
+            vals = vals[:1]
+        checks_total += len(vals)
+        checks_passed += sum(1 for v in vals if in_range(v, thr))
     pass_rate = (checks_passed / checks_total * 10) if checks_total else 0.0
 
     # ---------- Magnitude ----------
     metric_scores = []
-    for i, m in enumerate(metrics):
-        key = metric_key_order[i]
-        thr = metric_threshold_map[key]
-        vals = [v for v in m.values.values() if v is not None and not math.isnan(v)]
+    for key, m in named:
+        vals = _valid(m.values.values())
         if vals:
-            metric_scores.append(_growth_score(vals, threshold=thr))
+            metric_scores.append(_growth_score(vals, threshold=thr_for(key)))
     magnitude = (sum(metric_scores) / len(metric_scores)) if metric_scores else 0.0
 
-        # ---------- Consistency ----------
+    # ---------- Consistency (windowed metrics only) ----------
     per_metric_consistency = []
-    for i, m in enumerate(metrics):
-        key = metric_key_order[i]
-        thr = metric_threshold_map[key]
-        vals = [v for v in m.values.values() if v is not None and not math.isnan(v)]
-        if len(vals) >= 2:
-            failing_windows = [v for v in vals if not (thr["min"] <= v <= thr["max"])]
-            if not failing_windows:
-                per_metric_consistency.append(10.0)
-            else:
-                shortfalls = []
-                for v in failing_windows:
-                    if v < thr["min"]:
-                        shortfalls.append(thr["min"] - v)
-                    else:
-                        shortfalls.append(v - thr["max"])
-                
-                # Calculate the score based on ALL shortfalls, not just above-max ones
-                avg_shortfall = sum(shortfalls) / len(vals) if shortfalls else 0.0
-                bound_range = thr["max"] - thr["min"]
-                score = max(0.0, (1.0 - (avg_shortfall / bound_range)) * 10.0) if bound_range > 0 else 0.0
-                per_metric_consistency.append(score)
-                    # ↑↑↑ THEY'RE INSIDE THE `else`, SO THEY ONLY RUN FOR ABOVE-MAX FAILURES ↑↑↑
+    for key, m in named:
+        if key in _SINGLE_VALUE_KEYS:
+            continue
+        thr = thr_for(key)
+        vals = _valid(m.values.values())
+        if len(vals) < 2:
+            continue
+        failing = [v for v in vals if not in_range(v, thr)]
+        if not failing:
+            per_metric_consistency.append(10.0)
+            continue
+        shortfalls = [(thr["min"] - v) if v < thr["min"] else (v - thr["max"]) for v in failing]
+        avg_shortfall = sum(shortfalls) / len(vals)
+        bound_range = thr["max"] - thr["min"]
+        per_metric_consistency.append(
+            max(0.0, (1.0 - avg_shortfall / bound_range) * 10.0) if bound_range > 0 else 0.0
+        )
     consistency = (sum(per_metric_consistency) / len(per_metric_consistency)) if per_metric_consistency else 0.0
-    # Human-readable consistency reason (based on the computed consistency score)
+
     if consistency >= 9.0:
         c_reason = "Exceptional stability across all 4 time windows (10yr, 5yr, 3yr, 1yr)."
     elif consistency >= 7.0:
@@ -278,11 +308,12 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     else:
         c_reason = "Uneven growth trajectory; multiple time windows missed the benchmark."
 
-    # ---------- Trend ----------
-    trend_scores = []
-    for m in metrics:
-        if len([v for v in m.values.values() if v is not None]) >= 2:
-            trend_scores.append(_trend_penalty(m.values))
+    # ---------- Trend (windowed metrics only) ----------
+    trend_scores = [
+        _trend_penalty(m.values)
+        for key, m in named
+        if key not in _SINGLE_VALUE_KEYS and len(_valid(m.values.values())) >= 2
+    ]
     trend = (sum(trend_scores) / len(trend_scores)) if trend_scores else 5.0
 
     # ---------- Overall ----------
@@ -290,23 +321,17 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     label, color = _label_for_score(overall)
 
     # ---------- Strengths / weaknesses ----------
-    metric_scores_by_name = []
-    for i, m in enumerate(metrics):
-        key = metric_key_order[i]
-        thr = metric_threshold_map[key]
-        vals = [v for v in m.values.values() if v is not None and not math.isnan(v)]
+    by_name = []
+    for key, m in named:
+        vals = _valid(m.values.values())
         if vals:
-            metric_scores_by_name.append((m.label, sum(vals) / len(vals), thr))
-    metric_scores_by_name.sort(key=lambda t: t[1], reverse=True)
+            by_name.append((m.label, sum(vals) / len(vals), thr_for(key)))
+    by_name.sort(key=lambda t: t[1], reverse=True)
     strengths = [
-        f"{name} avg {avg*100:.0f}%"
-        for name, avg, thr in metric_scores_by_name[:2]
-        if thr["min"] <= avg <= thr["max"]
+        f"{name} avg {avg*100:.0f}%" for name, avg, thr in by_name[:2] if in_range(avg, thr)
     ]
     weaknesses = [
-        f"{name} avg {avg*100:.0f}%"
-        for name, avg, thr in metric_scores_by_name[-2:][::-1]
-        if not (thr["min"] <= avg <= thr["max"])
+        f"{name} avg {avg*100:.0f}%" for name, avg, thr in by_name[-2:][::-1] if not in_range(avg, thr)
     ]
 
     return WonderfulnessScore(
