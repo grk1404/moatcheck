@@ -98,6 +98,10 @@ CONFIG = {
     "tqqq_signal_minutes_before_close": 20,
     "tqqq_signal_retry_seconds": 300,       # retry a failed attempt every 5 minutes
 
+    # Startup report: a full status of every strategy each time the service starts
+    "startup_report_min_minutes": 10,       # a restart sooner than this sends a one-line notice (crash-loop guard)
+    "startup_timeout_seconds": 900,
+
     # Service loop
     "tick_seconds": 60,
     "cycle_timeout_seconds": 1500,          # a hung sweep exits so the service manager restarts it
@@ -268,7 +272,12 @@ def load_positions(csv_path: str) -> pd.DataFrame:
                     "AvgCost": _num(row[14] if len(row) > 14 else None),
                 })
 
-        return pd.DataFrame(rows)
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        # A stock held in several accounts is one position for alerting: one row per ticker, so a
+        # hit is scanned, listed and sent once instead of once per account.
+        return out.drop_duplicates(subset="Symbol", keep="first").reset_index(drop=True)
     except Exception as e:
         print(f"[alerts] Error parsing CSV: {e}")
         return pd.DataFrame()
@@ -664,41 +673,32 @@ def _send_group(title: str, entries: list, state: dict, cooldown_hours: float) -
     return len(fresh)
 
 
-def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
-    """52-week high and low checks. Returns number of hits delivered."""
-    print("[alerts] Running 52-week high and low checks.")
-    cfg = CONFIG
-    sent = 0
-    highs = [("HIGH", h["symbol"],
-              f"{h['symbol']}: {h['price']:.2f} USD ({h['pct']*100:.1f}% of 52w high {h['high']:.2f})")
-             for h in check_52w_highs(df, cfg["high_threshold"])]
-    sent += _send_group("🚨 52-Week High Alert", highs, state, cfg["cooldown_hours"])
-    lows = [("LOW", h["symbol"],
+def _entries_52w_highs(df: pd.DataFrame) -> list:
+    return [("HIGH", h["symbol"],
+             f"{h['symbol']}: {h['price']:.2f} USD ({h['pct']*100:.1f}% of 52w high {h['high']:.2f})")
+            for h in check_52w_highs(df, CONFIG["high_threshold"])]
+
+
+def _entries_52w_lows(df: pd.DataFrame) -> list:
+    return [("LOW", h["symbol"],
              f"{h['symbol']}: {h['price']:.2f} USD ({h['pct_above']*100:+.1f}% above 52w low {h['low']:.2f})")
-            for h in check_52w_lows(df, cfg["low_threshold"])]
-    sent += _send_group("⚠️ 52-Week Low Alert", lows, state, cfg["cooldown_hours"])
-    return sent
+            for h in check_52w_lows(df, CONFIG["low_threshold"])]
 
 
-def _run_mos_check(df: pd.DataFrame, state: dict) -> int:
-    """MOS buy price check. Returns number of hits delivered."""
-    entries = [("MOS", h["symbol"],
-                f"{h['symbol']}: {h['price']:.2f} USD <= MOS {h['mos_price']:.2f} "
-                f"(intrinsic {h['intrinsic']:.2f}, {h['discount']*100:+.1f}%)")
-               for h in check_mos_hits(df)]
-    return _send_group("🎯 MOS Buy Price Hit", entries, state, CONFIG["cooldown_hours"])
+def _entries_mos(df: pd.DataFrame) -> list:
+    return [("MOS", h["symbol"],
+             f"{h['symbol']}: {h['price']:.2f} USD <= MOS {h['mos_price']:.2f} "
+             f"(intrinsic {h['intrinsic']:.2f}, {h['discount']*100:+.1f}%)")
+            for h in check_mos_hits(df)]
 
 
-def _run_bnf_check(df: pd.DataFrame, state: dict) -> int:
-    """BNF reversal scan. Returns number of hits delivered."""
-    entries = [("BNF", h["symbol"],
-                f"{h['symbol']}: {h['price']:.2f} USD, {h['dislocation']:+.1f}% vs MA25 ({h['ma_25']:.2f}), RSI {h['rsi']:.1f}")
-               for h in check_bnf_setups(df)]
-    return _send_group("🔄 BNF Reversal Setup", entries, state, CONFIG["bnf_cooldown_hours"])
+def _entries_bnf(df: pd.DataFrame) -> list:
+    return [("BNF", h["symbol"],
+             f"{h['symbol']}: {h['price']:.2f} USD, {h['dislocation']:+.1f}% vs MA25 ({h['ma_25']:.2f}), RSI {h['rsi']:.1f}")
+            for h in check_bnf_setups(df)]
 
 
-def _run_swing_check(state: dict) -> int:
-    """TQQQ swing levels (reference only; the traded signal is the Sleeve). Returns hits delivered."""
+def _entries_swing() -> list:
     entries = []
     for h in check_tqqq_swing_alerts():
         kind = f"SWING:{h['type']}:{h['pct']}"
@@ -709,8 +709,31 @@ def _run_swing_check(state: dict) -> int:
             line = (f"BUY level: TQQQ {h['current']:.2f} USD is -{h['pct']*100:.0f}% from the 20d high "
                     f"{h['high']:.2f} (target {h['target']:.2f})")
         entries.append((kind, "TQQQ", line))
+    return entries
+
+
+def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
+    """52-week high and low checks. Returns number of hits delivered."""
+    print("[alerts] Running 52-week high and low checks.")
+    sent = _send_group("🚨 52-Week High Alert", _entries_52w_highs(df), state, CONFIG["cooldown_hours"])
+    sent += _send_group("⚠️ 52-Week Low Alert", _entries_52w_lows(df), state, CONFIG["cooldown_hours"])
+    return sent
+
+
+def _run_mos_check(df: pd.DataFrame, state: dict) -> int:
+    """MOS buy price check. Returns number of hits delivered."""
+    return _send_group("🎯 MOS Buy Price Hit", _entries_mos(df), state, CONFIG["cooldown_hours"])
+
+
+def _run_bnf_check(df: pd.DataFrame, state: dict) -> int:
+    """BNF reversal scan. Returns number of hits delivered."""
+    return _send_group("🔄 BNF Reversal Setup", _entries_bnf(df), state, CONFIG["bnf_cooldown_hours"])
+
+
+def _run_swing_check(state: dict) -> int:
+    """TQQQ swing levels (reference only; the traded signal is the Sleeve). Returns hits delivered."""
     return _send_group("📈 TQQQ Swing Levels (reference only; the Sleeve is the traded signal)",
-                       entries, state, CONFIG["cooldown_hours"])
+                       _entries_swing(), state, CONFIG["cooldown_hours"])
 
 
 def check_tqqq_signal() -> dict | None:
@@ -792,6 +815,23 @@ def check_tqqq_signal() -> dict | None:
         print(f"[alerts] TQQQ signal check failed: {type(e).__name__}: {e}")
         return None
 
+def _sleeve_lines(info: dict) -> list:
+    """Message lines for the Sleeve signal (used by the daily signal and the startup report)."""
+    action_icon = "🎯" if info["needs_action"] else "😴"
+    return [
+        f"{action_icon} TQQQ Sleeve Signal",
+        f"Regime: {info['regime']}",
+        f"Total Sleeve: {info['account_value']:.2f} USD",
+        "",
+        "🎯 TARGETS:",
+        f"TQQQ: {info['target_tqqq_pct']:.1f}% | SQQQ: {info['target_sqqq_pct']:.1f}% | Cash: {info['target_cash_pct']:.1f}%",
+        "",
+        "⚡ ACTIONS:",
+        f"TQQQ: {info['tqqq_action']}",
+        f"SQQQ: {info['sqqq_action']}",
+    ]
+
+
 def _run_tqqq_signal_check(today) -> int:
     """Send the daily TQQQ sleeve signal via WhatsApp. Returns 1 only if it was sent."""
     cfg = CONFIG
@@ -803,21 +843,7 @@ def _run_tqqq_signal_check(today) -> int:
         print(f"[alerts] Sleeve data is as of {info['as_of']}, not {today} (holiday or data lag); not sending.")
         return 0
 
-    action_icon = "🎯" if info["needs_action"] else "😴"
-
-    lines = [
-        f"{action_icon} TQQQ Sleeve Signal",
-        f"Regime: {info['regime']}",
-        f"Total Sleeve: {info['account_value']:.2f} USD",
-        "",
-        f"🎯 TARGETS:",
-        f"TQQQ: {info['target_tqqq_pct']:.1f}% | SQQQ: {info['target_sqqq_pct']:.1f}% | Cash: {info['target_cash_pct']:.1f}%",
-        "",
-        f"⚡ ACTIONS:",
-        f"TQQQ: {info['tqqq_action']}",
-        f"SQQQ: {info['sqqq_action']}",
-    ]
-    message = "\n".join(lines)
+    message = "\n".join(_sleeve_lines(info))
 
     if send_alert(message):
         return 1
@@ -851,6 +877,109 @@ def maybe_send_tqqq_signal() -> int:
         state["_tqqq_signal_date"] = today.isoformat()
         save_state(state)
     return sent
+
+def _market_status_line(now_ct: datetime) -> str:
+    sess = market_session(now_ct)
+    if not sess:
+        return f"Market is closed today ({now_ct:%A}); figures are from the last close."
+    if is_market_open(now_ct):
+        return f"Market is OPEN until {sess[1]:%H:%M} CT."
+    if now_ct < sess[0]:
+        return f"Market opens at {sess[0]:%H:%M} CT; figures are from the last close."
+    return "Market is closed for the day; figures are from today's close."
+
+
+def build_startup_report(df: pd.DataFrame, now_ct: datetime) -> tuple[str, list, bool]:
+    """Full status of every strategy, ignoring cooldowns. Returns (message, [(kind, symbol)] hits, sleeve_is_today).
+
+    Each check is isolated, so one failing check shows as 'check failed' instead of losing the report.
+    """
+    lines = [
+        f"🟢 MoatCheck alert service started {now_ct:%Y-%m-%d %H:%M} CT",
+        _market_status_line(now_ct),
+        "Full status of every strategy now; regular alerts follow their timers.",
+        "",
+    ]
+    hits: list = []
+    sleeve_today = False
+
+    # --- Sleeve (the traded strategy)
+    lines.append("━━ TQQQ SLEEVE (traded signal) ━━")
+    try:
+        info = check_tqqq_signal()
+        if info is None:
+            lines.append("Sleeve target unavailable (data or position file problem); see the service log.")
+        else:
+            sl = _sleeve_lines(info)
+            lines += sl[1:]                        # the section title above replaces the first line
+            sleeve_today = info.get("as_of") == now_ct.date()
+            if not sleeve_today:
+                lines.append(f"(NDX data as of {info.get('as_of')})")
+    except Exception as e:
+        lines.append(f"Sleeve check failed: {type(e).__name__}")
+    lines.append("")
+
+    sections = [
+        ("🚨 52-WEEK HIGHS (within 2%)", lambda: _entries_52w_highs(df)),
+        ("⚠️ 52-WEEK LOWS (within 2%)", lambda: _entries_52w_lows(df)),
+        ("🎯 MOS BUY PRICE", lambda: _entries_mos(df)),
+        ("🔄 BNF REVERSAL SETUPS", lambda: _entries_bnf(df)),
+        ("📈 TQQQ SWING LEVELS (reference only)", lambda: _entries_swing()),
+    ]
+    for title, fn in sections:
+        try:
+            if df.empty and title != sections[-1][0]:
+                lines += [f"━━ {title} ━━", "No positions file loaded.", ""]
+                continue
+            entries = fn()
+            lines.append(f"━━ {title}: {len(entries)} ━━")
+            lines += [e[2] for e in entries] or ["None right now."]
+            hits += [(e[0], e[1]) for e in entries]
+        except Exception as e:
+            lines.append(f"━━ {title} ━━")
+            lines.append(f"Check failed: {type(e).__name__}")
+        lines.append("")
+
+    sess = market_session(now_ct)
+    lines.append(f"Next: sweeps every {CONFIG['intraday_interval_seconds'] // 60} min while the market is open"
+                 f"{' (' + format(sess[0], '%H:%M') + '-' + format(sess[1], '%H:%M') + ' CT today)' if sess else ''}; "
+                 f"Sleeve signal {CONFIG['tqqq_signal_minutes_before_close']} min before the close.")
+    return "\n".join(lines), hits, sleeve_today
+
+
+def run_startup_report() -> int:
+    """Send the full startup status. Returns 1 if the report was sent, 0 if not.
+
+    Hits it lists are recorded as already alerted, so the first regular sweep does not repeat them.
+    A restart within startup_report_min_minutes of the last report (a crash loop) sends one line instead.
+    """
+    now = _now_ct()
+    state = load_state()
+    last = float(state.get("_last_startup_report", 0) or 0)
+    if time.time() - last < CONFIG["startup_report_min_minutes"] * 60:
+        print("[alerts] Startup report skipped: one was sent less than "
+              f"{CONFIG['startup_report_min_minutes']} minutes ago (restart loop?).")
+        send_alert(f"🔄 MoatCheck alert service restarted {now:%Y-%m-%d %H:%M} CT "
+                   f"(full report was sent {int((time.time() - last) / 60)} min ago).")
+        return 0
+
+    df = load_positions(CONFIG["csv_path"])
+    print(f"[alerts] Building startup report ({len(df)} positions).")
+    _RANGE_CACHE.clear()
+    message, hits, sleeve_today = build_startup_report(df, now)
+    if not send_alert(message):
+        print("[alerts] Startup report could not be delivered.")
+        return 0
+    state = load_state()
+    for kind, sym in hits:
+        mark_alerted(kind, sym, state)
+    state["_last_startup_report"] = time.time()
+    if sleeve_today and _in_signal_window(now):
+        state["_tqqq_signal_date"] = now.date().isoformat()     # the report carried today's Sleeve signal
+    save_state(state)
+    print(f"[alerts] Startup report sent ({len(hits)} threshold hit(s) recorded).")
+    return 1
+
 
 def run_intraday_cycle() -> int:
     """One threshold sweep: 52-week highs/lows, MOS, BNF, TQQQ swing. Returns alerts delivered."""
@@ -909,8 +1038,16 @@ def main() -> None:
           f"(first sweep {CONFIG['open_delay_minutes']} min after the open); tick {CONFIG['tick_seconds']}s")
     print(f"[alerts] Daily Sleeve signal: {CONFIG['tqqq_signal_minutes_before_close']} min before the close, once per trading day")
     print(f"[alerts] High threshold: {CONFIG['high_threshold']}  Low threshold: {CONFIG['low_threshold']}")
-    if telegram_configured():
-        send_telegram(f"🟢 MoatCheck alert service started {_now_ct():%Y-%m-%d %H:%M} CT")
+    # Full status of every strategy, then the normal timers take over.
+    if wait_for_network(timeout=180):
+        sent_full = _run_with_watchdog(run_startup_report, CONFIG["startup_timeout_seconds"], "Startup report")
+        if sent_full:
+            _last_intraday = time.time()        # the report covered a sweep; the next one follows the timer
+        elif sent_full is None:                 # the report crashed: still say the service is up
+            send_alert(f"🟢 MoatCheck alert service started {_now_ct():%Y-%m-%d %H:%M} CT "
+                       "(the full startup report failed; see the service log).")
+    else:
+        print("[alerts] Network not ready after 180s; startup report skipped.")
 
     last_beat = 0.0
     while True:
