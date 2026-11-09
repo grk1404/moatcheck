@@ -56,7 +56,11 @@ class Financials:
     current_price: float | None
     market_cap: float | None
     pe_ratio_ttm: float | None
-    analyst_5yr_growth: float | None
+    headline_eps_ttm: float | None = None    
+    analyst_5yr_growth: float | None = None
+    analyst_5yr_growth_raw: float | None = None      # <- pre-clamp (trailing earningsGrowth)
+    analyst_forward_growth: float | None = None      # <- NEW: +1y consensus from growth_estimates
+    analyst_forward_growth_source: str = ""          # <- NEW: "1y" | "0y" | "trailing" | ""
     shares_outstanding: float | None = None
     dividend_yield: float | None = None
     beta: float | None = None
@@ -345,7 +349,11 @@ def fetch(ticker: str) -> Financials:
         pass
 
     pe_ratio_ttm = None
+    headline_eps_ttm = None
     analyst_5yr_growth = None
+    analyst_5yr_growth_raw = None            # <-- ADD
+    analyst_forward_growth = None            # <-- ADD
+    analyst_forward_growth_source = ""       # <-- ADD
     shares_outstanding = None
     dividend_yield = None
     beta = None
@@ -394,9 +402,30 @@ def fetch(ticker: str) -> Financials:
         pe_ratio_ttm = info.get("trailingPE")
         if pe_ratio_ttm is not None:
             pe_ratio_ttm = float(pe_ratio_ttm)
+
+        _headline_eps = info.get("trailingEps")
+        if _headline_eps is not None:
+            headline_eps_ttm = float(_headline_eps)
+
         g = info.get("earningsGrowth") or info.get("revenueGrowth")
         if g is not None:
             analyst_5yr_growth = float(g)
+            analyst_5yr_growth_raw = analyst_5yr_growth      # <-- ADD (preserve pre-clamp)
+        # Forward consensus growth from Yahoo's Analysis page (growth_estimates).   <-- ADD BLOCK
+        # "+1y" is next fiscal year; "0y" is current fiscal year. LTG / +5y is
+        # no longer populated for US equities, so we do not rely on it.
+        try:
+            ge = yft.growth_estimates
+            if ge is not None and not ge.empty and "stockTrend" in ge.columns:
+                for period in ("+1y", "0y"):
+                    if period in ge.index:
+                        v = ge.loc[period, "stockTrend"]
+                        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                            analyst_forward_growth = float(v)
+                            analyst_forward_growth_source = period
+                            break
+        except Exception:
+            pass
         so = info.get("sharesOutstanding")
         if so is not None:
             shares_outstanding = float(so)
@@ -515,7 +544,11 @@ def fetch(ticker: str) -> Financials:
         current_price=current_price,
         market_cap=market_cap,
         pe_ratio_ttm=pe_ratio_ttm,
+        headline_eps_ttm=headline_eps_ttm,
         analyst_5yr_growth=analyst_5yr_growth,
+        analyst_5yr_growth_raw=analyst_5yr_growth_raw,
+        analyst_forward_growth=analyst_forward_growth,
+        analyst_forward_growth_source=analyst_forward_growth_source,
         shares_outstanding=shares_outstanding,
         dividend_yield=dividend_yield,
         beta=beta,

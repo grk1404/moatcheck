@@ -34,7 +34,8 @@ from technical_indicators import TechnicalIndicatorAnalyzer
 
 # Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
-
+MAX_ANALYST_GROWTH_FORWARD = 0.40
+MAX_ANALYST_GROWTH_TRAILING = 0.25
 
 def clear_yfinance_cache(ticker: str | None = None) -> bool:
     """Clear yfinance_cache data. 
@@ -746,14 +747,41 @@ def render_analyzer() -> None:
 
     # Company Name Display 
     st.subheader(f"{fin.company_name} ({fin.ticker})")
-    # Guardrail: Yahoo sometimes returns absurd analyst growth rates (e.g., 247%) 
-    # for small caps or post-earnings anomalies. Cap it at 25% so it doesn't
-    # blow up the DCF and intrinsic value calculations into the millions.
-    if getattr(fin, "analyst_5yr_growth", None) is not None:
-        if fin.analyst_5yr_growth > 0.25:
-            fin.analyst_5yr_growth = 0.25
-        elif fin.analyst_5yr_growth < 0.0:
-            fin.analyst_5yr_growth = 0.0    
+    
+    # Guardrail: extreme analyst growth would blow up value_price()/DCF into the
+    # millions and make almost every growth stock read BARGAIN BUY. Forward
+    # consensus (Yahoo +1y/0y) is analyst-averaged and can legitimately run high,
+    # so it gets the more generous cap; trailing quarterly YoY is a one-quarter
+    # artifact and gets the tighter one. The raw value is kept so the UI can
+    # show "raw -> capped".
+    _fg = getattr(fin, "analyst_forward_growth", None)
+    if _fg is not None:
+        _src = getattr(fin, "analyst_forward_growth_source", "") or "+1y"
+        _cap = MAX_ANALYST_GROWTH_FORWARD
+        _raw = _fg
+    elif getattr(fin, "analyst_5yr_growth", None) is not None:
+        _src = "trailing"
+        _cap = MAX_ANALYST_GROWTH_TRAILING
+        _raw = fin.analyst_5yr_growth
+    else:
+        _src = ""
+        _cap = None
+        _raw = None
+
+    if _cap is not None:
+        if _raw > _cap:
+            _used = _cap
+        elif _raw < 0.0:
+            _used = 0.0
+        else:
+            _used = _raw
+        fin.analyst_5yr_growth = _used   # keep the legacy field in sync
+    else:
+        _used = None
+
+    fin._analyst_growth_for_model = _used
+    fin._analyst_growth_label_src = _src
+    fin._analyst_growth_raw_display = _raw    
 
     # Company Summary
     if fin.company_summary or fin.company_sector or fin.company_industry or fin.company_country:
@@ -978,12 +1006,20 @@ def render_analyzer() -> None:
         label, color = _ANALYST_STYLE.get(key or "", (None, "gray"))
 
         if label is None or not count:
+            _ag = getattr(fin, "_analyst_growth_for_model", None)
+            _src = getattr(fin, "_analyst_growth_label_src", "")
+            _growth_html = ""
+            if _ag is not None:
+                if _src == "trailing":
+                    _growth_html = f'<div style="font-size: 0.72rem; color: #9aa0a6;">Trailing EPS growth: {_ag * 100:.1f}%</div>'
+                else:
+                    _src_label = {"+1y": "FY+1", "0y": "FY0"}.get(_src, _src)
+                    _growth_html = f'<div style="font-size: 0.72rem; color: #9aa0a6;">Est. growth ({_src_label}): {_ag * 100:.1f}%</div>'
             col.markdown(
                 '<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
                 '<div style="font-size: 1.5rem; color: #9AA0A6;">n/a</div>'
                 '<div style="font-size: 0.72rem; color: #9aa0a6;">no analyst coverage</div>'
-                + (f'<div style="font-size: 0.72rem; color: #9aa0a6;">Analyst growth: {fin.analyst_5yr_growth * 100:.1f}%</div>'
-                   if fin.analyst_5yr_growth is not None else ""),
+                + _growth_html,
                 unsafe_allow_html=True,
             )
             return
@@ -995,8 +1031,20 @@ def render_analyzer() -> None:
             upside = (tgt - fin.current_price) / fin.current_price * 100
             detail_parts.append(f"target ${tgt:.0f} ({upside:+.0f}%)")
         detail = " · ".join(detail_parts)
-        if fin.analyst_5yr_growth is not None:
-            detail += f"<br>Analyst growth: {fin.analyst_5yr_growth * 100:.1f}%"
+        _ag = getattr(fin, "_analyst_growth_for_model", None)
+        _raw = getattr(fin, "_analyst_growth_raw_display", None)
+        _src = getattr(fin, "_analyst_growth_label_src", "")
+        if _ag is not None:
+            if _src == "trailing":
+                _label = "Trailing EPS growth"
+            else:
+                _src_label = {"+1y": "FY+1", "0y": "FY0"}.get(_src, _src)
+                _label = f"Est. growth ({_src_label})"
+            
+            if _raw is not None and abs(_raw - _ag) > 1e-9:
+                detail += f"<br>{_label}: {_raw * 100:.1f}% → capped {_ag * 100:.1f}%"
+            else:
+                detail += f"<br>{_label}: {_ag * 100:.1f}%"
 
         col.markdown(
             f'<div style="color: rgba(250,250,250,0.6); font-size: 0.875rem;">Analyst Rating</div>'
@@ -1049,10 +1097,10 @@ def render_analyzer() -> None:
     if val and fin.current_price and val.value_price:
         _upside = (val.value_price - fin.current_price) / fin.current_price
         if _upside < 0:
-            _intrinsic_sub = f"{abs(_upside)*100:.1f}% above fair"
+            _intrinsic_sub = f"{abs(_upside)*100:.1f}% above Value Price"
             _intrinsic_color = "#FFA726" # Orange
         else:
-            _intrinsic_sub = f"{_upside*100:.1f}% below fair"
+            _intrinsic_sub = f"{_upside*100:.1f}% below Value Price"
             _intrinsic_color = "#00E676" # Green
 
     # Give Market Cap (col 2) a bit more room to breathe
@@ -1065,7 +1113,23 @@ def render_analyzer() -> None:
         sub_color=_intrinsic_color
     ), unsafe_allow_html=True)
     top2.metric("Market Cap", _fmt_money(fin.market_cap, fin.exchange, fin.ticker))
-    top3.metric("EPS (TTM)", _fmt_money(_eps_ttm, fin.exchange or "USD"))
+    
+    # Build the sub-text for non-GAAP EPS if Yahoo has a different number
+    _eps_sub = ""
+    _eps_sub_color = "#9aa0a6"
+    if getattr(fin, "headline_eps_ttm", None) is not None:
+        # If Yahoo's EPS is more than 2% different from GAAP, show it.
+        if abs(fin.headline_eps_ttm - _eps_ttm) / abs(_eps_ttm) > 0.02:
+            _eps_sub = f"Non-GAAP: {_fmt_money(fin.headline_eps_ttm, fin.exchange or 'USD')}"
+
+    top3.markdown(_metric_html(
+        "EPS (Diluted)",
+        _fmt_money(_eps_ttm, fin.exchange or "USD"),
+        sub=_eps_sub,
+        sub_color=_eps_sub_color,
+        help_text="Diluted EPS is pulled directly from the SEC 10-K/10-Q income statement (GAAP). Non-GAAP is Yahoo's headline adjusted EPS."
+    ), unsafe_allow_html=True)
+
     top4.metric("TTM P/E", f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "n/a")
 
     # Long-term debt with health coloring
@@ -1316,7 +1380,14 @@ def render_analyzer() -> None:
     if val is not None:
         with st.expander("How the value Price was calculated"):
             _big5_g_txt = _fmt_pct(big5_eps_g)
-            _analyst_g_txt = _fmt_pct(fin.analyst_5yr_growth)
+            _ag = getattr(fin, "_analyst_growth_for_model", None)
+            _raw = getattr(fin, "_analyst_growth_raw_display", None)
+            _src = getattr(fin, "_analyst_growth_label_src", "")
+            _analyst_g_txt = _fmt_pct(_ag) if _ag is not None else "n/a"
+            if _raw is not None and _ag is not None and abs(_raw - _ag) > 1e-9:
+                _analyst_g_txt = f"{_fmt_pct(_raw)} → capped {_fmt_pct(_ag)}"
+            elif _ag is not None and _src == "trailing":
+                _analyst_g_txt = f"{_fmt_pct(_ag)} (trailing)"
             _hist_pe_txt = f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "no data"
             _default_pe = val.growth_rate * 100 * 2
             _mos_pct_int = int(round(100 * (1 - val.mos_price / val.value_price))) if val.value_price else 50

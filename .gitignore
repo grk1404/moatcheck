@@ -40,3 +40,4 @@ Thumbs.db
 
 # Project Data (CSVs, JSON state, trade logs)
 data/
+data/alert_secrets.json
