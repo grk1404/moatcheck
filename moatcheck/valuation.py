@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+import statistics
 
 @dataclass
 class ValuationResult:
@@ -136,3 +136,34 @@ def debt_to_fcf(long_term_debt: float | None, fcf_ttm: float | None) -> float | 
     if long_term_debt <= 0:
         return 0.0
     return long_term_debt / fcf_ttm
+
+MAX_ANALYST_GROWTH_FORWARD = 0.40
+MAX_ANALYST_GROWTH_TRAILING = 0.25
+MAX_BIG5_GROWTH = 0.30
+MIN_BIG5_GROWTH = 0.02
+
+def get_model_growth(fin, big5_eps_values: dict) -> float | None:
+    """The 'Model' growth rate: lower of (capped Big 5 EPS) and (capped Analyst).
+    Used by both the Stock Analyzer and My Investments pages.
+    """
+    # 1. Get capped analyst growth
+    _ag = None
+    _fg = getattr(fin, "analyst_forward_growth", None)
+    if _fg is not None:
+        _ag = min(_fg, MAX_ANALYST_GROWTH_FORWARD)
+    elif getattr(fin, "analyst_5yr_growth", None) is not None:
+        _ag = min(fin.analyst_5yr_growth, MAX_ANALYST_GROWTH_TRAILING)
+
+    # 2. Get capped Big 5 EPS growth (median of 10y, 5y, 3y)
+    _bg = None
+    stable_eps = [v for w, v in big5_eps_values.items() if w in (5, 3, 10) and v is not None]
+    if stable_eps:
+        _bg = min(max(statistics.median(stable_eps), MIN_BIG5_GROWTH), MAX_BIG5_GROWTH)
+    else:
+        _fallback = big5_eps_values.get(1) or big5_eps_values.get(3) or big5_eps_values.get(5)
+        if _fallback is not None:
+            _bg = min(max(_fallback, MIN_BIG5_GROWTH), MAX_BIG5_GROWTH)
+
+    # 3. The Model chooses the lower of the positive Big 5 and Analyst
+    cands = [g for g in (_bg, _ag) if g is not None and g > 0]
+    return min(cands) if cands else None

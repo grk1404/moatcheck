@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import yfinance_cache as yf
 from curl_cffi import requests as curl_requests
+from moatcheck.valuation import get_model_growth
 
 _session = curl_requests.Session(impersonate="chrome")
 

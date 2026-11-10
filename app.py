@@ -13,6 +13,8 @@ import warnings
 from data_provider import get_ticker
 from investments import _metric_html, render_my_investments, get_holding_tickers
 from data_quality import check_data_quality
+from moatcheck.valuation import get_model_growth
+
 
 from trade_manager import (
     compute_target_shares,
@@ -748,40 +750,6 @@ def render_analyzer() -> None:
     # Company Name Display 
     st.subheader(f"{fin.company_name} ({fin.ticker})")
     
-    # Guardrail: extreme analyst growth would blow up value_price()/DCF into the
-    # millions and make almost every growth stock read BARGAIN BUY. Forward
-    # consensus (Yahoo +1y/0y) is analyst-averaged and can legitimately run high,
-    # so it gets the more generous cap; trailing quarterly YoY is a one-quarter
-    # artifact and gets the tighter one. The raw value is kept so the UI can
-    # show "raw -> capped".
-    _fg = getattr(fin, "analyst_forward_growth", None)
-    if _fg is not None:
-        _src = getattr(fin, "analyst_forward_growth_source", "") or "+1y"
-        _cap = MAX_ANALYST_GROWTH_FORWARD
-        _raw = _fg
-    elif getattr(fin, "analyst_5yr_growth", None) is not None:
-        _src = "trailing"
-        _cap = MAX_ANALYST_GROWTH_TRAILING
-        _raw = fin.analyst_5yr_growth
-    else:
-        _src = ""
-        _cap = None
-        _raw = None
-
-    if _cap is not None:
-        if _raw > _cap:
-            _used = _cap
-        elif _raw < 0.0:
-            _used = 0.0
-        else:
-            _used = _raw
-        fin.analyst_5yr_growth = _used   # keep the legacy field in sync
-    else:
-        _used = None
-
-    fin._analyst_growth_for_model = _used
-    fin._analyst_growth_label_src = _src
-    fin._analyst_growth_raw_display = _raw    
 
     # Company Summary
     if fin.company_summary or fin.company_sector or fin.company_industry or fin.company_country:
@@ -831,6 +799,30 @@ def render_analyzer() -> None:
     big5 = compute_big5(fin)
     big5_eps_g = _big5_eps_growth(big5)
 
+    # ============================================================
+    # GROWTH SELECTION & GUARDRAILS
+    # ============================================================
+    # For display purposes, determine what the model actually used.
+    # The actual math (caps and lowering) is handled by get_model_growth in valuation.py
+    _fg = getattr(fin, "analyst_forward_growth", None)
+    if _fg is not None:
+        _analyst_growth_raw_display = _fg
+        _analyst_growth_label_src = getattr(fin, "analyst_forward_growth_source", "") or "+1y"
+    elif getattr(fin, "analyst_5yr_growth", None) is not None:
+        _analyst_growth_raw_display = fin.analyst_5yr_growth
+        _analyst_growth_label_src = "trailing"
+    else:
+        _analyst_growth_raw_display = None
+        _analyst_growth_label_src = ""
+
+    # The actual math uses this shared helper:
+    fin._analyst_growth_for_model = get_model_growth(fin, big5.eps.values)
+    
+    # Store the raw display values for the UI
+    fin._analyst_growth_raw_display = _analyst_growth_raw_display
+    fin._analyst_growth_label_src = _analyst_growth_label_src    
+
+
     # --- EPS selection: prefer latest year, but fall back to a 3yr positive-EPS
     # average when the latest year is negative (value Price and other formulas
     # can't handle negative earnings). This surfaces to the user as an amber note.
@@ -867,9 +859,8 @@ def render_analyzer() -> None:
     _MODEL_MODE = "Model (lower of Big 5 & analyst)"
 
     def _model_growth() -> float | None:
-        """The growth the valuation model picks on its own: the lower of the positive Big 5 and analyst rates."""
-        cands = [g for g in (big5_eps_g, fin.analyst_5yr_growth) if g is not None and g > 0]
-        return min(cands) if cands else None
+        """The growth the valuation model picks on its own: the lower of the positive Big 5 and analyst rates."""        
+        return get_model_growth(fin, big5.eps.values)
 
     def _valuation_growth_rate_label(mode: str) -> str:
         if mode == _MODEL_MODE:

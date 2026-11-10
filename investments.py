@@ -10,6 +10,7 @@ from datetime import datetime
 import json
 import statistics
 from pathlib import Path
+from moatcheck.valuation import get_model_growth
 
 DATA_DIR = Path("data")
 # Look for any of these in priority order; first one that exists wins.
@@ -661,7 +662,11 @@ def _build_signals(df: pd.DataFrame) -> dict:
                 float(fin.free_cash_flow.iloc[-1])
                 if not fin.free_cash_flow.empty else None
             )
-            growth = eps_w.get(5) or eps_w.get(3)
+
+            # --- Use the shared model growth logic from valuation.py ---
+            # This ensures My Investments perfectly matches the Stock Analyzer.
+            growth = get_model_growth(fin, eps_w)
+
 
             vals: list[tuple[str, float]] = []
             if current_eps and growth:
