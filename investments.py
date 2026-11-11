@@ -10,7 +10,7 @@ from datetime import datetime
 import json
 import statistics
 from pathlib import Path
-from moatcheck.valuation import get_model_growth
+from moatcheck.valuation import get_model_growth, calculate_intrinsic_value
 
 DATA_DIR = Path("data")
 # Look for any of these in priority order; first one that exists wins.
@@ -617,8 +617,7 @@ def _build_signals(df: pd.DataFrame) -> dict:
     the caller caches the returned dict.
     """
     from moatcheck import (
-        fetch, compute_big5, dcf_two_stage, peter_lynch_fair,
-        graham_number, graham_formula, peg_fair_value,
+        fetch, compute_big5
     )
     from moatcheck.fetcher import FetchError
 
@@ -665,73 +664,32 @@ def _build_signals(df: pd.DataFrame) -> dict:
 
             # --- Use the shared model growth logic from valuation.py ---
             # This ensures My Investments perfectly matches the Stock Analyzer.
+            # 1. Get growth (centralized)
             growth = get_model_growth(fin, eps_w)
 
-
-            vals: list[tuple[str, float]] = []
-            if current_eps and growth:
-                if fcf_ttm is not None and fcf_ttm > 0:
-                    dcf = dcf_two_stage(
-                        fcf_ttm=fcf_ttm,
-                        shares_out=fin.shares_outstanding,
-                        current_price=fin.current_price,
-                        growth_rate=growth,
-                        discount_rate=0.10,
-                        terminal_growth=0.025,
-                    )
-                    if dcf and dcf.fair_value:
-                        vals.append(("DCF", dcf.fair_value))
-                
-
-                lynch = peter_lynch_fair(
-                    current_eps=current_eps, growth_rate=growth,
-                    dividend_yield=fin.dividend_yield,
-                    current_price=fin.current_price, mos=0.25,
-                )
-                if lynch and lynch.fair_value:
-                    vals.append(("Lynch", lynch.fair_value))
-
-                gn = graham_number(
-                    current_eps=current_eps,
-                    book_value_per_share=fin.book_value_per_share,
-                    current_price=fin.current_price, mos=0.25,
-                )
-                if gn and gn.fair_value:
-                    vals.append(("Graham #", gn.fair_value))
-
-                gf = graham_formula(
-                    current_eps=current_eps, growth_rate=growth,
-                    current_price=fin.current_price,
-                    aaa_bond_yield=0.045, mos=0.25,
-                )
-                if gf and gf.fair_value:
-                    vals.append(("Graham F", gf.fair_value))
-
-                peg = peg_fair_value(
-                    current_eps=current_eps, growth_rate=growth,
-                    current_price=fin.current_price, mos=0.25,
-                )
-                if peg and peg.fair_value:
-                    vals.append(("PEG", peg.fair_value))
-
-            if len(vals) >= 2:
-                intrinsic = statistics.median(v for _, v in vals)
-                method = f"median of {len(vals)}"
-            elif len(vals) == 1:
-                intrinsic = vals[0][1]
-                method = vals[0][0]
-            else:
-                intrinsic = None
-                method = None
+            # 2. Call the centralized valuation logic (used by both this page and Stock Analyzer)
+            val_res = calculate_intrinsic_value(
+                current_eps=current_eps,
+                fcf_ttm=fcf_ttm,
+                shares_outstanding=fin.shares_outstanding,
+                book_value_per_share=fin.book_value_per_share,
+                dividend_yield=fin.dividend_yield,
+                current_price=fin.current_price,
+                growth_rate=growth,
+                historical_pe=fin.pe_ratio_ttm,
+            )
+            
+            intrinsic = val_res["intrinsic_value"]
+            method = val_res["method"]
 
             out[sym] = {
                 "rev_10y": rev_w.get(10),
-                "rev_5y":  rev_w.get(5),
-                "rev_3y":  rev_w.get(3),
+                "rev_5y":  rev_w.get(5) or rev_w.get(3) or rev_w.get(1),
+                "rev_3y":  rev_w.get(3) or rev_w.get(1),
                 "rev_1y":  rev_w.get(1),
                 "eps_10y": eps_w.get(10),
-                "eps_5y":  eps_w.get(5),
-                "eps_3y":  eps_w.get(3),
+                "eps_5y":  eps_w.get(5) or eps_w.get(3) or eps_w.get(1),
+                "eps_3y":  eps_w.get(3) or eps_w.get(1),
                 "eps_1y":  eps_w.get(1),
                 "wonderfulness": big5.wonderfulness().overall,
                 "intrinsic_value": intrinsic,
