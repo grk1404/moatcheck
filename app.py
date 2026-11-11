@@ -3,6 +3,7 @@ import streamlit as st
 
 import shutil
 import os
+import statistics
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +14,7 @@ import warnings
 from data_provider import get_ticker
 from investments import _metric_html, render_my_investments, get_holding_tickers
 from data_quality import check_data_quality
-from moatcheck.valuation import get_model_growth
+from moatcheck.valuation import get_model_growth, calculate_intrinsic_value, calculate_model_valuation
 
 
 from trade_manager import (
@@ -349,50 +350,6 @@ def _verdict_price(current: float | None, mos: float | None, value: float | None
         return ("WATCH", f"between MOS and Intrinsic Value ({pct:.0f}% below Intrinsic)", "orange")
     pct = (current - value) / value * 100
     return ("AVOID", f"above Intrinsic Value by {pct:.0f}%", "red")
-
-
-def _big5_eps_growth(big5: Big5Result) -> float | None:
-    """Pick a stable EPS growth rate from the Big 5 EPS CAGR windows for valuation.
-
-    Rule: use the **median of the 5yr and 3yr windows** — these capture the
-    business trend without letting a single weak/strong year dominate. The 1yr
-    window is only used as a last resort when longer windows aren't computable
-    (e.g. foreign tickers with 4yrs of yfinance data). The 10yr window is
-    included when it exists to further stabilize.
-
-    Rationale: the "lowest window" rule (Buffett's discipline) is too brittle
-    for tickers with short history — a single flat year (e.g. KSPI's 1yr = 3%)
-    can suppress the value price by 4× vs the 3yr trend of 22%.
-    """
-    windows = big5.eps.values  # {10: v, 5: v, 3: v, 1: v}
-    stable = [v for w, v in windows.items() if w in (5, 3, 10) and v is not None]
-    if stable:
-        stable.sort()
-        n = len(stable)
-        # median (with even-count average)
-        if n % 2:
-            growth = stable[n // 2]
-        else:
-            growth = (stable[n // 2 - 1] + stable[n // 2]) / 2
-        
-        # --- FIX: Cap growth at 30% and ensure minimum 2% ---
-        if growth > 0.30:
-            growth = 0.30
-        if growth < 0.02:
-            growth = 0.02
-        return growth
-    
-    # Fallback: 1yr only when nothing longer is computable
-    one = windows.get(1)
-    if one is not None:
-        # --- FIX: Cap fallback growth at 30% and ensure minimum 2% ---
-        if one > 0.30:
-            one = 0.30
-        if one < 0.02:
-            one = 0.02
-        return one
-    return None
-
 
 def _inject_tab_styles() -> None:
     """Global CSS: buttons, headers, links, sidebar nav styling."""
@@ -796,8 +753,8 @@ def render_analyzer() -> None:
     # ============================================================
     # CORE CALCULATIONS
     # ============================================================
-    big5 = compute_big5(fin)
-    big5_eps_g = _big5_eps_growth(big5)
+    big5 = compute_big5(fin)    
+    big5_eps_g = get_model_growth(fin, big5.eps.values) # Instead of local math, use the shared model growth (which caps at 30% and handles the median)
 
     # ============================================================
     # GROWTH SELECTION & GUARDRAILS
@@ -888,71 +845,6 @@ def render_analyzer() -> None:
         options.append("Custom")
         return options
 
-    def _compute_valuation_value(mode: str):
-        if mode == _MODEL_MODE:
-            # The model's own rule: value_price() takes the lower of the two growth rates.
-            return value_price(
-                current_eps=eps_for_valuation,
-                big5_eps_growth=big5_eps_g,
-                analyst_growth=fin.analyst_5yr_growth,
-                historical_pe=fin.pe_ratio_ttm,
-            )
-
-        if mode == "Custom":
-            custom_growth_pct = float(st.session_state.get("custom_growth_rate", 0) or 0)
-            if custom_growth_pct <= 0:
-                return None
-            custom_growth = custom_growth_pct / 100.0
-            return value_price(
-                current_eps=eps_for_valuation,
-                big5_eps_growth=None,
-                analyst_growth=None,
-                historical_pe=fin.pe_ratio_ttm,
-                custom_growth=custom_growth,
-            )
-
-        if mode == "Value conservative":
-            # --- FIX: Use the conservative growth function (returns 15%) ---
-            conservative_growth = _moat_conservative_growth()
-            if conservative_growth is None:
-                return None
-            
-            # If EPS is negative or missing, we force a tiny $0.01 EPS 
-            # just so the math completes and gives us a theoretical floor value.
-            eps_for_math = eps_for_valuation
-            if eps_for_math is None or eps_for_math <= 0:
-                eps_for_math = 0.01
-
-            return value_price(
-                current_eps=eps_for_math,
-                big5_eps_growth=None,           
-                analyst_growth=None,            
-                historical_pe=fin.pe_ratio_ttm,
-                custom_growth=conservative_growth,
-            )
-
-        if mode == "Big 5 EPS growth":
-            if big5_eps_g is None:
-                return None
-            return value_price(
-                current_eps=eps_for_valuation,
-                big5_eps_growth=big5_eps_g,
-                analyst_growth=None,
-                historical_pe=fin.pe_ratio_ttm,
-            )
-
-        if mode == "Analyst 5Y growth":
-            if fin.analyst_5yr_growth is None:
-                return None
-            return value_price(
-                current_eps=eps_for_valuation,
-                big5_eps_growth=None,
-                analyst_growth=fin.analyst_5yr_growth,
-                historical_pe=fin.pe_ratio_ttm,
-            )
-
-        return None
-
     # Initialize Valuation State early so top metrics can use it
     if "valuation_growth_result" not in st.session_state:
         st.session_state["valuation_growth_result"] = None
@@ -964,13 +856,38 @@ def render_analyzer() -> None:
     mode_options = _valuation_growth_mode_options()
     if "valuation_growth_mode" not in st.session_state or st.session_state["valuation_growth_mode"] not in mode_options:
         st.session_state["valuation_growth_mode"] = mode_options[0]    # the model's own rule if computable
-    selected_growth_mode = st.session_state["valuation_growth_mode"]
-
+    selected_growth_mode = st.session_state.get("valuation_growth_mode", _MODEL_MODE)
     val = st.session_state.get("valuation_growth_result")
+    
+    # Calculate immediately if it's missing or if RE-VALUATE was clicked (this prevents the "Cannot compute" warning)
     if val is None:
-        val = _compute_valuation_value(selected_growth_mode)
-        st.session_state["valuation_growth_result"] = val
-        st.session_state["valuation_calculated_mode"] = selected_growth_mode
+        if selected_growth_mode == _MODEL_MODE:
+            calc_growth = get_model_growth(fin, big5.eps.values)
+        elif selected_growth_mode == "Value conservative":
+            calc_growth = _moat_conservative_growth()
+        elif selected_growth_mode == "Big 5 EPS growth":
+            calc_growth = big5_eps_g
+        elif selected_growth_mode == "Analyst 5Y growth":
+            calc_growth = fin.analyst_5yr_growth
+        elif selected_growth_mode == "Custom":
+            calc_growth = float(st.session_state.get("custom_growth_rate", 0) or 0) / 100.0
+        else:
+            calc_growth = None
+
+        val_res = calculate_model_valuation(
+            current_eps=eps_for_valuation,
+            fcf_ttm=float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None,
+            shares_outstanding=fin.shares_outstanding,
+            book_value_per_share=fin.book_value_per_share,
+            dividend_yield=fin.dividend_yield,
+            current_price=fin.current_price,
+            growth_rate=calc_growth,
+            historical_pe=fin.pe_ratio_ttm,
+        )
+        if val_res["details"] and "Value Price" in val_res["details"]:
+            val = val_res["details"]["Value Price"]
+            st.session_state["valuation_growth_result"] = val
+            st.session_state["valuation_calculated_mode"] = selected_growth_mode
 
     # --- MOVED UP: Define the rendering helpers before calling them ---
     _VERDICT_TOOLTIPS = {
@@ -1362,60 +1279,82 @@ def render_analyzer() -> None:
                 help="Recalculate with selected growth rate"
             )
 
+    # If the user clicked RE-VALUATE, force the calculation block above to run
     if revalue_button:
-        st.session_state["valuation_growth_result"] = _compute_valuation_value(selected_growth_mode)
-        st.session_state["valuation_calculated_mode"] = selected_growth_mode
+        st.session_state["valuation_growth_result"] = None
         st.rerun()
 
-    # Only show the "How it was calculated" expander if val actually exists
+    # 1. If val is still None on the first load, calculate it now (this puts the top metric on the screen)
+    val = st.session_state.get("valuation_growth_result")
+    if val is None:
+        if selected_growth_mode == _MODEL_MODE:
+            calc_growth = get_model_growth(fin, big5.eps.values)
+        elif selected_growth_mode == "Value conservative":
+            calc_growth = _moat_conservative_growth()
+        elif selected_growth_mode == "Big 5 EPS growth":
+            calc_growth = big5_eps_g
+        elif selected_growth_mode == "Analyst 5Y growth":
+            calc_growth = fin.analyst_5yr_growth
+        elif selected_growth_mode == "Custom":
+            calc_growth = float(st.session_state.get("custom_growth_rate", 0) or 0) / 100.0
+        else:
+            calc_growth = None
+
+        val_res = calculate_model_valuation(
+            current_eps=eps_for_valuation,
+            fcf_ttm=float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None,
+            shares_outstanding=fin.shares_outstanding,
+            book_value_per_share=fin.book_value_per_share,
+            dividend_yield=fin.dividend_yield,
+            current_price=fin.current_price,
+            growth_rate=calc_growth,
+            historical_pe=fin.pe_ratio_ttm,
+        )
+        if val_res["details"] and "Value Price" in val_res["details"]:
+            val = val_res["details"]["Value Price"]
+            st.session_state["valuation_growth_result"] = val
+            st.session_state["valuation_calculated_mode"] = selected_growth_mode
+
+    # 2. Render the expander using the newly calculated `val`
     if val is not None:
         with st.expander("How the value Price was calculated"):
-            _big5_g_txt = _fmt_pct(big5_eps_g)
-            _ag = getattr(fin, "_analyst_growth_for_model", None)
-            _raw = getattr(fin, "_analyst_growth_raw_display", None)
-            _src = getattr(fin, "_analyst_growth_label_src", "")
-            _analyst_g_txt = _fmt_pct(_ag) if _ag is not None else "n/a"
-            if _raw is not None and _ag is not None and abs(_raw - _ag) > 1e-9:
-                _analyst_g_txt = f"{_fmt_pct(_raw)} → capped {_fmt_pct(_ag)}"
-            elif _ag is not None and _src == "trailing":
-                _analyst_g_txt = f"{_fmt_pct(_ag)} (trailing)"
+            _big5_g_txt = _fmt_pct(get_model_growth(fin, big5.eps.values))
+            _analyst_g_txt = _fmt_pct(fin.analyst_5yr_growth)
             _hist_pe_txt = f"{fin.pe_ratio_ttm:.1f}" if fin.pe_ratio_ttm else "no data"
             _default_pe = val.growth_rate * 100 * 2
             _mos_pct_int = int(round(100 * (1 - val.mos_price / val.value_price))) if val.value_price else 50
 
             st.markdown(
                 f"""
-    **Step 1 — Growth rate (from the source selected above; not capped). The default "Model" option uses the lower of the Big 5 and analyst rates**
-    - Big 5 EPS growth (median of the 10/5/3-year windows): **{_big5_g_txt}**
-    - Analyst growth: **{_analyst_g_txt}**
-    - Used: **{_fmt_pct(val.growth_rate)}** *(source: {val.growth_source}; "Value conservative" fixes this at 15%)*
+**Step 1 — Growth rate (from the source selected above; not capped). The default "Model" option uses the lower of the Big 5 and analyst rates**
+- Big 5 EPS growth (median of the 10/5/3-year windows): **{_big5_g_txt}**
+- Analyst growth: **{_analyst_g_txt}**
+- Used: **{_fmt_pct(val.growth_rate)}** *(source: {val.growth_source}; "Value conservative" fixes this at 15%)*
 
-    **Step 2 — Estimate future P/E (the lower of two)**
-    - Historical TTM P/E: **{_hist_pe_txt}**
-    - 2 × growth rate: **{_default_pe:.1f}**
-    - Chosen future P/E: **{val.future_pe:.2f}**
+**Step 2 — Estimate future P/E (the lower of two)**
+- Historical TTM P/E: **{_hist_pe_txt}**
+- 2 × growth rate: **{_default_pe:.1f}**
+- Chosen future P/E: **{val.future_pe:.2f}**
 
-    **Step 3 — Project EPS 10 years forward**
-    - Current EPS × (1 + growth)^10
-    - = {val.current_eps:.2f} × (1 + {val.growth_rate:.4f})^10
-    - = **{val.future_eps:.2f}**
+**Step 3 — Project EPS 10 years forward**
+- Current EPS × (1 + growth)^10
+- = {val.current_eps:.2f} × (1 + {val.growth_rate:.4f})^10
+- = **{val.future_eps:.2f}**
 
-    **Step 4 — Future stock price**
-    - Future EPS × Future P/E
-    - = {val.future_eps:.2f} × {val.future_pe:.2f}
-    - = **{_fmt_money(val.future_price, fin.exchange, fin.ticker)}**
+**Step 4 — Future stock price**
+- Future EPS × Future P/E
+- = {val.future_eps:.2f} × {val.future_pe:.2f}
+- = **{_fmt_money(val.future_price, fin.exchange, fin.ticker)}**
 
-    **Step 5 — Discount back to today at {_fmt_pct(val.discount_rate)} (Buffett's required return)**
-    - Future price ÷ (1 + {val.discount_rate:.2f})^{val.horizon_years}
-    - = **{_fmt_money(val.value_price, fin.exchange, fin.ticker)}**  ← *Value Price*
+**Step 5 — Discount back to today at {_fmt_pct(val.discount_rate)} (Buffett's required return)**
+- Future price ÷ (1 + {val.discount_rate:.2f})^{val.horizon_years}
+- = **{_fmt_money(val.value_price, fin.exchange, fin.ticker)}**  ← *Value Price*
 
-    **Step 6 — Apply {_mos_pct_int}% Margin of Safety**
-    - value × {1 - _mos_pct_int/100:.2f}
-    - = **{_fmt_money(val.mos_price, fin.exchange, fin.ticker)}**  ← *MOS Buy Price*
-    """.strip()
+**Step 6 — Apply {_mos_pct_int}% Margin of Safety**
+- value × {1 - _mos_pct_int/100:.2f}
+- = **{_fmt_money(val.mos_price, fin.exchange, fin.ticker)}**  ← *MOS Buy Price*
+""".strip()
             )
-
-    st.markdown("---")
 
     # ============================================================
     # DCF METHOD VALUATION
@@ -1592,67 +1531,28 @@ def render_analyzer() -> None:
 
     methods: list[MethodResult] = []
 
-    def _add(m: MethodResult | None):
-        if m is not None:
-            methods.append(m)
-
-    _add(
-        dcf_two_stage(
-            fcf_ttm=_fcf_ttm_for_dcf,
-            shares_out=fin.shares_outstanding,
-            current_price=fin.current_price,
-            growth_rate=_growth_for_intrinsic,
-            discount_rate=dcf_discount,
-            terminal_growth=dcf_terminal,
-        )
-    )
-    _add(
-        peter_lynch_fair(
-            current_eps=eps_for_valuation,
-            growth_rate=_growth_for_intrinsic,
-            dividend_yield=fin.dividend_yield,
-            current_price=fin.current_price,
-            mos=mos_pct,
-        )
-    )
-    _add(
-        graham_number(
-            current_eps=eps_for_valuation,
-            book_value_per_share=fin.book_value_per_share,
-            current_price=fin.current_price,
-            mos=mos_pct,
-        )
-    )
-    _add(
-        graham_formula(
-            current_eps=eps_for_valuation,
-            growth_rate=_growth_for_intrinsic,
-            current_price=fin.current_price,
-            aaa_bond_yield=aaa_yield,
-            mos=mos_pct,
-        )
-    )
-    _add(
-        peg_fair_value(
-            current_eps=eps_for_valuation,
-            growth_rate=_growth_for_intrinsic,
-            current_price=fin.current_price,
-            mos=mos_pct,
-        )
+    # Call the router — it will return either the Median of 5 or the Value Price Model
+    # ALWAYS calculate the 5 methods for the table, regardless of the router setting
+    from moatcheck.valuation import calculate_median_valuation
+    val_res = calculate_median_valuation(
+        current_eps=eps_for_valuation,
+        fcf_ttm=_fcf_ttm_for_dcf,
+        shares_outstanding=fin.shares_outstanding,
+        book_value_per_share=fin.book_value_per_share,
+        dividend_yield=fin.dividend_yield,
+        current_price=fin.current_price,
+        growth_rate=_growth_for_intrinsic,
+        historical_pe=fin.pe_ratio_ttm,
+        discount_rate=dcf_discount,
+        terminal_growth=dcf_terminal,
+        aaa_bond_yield=aaa_yield,
+        mos=mos_pct,
     )
 
-    if not methods:
-        st.info(
-            "No intrinsic-value methods computable — need positive current EPS and at least "
-            "one growth estimate (Big 5 EPS or analyst)."
-        )
+    if not val_res["details"]:
+        st.info("No intrinsic-value methods computable.")
     else:
         def _verdict_with_pct(m: MethodResult) -> str:
-            """Append a small "(±NN%)" hint to the verdict cell.
-
-            Sign convention: positive % = current price is BELOW fair (upside),
-            negative = current price is ABOVE fair (overvalued).
-            """
             if m.upside_pct is None:
                 return m.verdict
             pct = m.upside_pct * 100
@@ -1664,17 +1564,18 @@ def render_analyzer() -> None:
                 return f"{m.verdict} ({-pct:.0f}% above fair)"
             return m.verdict
 
-        def _row(m: MethodResult) -> dict:
-            return {
-                "Method": m.name,
-                "Fair Value": _fmt_money(m.fair_value, fin.exchange, fin.ticker),
+        methods_rows = []
+        for name, m in val_res["details"].items():
+            methods_rows.append({
+                "Method": name,
+                "Fair Value": _fmt_money(getattr(m, "fair_value", getattr(m, "value_price", None)), fin.exchange, fin.ticker),
                 "MOS Buy": _fmt_money(m.mos_price, fin.exchange, fin.ticker),
                 "Upside vs Current": _fmt_pct(m.upside_pct),
                 "Verdict": _verdict_with_pct(m),
-            }
-
-        methods_df = pd.DataFrame([_row(m) for m in methods])
-
+            })
+            
+        methods_df = pd.DataFrame(methods_rows)
+        
         def _style_row(row):
             v = row["Verdict"]
             if v.startswith("BUY"):
@@ -1685,17 +1586,37 @@ def render_analyzer() -> None:
                 return ["background-color: #4b1e1e; color: #f0b6b6;"] * len(row)
             return [""] * len(row)
 
-        st.dataframe(
-            methods_df.style.apply(_style_row, axis=1),
-            width="stretch",
-            hide_index=True,
-        )
+        st.dataframe(methods_df.style.apply(_style_row, axis=1), width="stretch", hide_index=True)
+
+        # --- NEW: Calculate and show Median & Average ---
+        vals = [m.fair_value for m in val_res["details"].values() if m.fair_value is not None]
+        
+        if vals:
+            median_val = statistics.median(vals)
+            average_val = sum(vals) / len(vals)
+            
+            st.markdown(
+                f"""
+                <div style="background-color: rgba(255,255,255,0.05); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; display: flex; justify-content: space-around;">
+                    <div style="text-align: center;">
+                        <div style="color: #9aa0a6; font-size: 0.8rem; text-transform: uppercase;">Median Fair Value</div>
+                        <div style="font-size: 1.5rem; font-weight: 600; color: #e8eaed;">{_fmt_money(median_val, fin.exchange, fin.ticker)}</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #9aa0a6; font-size: 0.8rem; text-transform: uppercase;">Average Fair Value</div>
+                        <div style="font-size: 1.5rem; font-weight: 600; color: #e8eaed;">{_fmt_money(average_val, fin.exchange, fin.ticker)}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
         # Consensus verdict.
-        buys = sum(1 for m in methods if m.verdict == "BUY")
-        watches = sum(1 for m in methods if m.verdict == "WATCH")
-        avoids = sum(1 for m in methods if m.verdict == "AVOID")
+        buys = sum(1 for m in val_res["details"].values() if m.verdict == "BUY")
+        watches = sum(1 for m in val_res["details"].values() if m.verdict == "WATCH")
+        avoids = sum(1 for m in val_res["details"].values() if m.verdict == "AVOID")
         total = buys + watches + avoids
+
         if total:
             if buys >= total / 2:
                 st.success(f"Consensus: **BUY** ({buys}/{total} methods say below MOS)")
@@ -1705,8 +1626,8 @@ def render_analyzer() -> None:
                 st.warning(f"Consensus: **WATCH** ({buys} buy / {watches} watch / {avoids} avoid)")
 
         with st.expander("Per-method assumptions"):
-            for m in methods:
-                st.markdown(f"**{m.name}**")
+            for name, m in val_res["details"].items():
+                st.markdown(f"**{name}**")
                 st.write(m.assumptions)
 
     st.markdown("### Health checks")

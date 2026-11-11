@@ -9,8 +9,8 @@
     "eps_3y": 0.13572177900514792,
     "eps_1y": 0.20375335120643445,
     "wonderfulness": 6.8,
-    "intrinsic_value": 113.23780000000002,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 174.19296152944267,
+    "intrinsic_method": "Value Price Model"
   },
   "ABBV": {
     "rev_10y": 0.10342044063251343,
@@ -22,8 +22,8 @@
     "eps_3y": -0.2912939206655901,
     "eps_1y": -0.012552301255230214,
     "wonderfulness": 4.9,
-    "intrinsic_value": 23.862222222222222,
-    "intrinsic_method": "median of 4"
+    "intrinsic_value": 2.844430379322449,
+    "intrinsic_method": "Value Price Model"
   },
   "ACLS": {
     "rev_10y": 0.12132320013004838,
@@ -35,8 +35,8 @@
     "eps_3y": -0.1138029133405587,
     "eps_1y": -0.38211382113821146,
     "wonderfulness": 3.6,
-    "intrinsic_value": 80.11855241646336,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 253.26297959187255,
+    "intrinsic_method": "Value Price Model"
   },
   "ALGN": {
     "rev_10y": 0.16915831949131555,
@@ -48,8 +48,8 @@
     "eps_3y": 0.07016113370463617,
     "eps_1y": 0.005338078291815096,
     "wonderfulness": 5.0,
-    "intrinsic_value": 86.90290487089601,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 38.608984543656604,
+    "intrinsic_method": "Value Price Model"
   },
   "AMD": {
     "rev_10y": 0.24121884812875116,
@@ -61,8 +61,8 @@
     "eps_3y": 0.46663551029184314,
     "eps_1y": 1.65,
     "wonderfulness": 7.2,
-    "intrinsic_value": 68.67427540723024,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 340.1059259101981,
+    "intrinsic_method": "Value Price Model"
   },
   "AMZN": {
     "rev_10y": 0.20950174403196176,
@@ -71,11 +71,11 @@
     "rev_1y": 0.12377754683294695,
     "eps_10y": 0.606807735446484,
     "eps_5y": 0.2796010091361265,
-    "eps_3y": null,
+    "eps_3y": 0.2965641952983724,
     "eps_1y": 0.2965641952983724,
     "wonderfulness": 6.2,
-    "intrinsic_value": 97.15350000000001,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 129.0956092325423,
+    "intrinsic_method": "Value Price Model"
   },
   "AVGO": {
     "rev_10y": null,
@@ -87,13 +87,26 @@
     "eps_3y": 0.21644039911467994,
     "eps_1y": 2.8780487804878048,
     "wonderfulness": 8.3,
-    "intrinsic_value": 143.1,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 705.2780962144815,
+    "intrinsic_method": "Value Price Model"
+  },
+  "CDLR": {
+    "rev_10y": null,
+    "rev_5y": 0.7996995287332271,
+    "rev_3y": 0.7996995287332271,
+    "rev_1y": 1.4940057409804695,
+    "eps_10y": null,
+    "eps_5y": 0.5313276941129141,
+    "eps_3y": 0.5313276941129141,
+    "eps_1y": 3.1578947368421053,
+    "wonderfulness": 7.8,
+    "intrinsic_value": 31.073638132909473,
+    "intrinsic_method": "Value Price Model"
   },
   "CRWV": {
     "rev_10y": null,
-    "rev_5y": null,
-    "rev_3y": null,
+    "rev_5y": 1.679373368146214,
+    "rev_3y": 1.679373368146214,
     "rev_1y": 1.679373368146214,
     "eps_10y": null,
     "eps_5y": null,
@@ -101,7 +114,7 @@
     "eps_1y": null,
     "wonderfulness": 3.2,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "DECK": {
     "rev_10y": 0.11304383402200058,
@@ -113,12 +126,12 @@
     "eps_3y": 0.2953233566892641,
     "eps_1y": 0.1090047393364928,
     "wonderfulness": 8.1,
-    "intrinsic_value": 56.16,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 34.62232889543991,
+    "intrinsic_method": "Value Price Model"
   },
   "DJT": {
     "rev_10y": null,
-    "rev_5y": null,
+    "rev_5y": 0.3579897960397156,
     "rev_3y": 0.3579897960397156,
     "rev_1y": 0.017630153642091306,
     "eps_10y": null,
@@ -127,7 +140,7 @@
     "eps_1y": null,
     "wonderfulness": 3.8,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "ESINQ": {
     "rev_10y": null,
@@ -140,20 +153,20 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "EVVTY": {
     "rev_10y": null,
-    "rev_5y": null,
+    "rev_5y": 0.12362369300807097,
     "rev_3y": 0.12362369300807097,
     "rev_1y": 0.001674676515994289,
     "eps_10y": null,
-    "eps_5y": null,
+    "eps_5y": 0.10464650058368452,
     "eps_3y": 0.10464650058368452,
-    "eps_1y": -0.11505922165820637,
+    "eps_1y": -0.11505922165820626,
     "wonderfulness": 4.5,
-    "intrinsic_value": 61.34288301555163,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 49.435759017855084,
+    "intrinsic_method": "Value Price Model"
   },
   "FTNT": {
     "rev_10y": 0.2101736323581307,
@@ -165,8 +178,8 @@
     "eps_3y": 0.3167495145145989,
     "eps_1y": 0.07079646017699126,
     "wonderfulness": 6.7,
-    "intrinsic_value": 22.8932,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 27.945541707782443,
+    "intrinsic_method": "Value Price Model"
   },
   "FXAIX": {
     "rev_10y": null,
@@ -179,7 +192,7 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "GILD": {
     "rev_10y": -0.010252253813553658,
@@ -187,12 +200,12 @@
     "rev_3y": 0.025747792802937708,
     "rev_1y": 0.023961883564025843,
     "eps_10y": -0.05478241389143579,
-    "eps_5y": null,
+    "eps_5y": 0.230389935777624,
     "eps_3y": 0.230389935777624,
     "eps_1y": null,
     "wonderfulness": 4.9,
-    "intrinsic_value": 74.58254991941781,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 68.2810144272057,
+    "intrinsic_method": "Value Price Model"
   },
   "GOOGL": {
     "rev_10y": 0.1830771631182213,
@@ -204,8 +217,21 @@
     "eps_3y": 0.3333790189024399,
     "eps_1y": 0.3445273631840797,
     "wonderfulness": 6.8,
-    "intrinsic_value": 161.6095,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 183.69777460960128,
+    "intrinsic_method": "Value Price Model"
+  },
+  "IESC": {
+    "rev_10y": 0.1937174316394168,
+    "rev_5y": 0.2313796116538671,
+    "rev_3y": 0.1587761213212977,
+    "rev_1y": 0.1688798685877413,
+    "eps_10y": 0.34591589085180696,
+    "eps_5y": 0.50582200926231,
+    "eps_3y": 1.184921375723075,
+    "eps_1y": 0.5187057633973708,
+    "wonderfulness": 7.3,
+    "intrinsic_value": 223.44128391596578,
+    "intrinsic_method": "Value Price Model"
   },
   "INTC": {
     "rev_10y": -0.004614571414764956,
@@ -218,11 +244,11 @@
     "eps_1y": null,
     "wonderfulness": 4.4,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "IONQ": {
     "rev_10y": null,
-    "rev_5y": null,
+    "rev_5y": 1.268928825536873,
     "rev_3y": 1.268928825536873,
     "rev_1y": 2.01850347085181,
     "eps_10y": null,
@@ -231,7 +257,20 @@
     "eps_1y": null,
     "wonderfulness": 4.4,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
+  },
+  "KMT": {
+    "rev_10y": 0.011674539788986138,
+    "rev_5y": 0.050580232471955755,
+    "rev_3y": 0.04281350160106023,
+    "rev_1y": 0.1982123654888921,
+    "eps_10y": null,
+    "eps_5y": 0.4672421091215282,
+    "eps_3y": 0.4466266823347387,
+    "eps_1y": 2.6833333333333336,
+    "wonderfulness": 7.5,
+    "intrinsic_value": 68.80937504064516,
+    "intrinsic_method": "Value Price Model"
   },
   "KNSL": {
     "rev_10y": 0.36976261420744194,
@@ -243,8 +282,8 @@
     "eps_3y": 0.4654010132131128,
     "eps_1y": 0.21766029246344187,
     "wonderfulness": 8.0,
-    "intrinsic_value": 547.5284999999999,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 705.7896208313194,
+    "intrinsic_method": "Value Price Model"
   },
   "KR": {
     "rev_10y": 0.03002767506262205,
@@ -256,12 +295,12 @@
     "eps_3y": -0.2045740326595622,
     "eps_1y": -0.5803814713896458,
     "wonderfulness": 4.0,
-    "intrinsic_value": 18.42648501478239,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 1.8561113492188863,
+    "intrinsic_method": "Value Price Model"
   },
   "LCID": {
     "rev_10y": null,
-    "rev_5y": null,
+    "rev_5y": 0.3056882157210081,
     "rev_3y": 0.3056882157210081,
     "rev_1y": 0.6758311133998158,
     "eps_10y": null,
@@ -270,7 +309,7 @@
     "eps_1y": null,
     "wonderfulness": 2.8,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "META": {
     "rev_10y": 0.27338307879318413,
@@ -282,8 +321,8 @@
     "eps_3y": 0.398395285030712,
     "eps_1y": -0.015507124895222213,
     "wonderfulness": 6.6,
-    "intrinsic_value": 469.56505302000005,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 975.1995417593122,
+    "intrinsic_method": "Value Price Model"
   },
   "MSFT": {
     "rev_10y": 0.13792901043139016,
@@ -295,8 +334,8 @@
     "eps_3y": 0.22855998285745227,
     "eps_1y": 0.31598240469208205,
     "wonderfulness": 6.7,
-    "intrinsic_value": 375.15498205,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 880.1843213104,
+    "intrinsic_method": "Value Price Model"
   },
   "MU": {
     "rev_10y": 0.2679666874921178,
@@ -305,11 +344,11 @@
     "rev_1y": 2.563272513243084,
     "eps_10y": null,
     "eps_5y": 0.7062403288367196,
-    "eps_3y": null,
+    "eps_3y": 8.793148880105402,
     "eps_1y": 8.793148880105402,
     "wonderfulness": 8.0,
-    "intrinsic_value": 1320.8440256699998,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 1153.8865699002395,
+    "intrinsic_method": "Value Price Model"
   },
   "NFLX": {
     "rev_10y": 0.20886472226701724,
@@ -321,8 +360,8 @@
     "eps_3y": 0.36489469824866827,
     "eps_1y": 0.2777777777777777,
     "wonderfulness": 6.2,
-    "intrinsic_value": 20.30255956769983,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 12.078118843155119,
+    "intrinsic_method": "Value Price Model"
   },
   "NVDA": {
     "rev_10y": 0.45696505314008307,
@@ -334,8 +373,8 @@
     "eps_3y": 2.0660722620765335,
     "eps_1y": 0.6666666666666667,
     "wonderfulness": 5.5,
-    "intrinsic_value": 147.0,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 467.14977670350584,
+    "intrinsic_method": "Value Price Model"
   },
   "PARR": {
     "rev_10y": 0.13705331770566098,
@@ -343,12 +382,12 @@
     "rev_3y": 0.006462255423940189,
     "rev_1y": -0.06392999548433209,
     "eps_10y": null,
-    "eps_5y": null,
+    "eps_5y": 0.05601433675539913,
     "eps_3y": 0.05601433675539913,
     "eps_1y": null,
     "wonderfulness": 5.7,
-    "intrinsic_value": 80.50798904456624,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 15.79981918554434,
+    "intrinsic_method": "Value Price Model"
   },
   "PLTR": {
     "rev_10y": null,
@@ -356,12 +395,12 @@
     "rev_3y": 0.32917125287657845,
     "rev_1y": 0.5618339093221549,
     "eps_10y": null,
-    "eps_5y": null,
-    "eps_3y": null,
+    "eps_5y": 2.3157894736842106,
+    "eps_3y": 2.3157894736842106,
     "eps_1y": 2.3157894736842106,
     "wonderfulness": 7.8,
-    "intrinsic_value": 18.9,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 128.80921080169318,
+    "intrinsic_method": "Value Price Model"
   },
   "RCL": {
     "rev_10y": 0.08010797918697965,
@@ -369,12 +408,12 @@
     "rev_3y": 0.2659494720655575,
     "rev_1y": 0.0880247512739627,
     "eps_10y": 0.17852716110821754,
-    "eps_5y": null,
-    "eps_3y": null,
+    "eps_5y": 0.42687385740402206,
+    "eps_3y": 0.42687385740402206,
     "eps_1y": 0.42687385740402206,
     "wonderfulness": 5.6,
-    "intrinsic_value": 278.68089848992753,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 337.7370511155758,
+    "intrinsic_method": "Value Price Model"
   },
   "SMCI": {
     "rev_10y": 0.3318128732990553,
@@ -386,8 +425,8 @@
     "eps_3y": 0.4193981981419097,
     "eps_1y": 0.9404761904761905,
     "wonderfulness": 6.9,
-    "intrinsic_value": 29.95833435950478,
-    "intrinsic_method": "median of 4"
+    "intrinsic_value": 16.94806393098427,
+    "intrinsic_method": "Value Price Model"
   },
   "SPCX": {
     "rev_10y": null,
@@ -400,7 +439,7 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "SPXL": {
     "rev_10y": null,
@@ -413,7 +452,7 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "SPY": {
     "rev_10y": null,
@@ -426,7 +465,7 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "SVA": {},
   "SWK": {
@@ -439,8 +478,8 @@
     "eps_3y": null,
     "eps_1y": null,
     "wonderfulness": 3.0,
-    "intrinsic_value": 32.388888888888886,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 3.193957841188343,
+    "intrinsic_method": "Value Price Model"
   },
   "TQQQ": {
     "rev_10y": null,
@@ -453,7 +492,7 @@
     "eps_1y": null,
     "wonderfulness": 0.5,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "TSLA": {
     "rev_10y": 0.3708512895765279,
@@ -465,8 +504,8 @@
     "eps_3y": -0.3318021688674605,
     "eps_1y": -0.47058823529411764,
     "wonderfulness": 6.0,
-    "intrinsic_value": 14.860356372574504,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 1.9580624756989289,
+    "intrinsic_method": "Value Price Model"
   },
   "TSM": {
     "rev_10y": null,
@@ -478,8 +517,8 @@
     "eps_3y": 0.18370010279987747,
     "eps_1y": 0.2710280373831775,
     "wonderfulness": 6.3,
-    "intrinsic_value": 29.532339612870317,
-    "intrinsic_method": "median of 4"
+    "intrinsic_value": 72.38671982008448,
+    "intrinsic_method": "Value Price Model"
   },
   "ULTA": {
     "rev_10y": 0.12187076411830722,
@@ -491,8 +530,8 @@
     "eps_3y": 0.022135848660400415,
     "eps_1y": 0.011838989739542338,
     "wonderfulness": 6.4,
-    "intrinsic_value": 274.09159999999997,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 374.13745925061414,
+    "intrinsic_method": "Value Price Model"
   },
   "USO": {
     "rev_10y": null,
@@ -505,7 +544,7 @@
     "eps_1y": null,
     "wonderfulness": 5.3,
     "intrinsic_value": null,
-    "intrinsic_method": null
+    "intrinsic_method": "ETF / Fund"
   },
   "VMD": {
     "rev_10y": null,
@@ -517,8 +556,8 @@
     "eps_3y": 0.322393118173552,
     "eps_1y": 0.3214285714285714,
     "wonderfulness": 7.5,
-    "intrinsic_value": 5.610421107189727,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 4.050516847391481,
+    "intrinsic_method": "Value Price Model"
   },
   "ZBRA": {
     "rev_10y": 0.03986726694964604,
@@ -530,8 +569,8 @@
     "eps_3y": -0.024059043989460127,
     "eps_1y": -0.1964636542239686,
     "wonderfulness": 4.9,
-    "intrinsic_value": 116.974,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 11.535129401840434,
+    "intrinsic_method": "Value Price Model"
   },
   "ZM": {
     "rev_10y": null,
@@ -543,7 +582,7 @@
     "eps_3y": 1.6292780714141872,
     "eps_1y": 0.9252336448598131,
     "wonderfulness": 6.5,
-    "intrinsic_value": 73.32656680903585,
-    "intrinsic_method": "median of 5"
+    "intrinsic_value": 14.173304124538609,
+    "intrinsic_method": "Value Price Model"
   }
 }
