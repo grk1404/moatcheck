@@ -167,3 +167,227 @@ def get_model_growth(fin, big5_eps_values: dict) -> float | None:
     # 3. The Model chooses the lower of the positive Big 5 and Analyst
     cands = [g for g in (_bg, _ag) if g is not None and g > 0]
     return min(cands) if cands else None
+
+# ============================================================
+# CENTRALIZED VALUATION METHODS
+# ============================================================
+
+from .intrinsic import dcf_two_stage, peter_lynch_fair, graham_number, graham_formula, peg_fair_value
+
+def calculate_median_valuation(
+    current_eps: float | None,
+    fcf_ttm: float | None,
+    shares_outstanding: float | None,
+    book_value_per_share: float | None,
+    dividend_yield: float | None,
+    current_price: float | None,
+    growth_rate: float | None,
+    historical_pe: float | None = None,  # <-- ADD THIS LINE
+    discount_rate: float = 0.10,
+    terminal_growth: float = 0.025,
+    aaa_bond_yield: float = 0.045,
+    mos: float = 0.25,
+    **kwargs,                            # <-- ADD THIS LINE to catch anything else
+) -> dict:
+    """Calculates the 5 standard valuation methods and returns the median."""
+    vals = []
+    details = {}
+
+    if current_eps and growth_rate:
+        # 1. DCF
+        if fcf_ttm is not None and fcf_ttm > 0 and shares_outstanding:
+            dcf = dcf_two_stage(
+                fcf_ttm=fcf_ttm, shares_out=shares_outstanding, current_price=current_price,
+                growth_rate=growth_rate, discount_rate=discount_rate, terminal_growth=terminal_growth,
+            )
+            if dcf and dcf.fair_value:
+                vals.append(("DCF", dcf.fair_value))
+                details["DCF"] = dcf
+
+        # 2. Peter Lynch
+        lynch = peter_lynch_fair(
+            current_eps=current_eps, growth_rate=growth_rate,
+            dividend_yield=dividend_yield, current_price=current_price, mos=mos,
+        )
+        if lynch and lynch.fair_value:
+            vals.append(("Lynch", lynch.fair_value))
+            details["Lynch"] = lynch
+
+        # 3. Buffett DCF (Replaces Graham Number)
+        b_dcf = buffett_dcf(
+            fcf_ttm=fcf_ttm,
+            shares_outstanding=shares_outstanding,
+            current_price=current_price,
+            growth_rate=growth_rate,
+            discount_rate=discount_rate,
+            terminal_growth=terminal_growth,
+            mos=mos,
+        )
+        if b_dcf and b_dcf.fair_value:
+            vals.append(("Buffett DCF", b_dcf.fair_value))
+            details["Buffett DCF"] = b_dcf
+
+        # 4. Graham Formula
+        gf = graham_formula(
+            current_eps=current_eps, growth_rate=growth_rate,
+            current_price=current_price, aaa_bond_yield=aaa_bond_yield, mos=mos,
+        )
+        if gf and gf.fair_value:
+            vals.append(("Graham F", gf.fair_value))
+            details["Graham F"] = gf
+
+        # 5. PEG
+        peg = peg_fair_value(
+            current_eps=current_eps, growth_rate=growth_rate,
+            current_price=current_price, mos=mos,
+        )
+        if peg and peg.fair_value:
+            vals.append(("PEG", peg.fair_value))
+            details["PEG"] = peg
+
+    if len(vals) >= 2:
+        intrinsic = statistics.median(v for _, v in vals)
+        method = f"median of {len(vals)}"
+    elif len(vals) == 1:
+        intrinsic = vals[0][1]
+        method = vals[0][0]
+    else:
+        intrinsic = None
+        # If EPS is missing completely, it's likely an ETF. If EPS is just negative, it's a stock we can't value.
+        if current_eps is None:
+            method = "ETF / Fund"
+        elif current_eps <= 0:
+            method = "Negative EPS"
+        else:
+            method = "No models applicable"
+
+    return {"intrinsic_value": intrinsic, "method": method, "details": details}
+
+
+def calculate_model_valuation(
+    current_eps: float | None,
+    fcf_ttm: float | None,
+    shares_outstanding: float | None,
+    book_value_per_share: float | None,
+    dividend_yield: float | None,
+    current_price: float | None,
+    growth_rate: float | None,
+    historical_pe: float | None = None,
+    **kwargs
+) -> dict:
+    """The 'Value Price' model strategy (what the Stock Analyzer top card uses)."""
+    if not current_eps or current_eps <= 0 or not growth_rate:
+        return {"intrinsic_value": None, "method": "ETF / Fund" if current_eps is None else "No growth", "details": {}}
+
+    val = value_price(
+        current_eps=current_eps,
+        big5_eps_growth=None,
+        analyst_growth=None,
+        historical_pe=historical_pe,
+        custom_growth=growth_rate,
+    )
+    
+    if val and val.value_price:
+        return {"intrinsic_value": val.value_price, "method": "Value Price Model", "details": {"Value Price": val}}
+    return {"intrinsic_value": None, "method": "Model Failed", "details": {}}
+
+
+# ============================================================
+# 🎯 THE ROUTER — Change this one line to switch strategies!
+# ============================================================
+VALUATION_METHOD = "model"  # Options: "median" or "model"
+
+def calculate_intrinsic_value(
+    current_eps: float | None,
+    fcf_ttm: float | None,
+    shares_outstanding: float | None,
+    book_value_per_share: float | None,
+    dividend_yield: float | None,
+    current_price: float | None,
+    growth_rate: float | None,
+    **kwargs
+) -> dict:
+    """The central entry point for all valuation."""
+    if VALUATION_METHOD == "median":
+        return calculate_median_valuation(
+            current_eps=current_eps, fcf_ttm=fcf_ttm, shares_outstanding=shares_outstanding,
+            book_value_per_share=book_value_per_share, dividend_yield=dividend_yield,
+            current_price=current_price, growth_rate=growth_rate, **kwargs
+        )
+    elif VALUATION_METHOD == "model":
+        return calculate_model_valuation(
+            current_eps=current_eps, fcf_ttm=fcf_ttm, shares_outstanding=shares_outstanding,
+            book_value_per_share=book_value_per_share, dividend_yield=dividend_yield,
+            current_price=current_price, growth_rate=growth_rate, **kwargs
+        )
+    else:
+        raise ValueError(f"Unknown VALUATION_METHOD: {VALUATION_METHOD}")
+def buffett_dcf(
+    fcf_ttm: float | None,
+    shares_outstanding: float | None,
+    current_price: float | None,
+    growth_rate: float | None,
+    discount_rate: float = 0.10,
+    terminal_growth: float = 0.025,
+    mos: float = 0.25,
+):
+    """Warren Buffett style Owner Earnings DCF."""
+    if not fcf_ttm or fcf_ttm <= 0 or not shares_outstanding or shares_outstanding <= 0:
+        return None
+
+    # Buffett never assumes high growth forever. Cap it at 20% for the DCF.
+    g = min(max(growth_rate or 0.0, 0.0), 0.20)
+    tg = terminal_growth
+    r = discount_rate
+
+    # Project 10 years of Free Cash Flow and discount to present value
+    pv = 0.0
+    for year in range(1, 11):
+        fcf_year = fcf_ttm * (1 + g) ** year
+        pv += fcf_year / (1 + r) ** year
+
+    # Terminal Value (Gordon Growth Model)
+    fcf_year_11 = fcf_ttm * (1 + g) ** 10 * (1 + tg)
+    tv = fcf_year_11 / (r - tg)
+    pv_tv = tv / (1 + r) ** 10
+
+    total_equity_value = pv + pv_tv
+    fair_value = total_equity_value / shares_outstanding
+    mos_price = fair_value * (1 - mos)
+
+    upside_pct = (fair_value - current_price) / current_price if current_price else None
+    if upside_pct is None:
+        verdict = "N/A"
+    elif upside_pct >= 0.15:
+        verdict = "BUY"
+    elif upside_pct >= -0.05:
+        verdict = "WATCH"
+    else:
+        verdict = "AVOID"
+
+    from .intrinsic import MethodResult
+    return MethodResult(
+        name="Buffett DCF",
+        fair_value=fair_value,
+        mos_price=mos_price,
+        upside_pct=upside_pct,
+        verdict=verdict,
+        assumptions=(
+            f"FCF: ${fcf_ttm/1e9:.2f}B | Growth: {g*100:.1f}% | Discount: {r*100:.0f}% | "
+            f"Terminal: {tg*100:.1f}% | Margin of Safety: {mos*100:.0f}%"
+        )
+    )
+
+def get_ui_growth_rate(mode: str, fin, big5_eps_g: float | None, custom_pct: float = 0.0) -> float | None:
+    """Translates the UI radio button selection into a growth rate."""
+    if mode == "Model (lower of Big 5 & analyst)":
+        return get_model_growth(fin, {"5": big5_eps_g}) # (Passing a dict to match the signature)
+    if mode == "Value conservative":
+        return 0.15
+    if mode == "Big 5 EPS growth":
+        return big5_eps_g
+    if mode == "Analyst 5Y growth":
+        return getattr(fin, "analyst_5yr_growth", None)
+    if mode == "Custom":
+        return custom_pct / 100.0 if custom_pct > 0 else None
+    return None

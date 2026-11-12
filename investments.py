@@ -547,6 +547,96 @@ def _render_top_movers(df: pd.DataFrame) -> None:
         else:
             st.caption("No losers today.")
 
+def _render_bargain_buys(df: pd.DataFrame, signals: dict) -> None:
+    """Scan positions for stocks trading significantly below their Intrinsic Value."""
+    if not signals:
+        return
+
+    # 1. Aggregate holdings by symbol so a stock held in 2 accounts only shows up once
+    agg = df.groupby("Symbol").agg({
+        "Last price": "first",
+        "Description": "first"
+    }).reset_index()
+
+    bargains = []
+    for _, r in agg.iterrows():
+        sym = str(r["Symbol"])
+        if len(sym) > 5 or not sym.isalpha():
+            continue
+            
+        sig = signals.get(sym, {}) or {}
+        intrinsic = sig.get("intrinsic_value")
+        price = r["Last price"]
+        
+        if intrinsic and price and intrinsic > 0 and price == price:
+            # Calculate the discount (how much below fair value)
+            discount = (intrinsic - price) / intrinsic
+            
+            # Flag if trading at least 15% below Intrinsic Value
+            if discount >= 0.15:
+                # Determine the tier based on the Stock Analyzer logic
+                if discount >= 0.50:
+                    tier = "BARGAIN BUY"
+                    color = "#00E676" # Bright green
+                    bg = "rgba(0, 230, 118, 0.15)"
+                elif discount >= 0.30:
+                    tier = "DEEP DISCOUNT"
+                    color = "#4CAF50" # Green
+                    bg = "rgba(76, 175, 80, 0.15)"
+                else:
+                    tier = "BUY ZONE"
+                    color = "#8BC34A" # Light green
+                    bg = "rgba(139, 195, 74, 0.15)"
+
+                bargains.append({
+                    "Symbol": sym,
+                    "Name": str(r.get("Description", ""))[:25],
+                    "Price": price,
+                    "Intrinsic": intrinsic,
+                    "Discount": discount,
+                    "Tier": tier,
+                    "Color": color,
+                    "Bg": bg,
+                })
+                
+    if not bargains:
+        return
+
+    # Sort by the biggest discount first
+    bargains.sort(key=lambda x: x["Discount"], reverse=True)
+
+    st.markdown("#### 🟢 Buying Opportunities (Trading >15% below Intrinsic Value)")
+    st.caption("These holdings are trading at a significant discount. **BARGAIN BUY** means it has hit the 50% Margin of Safety threshold.")
+    
+    # Display in columns (up to 4 per row)
+    cols = st.columns(4)
+    for i, b in enumerate(bargains):
+        with cols[i % 4]:
+            # Draw a card with dynamic colors based on the discount tier
+            st.markdown(
+                f"""
+                <div style="background-color: {b['Bg']}; border: 1px solid {b['Color']}; 
+                            border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <div style="font-size: 1.2rem; font-weight: 700; color: #e8eaed;">{b['Symbol']}</div>
+                        <div style="font-size: 1rem; font-weight: 600; color: {b['Color']};">-{b['Discount']*100:.0f}%</div>
+                    </div>
+                    <div style="font-size: 0.75rem; color: {b['Color']}; font-weight: 600; text-transform: uppercase; margin-bottom: 0.2rem;">
+                        {b['Tier']}
+                    </div>
+                    <div style="font-size: 0.75rem; color: #9aa0a6; margin-bottom: 0.5rem;">
+                        {b['Name']}
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+                        <div style="color: #9aa0a6;">Price: <strong>${b['Price']:.2f}</strong></div>
+                        <div style="color: #9aa0a6;">Value: <strong>${b['Intrinsic']:.2f}</strong></div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    st.divider()
+
 def _money(v) -> str:
     """Compact dollar formatter: $1.23T, $2.52M, $12.1K, $45.00."""
     if v is None or v != v:
@@ -1410,7 +1500,13 @@ def render_my_investments() -> None:
 
     _hero_strip(df)                 # Hero Strip
     _render_52w_alert(df)           # 52-week high stock alerts    
-    _render_top_movers(df)          # <-- new Top Movers
+    _render_top_movers(df)          # Top Movers
+    
+    # Fetch cached signals early so we can use them for the Bargain Buys list
+    with st.spinner("Loading valuations..."):
+        signals = _load_or_build_signals(df)
+        
+    _render_bargain_buys(df, signals)  # <-- NEW: Bargain Buys list
     st.divider()
 
     c1, c2 = st.columns([1, 4])
@@ -1423,9 +1519,6 @@ def render_my_investments() -> None:
             "Refresh recomputes growth + valuations for every position. "
             "First run takes 1–3 minutes; results are cached."
         )
-
-    with st.spinner("Loading signals…"):
-        signals = _load_or_build_signals(df)
 
     _positions_table(df, signals)
     st.divider()

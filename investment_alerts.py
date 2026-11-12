@@ -109,6 +109,7 @@ CONFIG = {
     "heartbeat_seconds": 1800,
 
     "swing_thresholds": [0.15, 0.20],       # TQQQ swing levels (15% and 20%)
+    "bargain_cooldown_hours": 168,  # 7 days per tier per ticker
 }
 
 # Path to the My Investments cache that holds intrinsic values
@@ -388,86 +389,58 @@ def check_52w_lows(df: pd.DataFrame, threshold: float) -> list[dict]:
 
 
 # ============================================================
-# MOS PRICE CHECK — reads from the My Investments cache
+# BUYING OPPORTUNITIES (BARGAIN BUYS) CHECK
 # ============================================================
 
-def check_mos_hits(df: pd.DataFrame) -> list[dict]:
-    """Positions trading at or below their MOS buy price."""
-    from data_provider import get_ticker
-    from moatcheck import fetch, compute_big5, value_price
+def check_bargain_hits(df: pd.DataFrame) -> list[dict]:
+    """Scan positions for stocks trading at least 15% below their Intrinsic Value.
+    Uses the cached signals from My Investments — no re-fetch needed."""
+    print(f"[alerts] Starting Bargain Buy check for {len(df)} positions.")
 
-    print(f"[alerts] Starting MOS price check for {len(df)} positions.")
+    if not SIGNALS_CACHE.exists():
+        print(f"[alerts] No signals cache at {SIGNALS_CACHE}; skipping Bargain check.")
+        return []
+
+    try:
+        signals = json.loads(SIGNALS_CACHE.read_text())
+    except Exception as e:
+        print(f"[alerts] Could not read signals cache: {e}")
+        return []
 
     hits = []
     for _, row in df.iterrows():
         sym = str(row["Symbol"]).strip().upper()
-        if not sym:
-            continue
-        try:
-            fin = fetch(sym)
-        except Exception:
+        if not sym or sym not in signals:
             continue
 
-        try:
-            if fin is None or fin.current_price is None or fin.current_price <= 0:
-                continue
-
-            big5 = compute_big5(fin)
-            eps_windows = big5.eps.values
-            stable = [v for w, v in eps_windows.items() if w in (5, 3, 10) and v is not None]
-            if stable:
-                stable.sort()
-                n = len(stable)
-                if n % 2:
-                    growth = stable[n // 2]
-                else:
-                    growth = (stable[n // 2 - 1] + stable[n // 2]) / 2
-            else:
-                growth = eps_windows.get(1)
-
-            if growth is None:
-                continue
-
-            if growth > 0.30:
-                growth = 0.30
-            if growth < 0.02:
-                growth = 0.02
-
-            eps_ttm = float(fin.eps.iloc[-1]) if not fin.eps.empty else None
-            current_eps = eps_ttm
-            if current_eps is None or current_eps <= 0:
-                if not fin.eps.empty:
-                    positive = fin.eps[fin.eps > 0]
-                    if not positive.empty:
-                        current_eps = float(positive.tail(3).mean())
-
-            if current_eps is None or current_eps <= 0:
-                continue
-
-            val = value_price(
-                current_eps=current_eps,
-                big5_eps_growth=None,
-                analyst_growth=None,
-                historical_pe=fin.pe_ratio_ttm,
-                custom_growth=0.15,
-            )
-            if val is None or val.value_price is None or val.value_price <= 0:
-                continue
-
-            mos_price = val.mos_price
-            rng = _price_range(sym)
-            price = rng[0] if rng else float(fin.current_price)
-
-            if price <= mos_price:
-                hits.append({
-                    "symbol": sym,
-                    "price": price,
-                    "mos_price": mos_price,
-                    "intrinsic": float(val.value_price),
-                    "discount": (price - mos_price) / mos_price,
-                })
-        except Exception:
+        sig = signals[sym] or {}
+        intrinsic = sig.get("intrinsic_value")
+        if not intrinsic or intrinsic <= 0:
             continue
+
+        rng = _price_range(sym)
+        if rng is None:
+            continue
+        price = rng[0]
+
+        discount = (intrinsic - price) / intrinsic
+        if discount < 0.15:
+            continue
+
+        if discount >= 0.50:
+            tier = "BARGAIN BUY"
+        elif discount >= 0.30:
+            tier = "DEEP DISCOUNT"
+        else:
+            tier = "BUY ZONE"
+
+        hits.append({
+            "symbol": sym,
+            "price": price,
+            "intrinsic": intrinsic,
+            "discount": discount,
+            "tier": tier,
+        })
 
     return hits
 
@@ -685,11 +658,12 @@ def _entries_52w_lows(df: pd.DataFrame) -> list:
             for h in check_52w_lows(df, CONFIG["low_threshold"])]
 
 
-def _entries_mos(df: pd.DataFrame) -> list:
-    return [("MOS", h["symbol"],
-             f"{h['symbol']}: {h['price']:.2f} USD <= MOS {h['mos_price']:.2f} "
-             f"(intrinsic {h['intrinsic']:.2f}, {h['discount']*100:+.1f}%)")
-            for h in check_mos_hits(df)]
+def _entries_bargain(df: pd.DataFrame) -> list:
+    return [(f"BARGAIN:{h['tier']}",  # <-- tier in the key
+             h["symbol"],
+             f"{h['symbol']} [{h['tier']}]: {h['price']:.2f} USD is {h['discount']*100:.0f}% below Intrinsic Value "
+             f"({h['intrinsic']:.2f} USD)")
+            for h in check_bargain_hits(df)]
 
 
 def _entries_bnf(df: pd.DataFrame) -> list:
@@ -718,12 +692,6 @@ def _run_52w_checks(df: pd.DataFrame, state: dict) -> int:
     sent = _send_group("🚨 52-Week High Alert", _entries_52w_highs(df), state, CONFIG["cooldown_hours"])
     sent += _send_group("⚠️ 52-Week Low Alert", _entries_52w_lows(df), state, CONFIG["cooldown_hours"])
     return sent
-
-
-def _run_mos_check(df: pd.DataFrame, state: dict) -> int:
-    """MOS buy price check. Returns number of hits delivered."""
-    return _send_group("🎯 MOS Buy Price Hit", _entries_mos(df), state, CONFIG["cooldown_hours"])
-
 
 def _run_bnf_check(df: pd.DataFrame, state: dict) -> int:
     """BNF reversal scan. Returns number of hits delivered."""
@@ -922,7 +890,7 @@ def build_startup_report(df: pd.DataFrame, now_ct: datetime) -> tuple[str, list,
     sections = [
         ("🚨 52-WEEK HIGHS (within 2%)", lambda: _entries_52w_highs(df)),
         ("⚠️ 52-WEEK LOWS (within 2%)", lambda: _entries_52w_lows(df)),
-        ("🎯 MOS BUY PRICE", lambda: _entries_mos(df)),
+        ("🎯 BUYING OPPORTUNITIES (Bargain Buys)", lambda: _entries_bargain(df)),
         ("🔄 BNF REVERSAL SETUPS", lambda: _entries_bnf(df)),
         ("📈 TQQQ SWING LEVELS (reference only)", lambda: _entries_swing()),
     ]
@@ -991,7 +959,7 @@ def run_intraday_cycle() -> int:
     state = load_state()
     sent = 0
     for label, fn in (("52-week", lambda: _run_52w_checks(df, state)),
-                      ("MOS", lambda: _run_mos_check(df, state)),
+                      ("Bargain", lambda: _send_group("🎯 Buying Opportunities", _entries_bargain(df), state, CONFIG["bargain_cooldown_hours"])),
                       ("BNF", lambda: _run_bnf_check(df, state)),
                       ("TQQQ swing", lambda: _run_swing_check(state))):
         try:

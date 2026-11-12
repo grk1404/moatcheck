@@ -14,7 +14,7 @@ import warnings
 from data_provider import get_ticker
 from investments import _metric_html, render_my_investments, get_holding_tickers
 from data_quality import check_data_quality
-from moatcheck.valuation import get_model_growth, calculate_intrinsic_value, calculate_model_valuation
+from moatcheck.valuation import get_model_growth, calculate_intrinsic_value, calculate_model_valuation, get_ui_growth_rate
 
 
 from trade_manager import (
@@ -861,18 +861,12 @@ def render_analyzer() -> None:
     
     # Calculate immediately if it's missing or if RE-VALUATE was clicked (this prevents the "Cannot compute" warning)
     if val is None:
-        if selected_growth_mode == _MODEL_MODE:
-            calc_growth = get_model_growth(fin, big5.eps.values)
-        elif selected_growth_mode == "Value conservative":
-            calc_growth = _moat_conservative_growth()
-        elif selected_growth_mode == "Big 5 EPS growth":
-            calc_growth = big5_eps_g
-        elif selected_growth_mode == "Analyst 5Y growth":
-            calc_growth = fin.analyst_5yr_growth
-        elif selected_growth_mode == "Custom":
-            calc_growth = float(st.session_state.get("custom_growth_rate", 0) or 0) / 100.0
-        else:
-            calc_growth = None
+        calc_growth = get_ui_growth_rate(
+        mode=selected_growth_mode,
+        fin=fin,
+        big5_eps_g=big5_eps_g,
+        custom_pct=float(st.session_state.get("custom_growth_rate", 0) or 0)
+        )
 
         val_res = calculate_model_valuation(
             current_eps=eps_for_valuation,
@@ -1287,18 +1281,12 @@ def render_analyzer() -> None:
     # 1. If val is still None on the first load, calculate it now (this puts the top metric on the screen)
     val = st.session_state.get("valuation_growth_result")
     if val is None:
-        if selected_growth_mode == _MODEL_MODE:
-            calc_growth = get_model_growth(fin, big5.eps.values)
-        elif selected_growth_mode == "Value conservative":
-            calc_growth = _moat_conservative_growth()
-        elif selected_growth_mode == "Big 5 EPS growth":
-            calc_growth = big5_eps_g
-        elif selected_growth_mode == "Analyst 5Y growth":
-            calc_growth = fin.analyst_5yr_growth
-        elif selected_growth_mode == "Custom":
-            calc_growth = float(st.session_state.get("custom_growth_rate", 0) or 0) / 100.0
-        else:
-            calc_growth = None
+        calc_growth = get_ui_growth_rate(
+            mode=selected_growth_mode,
+            fin=fin,
+            big5_eps_g=big5_eps_g,
+            custom_pct=float(st.session_state.get("custom_growth_rate", 0) or 0)
+        )
 
         val_res = calculate_model_valuation(
             current_eps=eps_for_valuation,
@@ -3585,7 +3573,7 @@ def render_backtest() -> None:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         _btn_slot = st.empty()
         if not st.session_state.get("backtest_running"):
-            run_clicked = _btn_slot.button("▶ Run All", type="primary", use_container_width=True, key="backtest_btn")
+            run_clicked = _btn_slot.button("▶ Run All", type="primary", width="stretch", key="backtest_btn")
             if run_clicked:
                 st.session_state["backtest_running"] = True
                 st.rerun()
@@ -3727,7 +3715,7 @@ def render_backtest() -> None:
 
     st.dataframe(
         comparison_df.style.apply(_style_comparison, axis=None),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     
@@ -3766,7 +3754,7 @@ def render_backtest() -> None:
         yaxis_title="Portfolio Value ($)",
         margin=dict(l=20, r=20, t=40, b=20),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # ---------- 15% Swing Analysis ----------
     st.markdown("#### 15% Swing Analysis")
@@ -3824,7 +3812,7 @@ def render_backtest() -> None:
         display["move_pct"] = display["move_pct"].map(lambda v: f"{v*100:+.2f}%")
         display["days_since_prior"] = display["days_since_prior"].map(lambda v: "—" if pd.isna(v) else f"{int(v)}")
         display = display.rename(columns={"date": "Date", "direction": "Direction", "from_date": "From Date", "from_price": "From $", "to_price": "To $", "move_pct": "Move", "days_since_prior": "Days since prior"})
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width="stretch", hide_index=True)
 
         # Chart with markers
         # Chart with markers
@@ -3876,7 +3864,7 @@ def render_backtest() -> None:
             yaxis_title=f"{bt_ticker} Price ($)", 
             margin=dict(l=20, r=20, t=40, b=20)
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     # ---------- Trade logs — one expander per strategy ----------
     for name, r in results.items():
@@ -3899,7 +3887,7 @@ def render_backtest() -> None:
             display["pnl"] = display["pnl"].map(lambda v: f"${v:+,.2f}")
             display["return_pct"] = display["return_pct"].map(lambda v: f"{v*100:+.2f}%")
             display = display.rename(columns={"entry_date": "Entry", "exit_date": "Exit", "entry_price": "Entry $", "exit_price": "Exit $", "shares": "Shares", "pnl": "P&L", "return_pct": "Return", "days_held": "Days"})
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, width="stretch", hide_index=True)
 
     st.caption(
         "Backtest is hypothetical. Past performance does not guarantee future "
@@ -4038,7 +4026,7 @@ with st.sidebar:
     with st.form("clear_cache_form"):
         st.caption("Clear cached data for a specific stock (e.g., AAPL).")
         ticker_to_clear = st.text_input("Ticker to clear", placeholder="AAPL", label_visibility="collapsed").strip().upper()
-        clear_single = st.form_submit_button("Clear this ticker's cache", use_container_width=True)
+        clear_single = st.form_submit_button("Clear this ticker's cache", width="stretch")
         
         if clear_single and ticker_to_clear:
             if clear_yfinance_cache(ticker_to_clear):
@@ -4048,7 +4036,7 @@ with st.sidebar:
                 st.info(f"No cache found for {ticker_to_clear}.")
 
     # Button to nuke everything
-    if st.button("🚨 Clear ENTIRE cache", type="primary", use_container_width=True):
+    if st.button("🚨 Clear ENTIRE cache", type="primary", width="stretch"):
         if clear_yfinance_cache(ticker=None):
             st.cache_data.clear()
             st.success("Entire cache cleared!")
