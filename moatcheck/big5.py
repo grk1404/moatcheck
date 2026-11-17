@@ -13,6 +13,9 @@ WINDOWS = (10, 5, 3, 1)
 PASS_THRESHOLD = 0.10  # 10% is the bar for "wonderful" growth rate in any metric.
 CONSISTENCY_VOLATILITY_CEILING = 0.6  # avg coefficient-of-variation at/above this -> consistency = 0 RG
 
+def _windows_for(horizon: str) -> tuple[int, ...]:
+    """The set of year windows to evaluate for a given horizon."""
+    return (10, 5, 3, 1) if horizon == "10y" else (5, 3, 1)
 
 # ============================================================
 # Threshold resolution
@@ -242,7 +245,7 @@ def _valid(values) -> list[float]:
     return [v for v in values if v is not None and not math.isnan(v)]
 
 
-def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
+def score_wonderfulness(big5: "Big5Result", time_horizon: str = "10y") -> WonderfulnessScore:
     """Compute a 0-10 wonderfulness score from a Big5Result.
 
     Thresholds are read from big5.thresholds (set by compute_big5). Each metric is matched
@@ -250,6 +253,8 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     conversion was missing the fair-value discounts were judged against its 80% floor.)
     """
     named = _named_metrics(big5)
+    windows = _windows_for(time_horizon)
+
     thresholds = getattr(big5, "thresholds", None) or DEFAULT_THRESHOLDS
 
     def thr_for(key: str) -> dict[str, float]:
@@ -263,7 +268,7 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     checks_total = checks_passed = 0
     for key, m in named:
         thr = thr_for(key)
-        vals = _valid(m.values.values())
+        vals = _valid([m.values.get(w) for w in windows])
         if key in _SINGLE_VALUE_KEYS:
             vals = vals[:1]
         checks_total += len(vals)
@@ -273,7 +278,7 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     # ---------- Magnitude ----------
     metric_scores = []
     for key, m in named:
-        vals = _valid(m.values.values())
+        vals = _valid([m.values.get(w) for w in windows])
         if vals:
             metric_scores.append(_growth_score(vals, threshold=thr_for(key)))
     magnitude = (sum(metric_scores) / len(metric_scores)) if metric_scores else 0.0
@@ -284,7 +289,7 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
         if key in _SINGLE_VALUE_KEYS:
             continue
         thr = thr_for(key)
-        vals = _valid(m.values.values())
+        vals = _valid([m.values.get(w) for w in windows])
         if len(vals) < 2:
             continue
         failing = [v for v in vals if not in_range(v, thr)]
@@ -312,7 +317,7 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     trend_scores = [
         _trend_penalty(m.values)
         for key, m in named
-        if key not in _SINGLE_VALUE_KEYS and len(_valid(m.values.values())) >= 2
+        if key not in _SINGLE_VALUE_KEYS and len(_valid([m.values.get(w) for w in windows])) >= 2
     ]
     trend = (sum(trend_scores) / len(trend_scores)) if trend_scores else 5.0
 
@@ -323,7 +328,7 @@ def score_wonderfulness(big5: "Big5Result") -> WonderfulnessScore:
     # ---------- Strengths / weaknesses ----------
     by_name = []
     for key, m in named:
-        vals = _valid(m.values.values())
+        vals = _valid([m.values.get(w) for w in windows])
         if vals:
             by_name.append((m.label, sum(vals) / len(vals), thr_for(key)))
     by_name.sort(key=lambda t: t[1], reverse=True)
@@ -363,6 +368,7 @@ class Big5Result:
     fcf: MetricResult
     roic_by_year: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     thresholds: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
+    time_horizon: str = "10y"
 
     # New quality metrics
     cash_conversion: MetricResult | None = None
@@ -382,8 +388,8 @@ class Big5Result:
         rows = [m.as_row() for m in metrics]
         return pd.DataFrame(rows)
 
-    def wonderfulness(self) -> WonderfulnessScore:
-        return score_wonderfulness(self)
+    def wonderfulness(self, time_horizon: str = "10y") -> WonderfulnessScore:
+        return score_wonderfulness(self, time_horizon=time_horizon)
 
 
 # ============================================================
@@ -502,8 +508,8 @@ def _discount_to_fair_value(
         
     return float(discount)
 
-def _metric_from_cagr(label: str, series: pd.Series, threshold: dict[str, float]) -> MetricResult:
-    raw = {w: cagr(series, w) for w in WINDOWS}
+def _metric_from_cagr(label: str, series: pd.Series, threshold: dict[str, float], windows: tuple = WINDOWS) -> MetricResult:
+    raw = {w: cagr(series, w) for w in windows}
     # Normalize NaN to None so downstream filters ("is not None") catch it
     values = {w: (None if v is None or math.isnan(v) else v) for w, v in raw.items()}
     computed = [v for v in values.values() if v is not None]
@@ -513,8 +519,8 @@ def _metric_from_cagr(label: str, series: pd.Series, threshold: dict[str, float]
     return MetricResult(label=label, values=values, passes=passes)
 
 
-def _metric_from_average(label: str, series: pd.Series, threshold: dict[str, float]) -> MetricResult:
-    raw = {w: window_average(series, w) for w in WINDOWS}
+def _metric_from_average(label: str, series: pd.Series, threshold: dict[str, float], windows: tuple = WINDOWS) -> MetricResult:
+    raw = {w: window_average(series, w) for w in windows}
     values = {w: (None if v is None or math.isnan(v) else v) for w, v in raw.items()}
     computed = [v for v in values.values() if v is not None]
     rmin = threshold["min"]
@@ -545,6 +551,7 @@ def _bvps(fin: Financials) -> pd.Series:
 def compute_big5(
     fin: Financials,
     thresholds: dict | None = None,
+    time_horizon: str = "10y",
 ) -> Big5Result:
     """
     Compute the Big 5 growth metrics.
@@ -564,16 +571,17 @@ def compute_big5(
     Big5Result with metric rows, ROIC series, and resolved thresholds.
     """
     resolved = resolve_thresholds(thresholds)
+    windows = _windows_for(time_horizon)
 
     roic_series = _roic_per_year(fin)
     bvps_series = _bvps(fin)
 
 # Big 5 core metrics
-    roic_m = _metric_from_average("ROIC growth rate", roic_series, threshold=resolved["roic"])
-    sales_m = _metric_from_cagr("Sales growth rate", fin.revenue, threshold=resolved["revenue"])
-    eps_m = _metric_from_cagr("EPS growth rate", fin.eps, threshold=resolved["eps"])
-    equity_m = _metric_from_cagr("Equity (BVPS) growth rate", bvps_series, threshold=resolved["equity"])
-    fcf_m = _metric_from_cagr("Free Cash Flow growth rate", fin.free_cash_flow, threshold=resolved["ocf"])
+    roic_m = _metric_from_average("ROIC growth rate", roic_series, threshold=resolved["roic"], windows=windows)
+    sales_m = _metric_from_cagr("Sales growth rate", fin.revenue, threshold=resolved["revenue"], windows=windows)
+    eps_m = _metric_from_cagr("EPS growth rate", fin.eps, threshold=resolved["eps"], windows=windows)
+    equity_m = _metric_from_cagr("Equity (BVPS) growth rate", bvps_series, threshold=resolved["equity"], windows=windows)
+    fcf_m = _metric_from_cagr("Free Cash Flow growth rate", fin.free_cash_flow, threshold=resolved["ocf"], windows=windows)
 
     # Cash Conversion Ratio (10yr average)
     cash_conv_value = _cash_conversion_ratio(fin, years=10)
@@ -633,4 +641,5 @@ def compute_big5(
         cash_conversion=cash_conv_metric,
         discount_fcf=disc_fcf_metric,
         discount_np=disc_np_metric,
+        time_horizon=time_horizon,
     )

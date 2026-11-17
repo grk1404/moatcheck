@@ -80,7 +80,7 @@ def _fetch_meta(sym: str) -> dict:
 def _blank_share(df: pd.DataFrame) -> float:
     """Share of rows with neither an exchange nor a market cap (Yahoo returned nothing for them)."""
     if df is None or df.empty:
-        return 0.0
+        return 0
     no_exch = df["exchange"].fillna("").astype(str).str.strip() == ""
     no_cap = pd.to_numeric(df["market_cap"], errors="coerce").fillna(0) <= 0
     return float((no_exch & no_cap).mean())
@@ -136,7 +136,7 @@ def _build_universe_cache(force: bool = False) -> pd.DataFrame:
 
     fetched: dict[str, dict] = {}
     if todo:
-        progress = st.progress(0.0, text="Fetching metadata…")
+        progress = st.progress(0, text="Fetching metadata…")
         with ThreadPoolExecutor(max_workers=UNIVERSE_WORKERS) as ex:
             futs = {ex.submit(_fetch_meta, t): t for t in todo}
             for i, fut in enumerate(as_completed(futs), 1):
@@ -206,17 +206,21 @@ def _big5_values(b) -> dict:
     return out
 
 
-def score_from_values(vals: dict | None, thresholds: dict | None) -> float | None:
-    """Wonderfulness score from cached growth numbers under the given thresholds (microseconds)."""
-    from moatcheck.big5 import Big5Result, MetricResult
+def score_from_values(vals: dict | None, thresholds: dict | None, time_horizon: str = "10y") -> float | None:
+    from moatcheck.big5 import Big5Result, MetricResult, _windows_for
 
     if not vals:
         return None
 
+    windows = _windows_for(time_horizon)
+
     def mk(key: str) -> MetricResult:
         v = vals.get(key) or {}
-        return MetricResult(label=_METRIC_LABELS[key],
-                            values={w: v.get(str(w)) for w in (10, 5, 3, 1)}, passes=False)
+        return MetricResult(
+            label=_METRIC_LABELS[key],
+            values={w: v.get(str(w)) for w in windows},
+            passes=False,
+        )
 
     b = Big5Result(
         roic=mk("roic"), sales=mk("sales"), eps=mk("eps"), equity=mk("equity"), fcf=mk("fcf"),
@@ -224,8 +228,9 @@ def score_from_values(vals: dict | None, thresholds: dict | None) -> float | Non
         discount_fcf=mk("discount_fcf") if "discount_fcf" in vals else None,
         discount_np=mk("discount_np") if "discount_np" in vals else None,
         thresholds=resolve_thresholds(thresholds),
+        time_horizon=time_horizon,
     )
-    return b.wonderfulness().overall
+    return b.wonderfulness(time_horizon=time_horizon).overall
 
 
 def _cache_entry_valid(entry: dict | None, now: float) -> bool:
@@ -277,7 +282,7 @@ def _row_from_dict(d: dict) -> ScreenerRow:
     )
 
 # ==================== CONFIGURATION ====================
-DEFAULT_MAX_WORKERS = 80          # total concurrent fetches (processes x threads)
+DEFAULT_MAX_WORKERS = 20          # total concurrent fetches (processes x threads)
 PROCESS_MIN_BATCH = 150           # below this, threads in one process are quicker than starting workers
 THREADS_PER_PROCESS = 8
 DEFAULT_MAX_CANDIDATES = 100
@@ -454,12 +459,12 @@ def _error_row(ticker: str, err: Exception, transient: bool) -> ScreenerRow:
     )
 
 
-def analyze_ticker(ticker: str, thresholds: dict | None) -> ScreenerRow:
+def analyze_ticker(ticker: str, thresholds: dict | None, time_horizon: str = "10y") -> ScreenerRow:
     """Full MoatCheck analysis of one ticker. Pure (no Streamlit), so it can be tested and reused."""
     try:
         fin = fetch(ticker, light=True, persist=False)
-        big5 = compute_big5(fin, thresholds=thresholds)
-        score = big5.wonderfulness().overall
+        big5 = compute_big5(fin, thresholds=thresholds, time_horizon=time_horizon)
+        score = big5.wonderfulness(time_horizon=time_horizon).overall
 
         current_eps = positive_eps(fin)
 
@@ -481,7 +486,7 @@ def analyze_ticker(ticker: str, thresholds: dict | None) -> ScreenerRow:
 
         # An intrinsic value more than 5x the market price is almost always bad input data.
         if value_price_val is not None and fin.current_price and fin.current_price > 0:
-            if value_price_val / fin.current_price > 5.0:
+            if value_price_val / fin.current_price > 5:
                 value_price_val = None
                 mos_price_val = None
         verdict = verdict_price(fin.current_price, mos_price_val, value_price_val)
@@ -527,11 +532,9 @@ def _worker_init(sec_rate: float) -> None:
     set_sec_rate(sec_rate)
 
 
-def _analyze_chunk(tickers: list[str], thresholds: dict | None, threads: int) -> list[ScreenerRow]:
-    """Analyze a chunk of tickers inside a worker process, overlapping the network waits with
-    threads. Processes give real CPU parallelism (the parsing is CPU-bound; threads share one core)."""
+def _analyze_chunk(tickers: list[str], thresholds: dict | None, threads: int, time_horizon: str = "10y") -> list[ScreenerRow]:
     with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
-        return list(ex.map(lambda t: analyze_ticker(t, thresholds), tickers))
+        return list(ex.map(lambda t: analyze_ticker(t, thresholds, time_horizon=time_horizon), tickers))
 
 
 def deep_analyze_ticker(ticker: str, thresholds_tuple: tuple) -> ScreenerRow:
@@ -596,6 +599,7 @@ def deep_analyze_batch(
     max_workers: int = DEFAULT_MAX_WORKERS,
     show_live: bool = True,
     thresholds: dict | None = None,
+    time_horizon: str = "10y",
 ) -> list[ScreenerRow]:
     """Analyze tickers in parallel with live results, periodic saves and one retry pass for
     transient failures. Cached rows are reused only if their thresholds and version match."""
@@ -612,7 +616,7 @@ def deep_analyze_batch(
         if entry:
             row = _row_from_dict(entry["row"])
             if row.big5_values:                      # re-score under the CURRENT thresholds
-                row.score = score_from_values(row.big5_values, thresholds)
+                row.score = score_from_values(row.big5_values, thresholds, time_horizon=time_horizon)
             from_cache.append(row)
         else:
             to_run.append(t)
@@ -676,14 +680,14 @@ def deep_analyze_batch(
         results.append(row)
         _store(row)
         if len(results) % 10 == 0 or len(results) == total:
-            progress_bar.progress(min(1.0, len(results) / total))
+            progress_bar.progress(min(1, len(results) / total))
             status_text.text(f"{label}: {len(results)}/{total} - {row.ticker}")
         if show_live and live_container is not None and len(results) % 25 == 0:
             _show_live()
 
     def _run_threads(batch: list[str], workers: int, label: str, out: list) -> None:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futs = {executor.submit(analyze_ticker, t, thresholds): t for t in batch}
+            futs = {executor.submit(analyze_ticker, t, thresholds, time_horizon=time_horizon): t for t in batch}
             for fut in as_completed(futs):
                 t = futs[fut]
                 try:
@@ -699,8 +703,8 @@ def deep_analyze_batch(
         procs = max(2, min((os.cpu_count() or 4) - 2, -(-workers // THREADS_PER_PROCESS), 12))
         threads = max(2, -(-workers // procs))
         chunks = [batch[i:i + 12] for i in range(0, len(batch), 12)]
-        with ProcessPoolExecutor(max_workers=procs, initializer=_worker_init, initargs=(8.0 / procs,)) as ex:
-            futs = [ex.submit(_analyze_chunk, c, thresholds, threads) for c in chunks]
+        with ProcessPoolExecutor(max_workers=procs, initializer=_worker_init, initargs=(8 / procs,)) as ex:
+            futs = [ex.submit(_analyze_chunk, c, thresholds, threads, time_horizon) for c in chunks]
             for fut in as_completed(futs):
                 for row in fut.result():
                     _record(row, out, label)
@@ -764,12 +768,12 @@ RESULTS_STALE_DAYS = 7
 
 # Session key -> default (in percent). Same keys the page has always used.
 _THRESHOLD_DEFAULTS = {
-    "scr_rev_min": 10.0, "scr_rev_max": 50.0,
-    "scr_eps_min": 10.0, "scr_eps_max": 50.0,
-    "scr_eq_min": 10.0, "scr_eq_max": 50.0,
-    "scr_ocf_min": 10.0, "scr_ocf_max": 50.0,
-    "scr_roic_min": 10.0, "scr_roic_max": 50.0,
-    "scr_cash_conv": 80.0, "scr_disc_fcf": 30.0, "scr_disc_np": 30.0,
+    "scr_rev_min": 10, "scr_rev_max": 500,
+    "scr_eps_min": 10, "scr_eps_max": 500,
+    "scr_eq_min": 10, "scr_eq_max": 500,
+    "scr_ocf_min": 10, "scr_ocf_max": 500,
+    "scr_roic_min": 10, "scr_roic_max": 500,
+    "scr_cash_conv": 80, "scr_disc_fcf": 30, "scr_disc_np": 30,
 }
 _BIG5_ROWS = [
     ("Revenue", "scr_rev_min", "scr_rev_max"),
@@ -868,6 +872,7 @@ def load_saved_results() -> tuple[list[ScreenerRow], dict] | None:
 def _init_settings_state(meta: dict) -> None:
     """First visit in a session: put every control back to what produced the saved list."""
     ss = st.session_state
+    ss.setdefault("scr_time_horizon", "10y")
     if ss.get("scr_init"):
         return
     saved = meta.get("settings") or {}
@@ -882,29 +887,35 @@ def _init_settings_state(meta: dict) -> None:
     ss.setdefault("scr_workers", DEFAULT_MAX_WORKERS)
     ss.setdefault("scr_live", True)
     ss.setdefault("scr_force", False)
+    # If the saved state has an old default (like 50), force it to update to the new default
     for key, default in _THRESHOLD_DEFAULTS.items():
         try:
-            ss.setdefault(key, float(pct.get(key, default)))
+            val = float(pct.get(key, default))
+            # If the current session has a stale value (like 80), overwrite it if the saved file is empty
+            if not pct and ss.get(key) in (50, 80) and val in (500, 10):
+                ss[key] = val
+            else:
+                ss.setdefault(key, val)
         except (TypeError, ValueError):
             ss.setdefault(key, default)
     ss.setdefault("scr_v_verdicts", list(_MAIN_VERDICTS))
-    ss.setdefault("scr_v_min", 0.0)
+    ss.setdefault("scr_v_min", 0)
     ss.setdefault("scr_v_search", "")
     ss["scr_init"] = True
 
 
 def _thresholds_from_state() -> dict:
     ss = st.session_state
-    g = lambda k: float(ss[k]) / 100.0
+    g = lambda k: float(ss[k]) / 100
     return {
         "revenue": {"min": g("scr_rev_min"), "max": g("scr_rev_max")},
         "eps": {"min": g("scr_eps_min"), "max": g("scr_eps_max")},
         "equity": {"min": g("scr_eq_min"), "max": g("scr_eq_max")},
         "ocf": {"min": g("scr_ocf_min"), "max": g("scr_ocf_max")},
         "roic": {"min": g("scr_roic_min"), "max": g("scr_roic_max")},
-        "cash_conversion": {"min": g("scr_cash_conv"), "max": 999.0},
-        "discount_fcf": {"min": g("scr_disc_fcf"), "max": 999.0},
-        "discount_np": {"min": g("scr_disc_np"), "max": 999.0},
+        "cash_conversion": {"min": g("scr_cash_conv"), "max": 999},
+        "discount_fcf": {"min": g("scr_disc_fcf"), "max": 999},
+        "discount_np": {"min": g("scr_disc_np"), "max": 999},
     }
 
 
@@ -962,7 +973,8 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
         return None
 
     st.info(f"📊 Screening **{len(tickers):,}** stocks that match your company filters.")
-    results = deep_analyze_batch(tickers, int(ss["scr_workers"]), bool(ss["scr_live"]), thresholds=thresholds)
+    horizon = st.session_state.get("scr_time_horizon", "10y")
+    results = deep_analyze_batch(tickers, int(ss["scr_workers"]), bool(ss["scr_live"]), thresholds=thresholds, time_horizon=horizon,)
 
     elapsed = time.time() - start
     meta = {
@@ -973,7 +985,7 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
         "thresholds_pct": {k: float(ss[k]) for k in _THRESHOLD_DEFAULTS},
     }
     if save_results(results, meta):
-        st.success(f"✅ Screened {len(results):,} stocks in {elapsed:.0f}s and saved to `{RESULTS_CSV}`.")
+        st.success(f"✅ Screened {len(results):,} stocks in {elapsed:f}s and saved to `{RESULTS_CSV}`.")
     else:
         st.warning(f"Screened {len(results):,} stocks, but `{RESULTS_CSV}` could not be written "
                    "(is it open in Excel?). The results are shown below but were not saved.")
@@ -982,35 +994,120 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
 
 def _render_settings() -> None:
     """Company filters, Big 5 thresholds and quality filters, in that order."""
+    
+    st.markdown("""
+        <style>
+        div[data-baseweb="select"] > div:last-child { display: none !important; }
+        </style>
+    """, unsafe_allow_html=True)
+
     st.markdown("##### Company filters")
     c1, c2, c3 = st.columns(3)
     c1.selectbox("Company size", options=list(MARKET_CAP_RANGES.keys()), key="scr_size")
     c2.selectbox("Exchange", options=EXCHANGES, key="scr_exchange")
-    c3.multiselect(
-        "Sector", options=[s for s in SECTORS if s != "All Sectors"], key="scr_sectors",
-        placeholder="All sectors", help="Pick one or more sectors, or leave empty for all.",
-    )
+    c3.multiselect("Sector", options=[s for s in SECTORS if s != "All Sectors"], key="scr_sectors", placeholder="All sectors")
 
-    st.markdown("##### Big 5 growth thresholds")
-    st.caption("Annual growth a company must reach (**min**) and must not exceed (**max**), in %. "
-               "A company passes a metric only if every window (10, 5, 3 and 1 year) falls inside the range.")
-    cols = st.columns(5)
-    for col, (label, kmin, kmax) in zip(cols, _BIG5_ROWS):
-        with col:
-            st.markdown(f"**{label}**")
-            a, b = st.columns(2)
-            a.number_input("Min %", key=kmin, min_value=0.0, max_value=100.0, step=1.0, format="%.0f")
-            b.number_input("Max %", key=kmax, min_value=0.0, max_value=100.0, step=1.0, format="%.0f")
+    st.markdown("##### Big 5 Growth Rate Thresholds")
+    
+    # Create a row with the custom label on the left and the radio buttons on the right
+    r_lbl, r_rad = st.columns([1.5, 4])
+    
+    with r_lbl:
+        # Custom HTML label with a hover tooltip on the ⓘ icon
+        st.markdown(
+            """
+            <div style="display: flex; align-items: center; height: 100%; padding-top: 10px;">
+                <span style="font-weight: 600; font-size: 0.95rem; color: #FAFAFA;">Evaluation Period</span>
+                <span title="10y includes the 10, 5, 3, and 1 year windows. 5y includes 5, 3, and 1 year." 
+                      style="cursor: help; color: #4CAF50; margin-left: 6px; font-size: 0.9rem;">
+                    &#9432;
+                </span>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+    with r_rad:
+        st.radio(
+            "Evaluation Period", 
+            options=["10y", "5y"], 
+            index=0,
+            horizontal=True, 
+            key="scr_time_horizon",
+            label_visibility="collapsed"  # Hide the default label since we drew it manually
+        )
+
+    st.caption("What is the Annual growth a company must reach (**min**) and must not exceed (**max**), in %. "
+               "A company passes a metric only if every window falls inside the range.")
+    
+    def _render_metric_input(label, kmin, kmax, col_obj):
+        with col_obj:
+            l_col, a, b = st.columns([1.8, 1, 1])
+            l_col.markdown(f"<div style='margin-top: 28px; font-weight: 600;'>{label}</div>", unsafe_allow_html=True)
+            
+            _min_display = int(st.session_state[kmin]) if float(st.session_state[kmin]).is_integer() else st.session_state[kmin]
+            _max_display = int(st.session_state[kmax]) if float(st.session_state[kmax]).is_integer() else st.session_state[kmax]
+            
+            min_val = a.text_input("Min %", value=str(_min_display) if kmin in st.session_state else "10", key=f"txt_{kmin}")
+            max_val = b.text_input("Max %", value=str(_max_display) if kmax in st.session_state else "500", key=f"txt_{kmax}")
+            
+            try:
+                st.session_state[kmin] = float(min_val)
+            except ValueError:
+                st.session_state[kmin] = 0.0
+            try:
+                st.session_state[kmax] = float(max_val)
+            except ValueError:
+                st.session_state[kmax] = 500.0
+
+    # Big 5 Rows
+    c1, s1, c2, s2, c3 = st.columns([2.5, 0.2, 2.5, 0.2, 2.5])
+    _render_metric_input("Revenue Growth", "scr_rev_min", "scr_rev_max", c1)
+    _render_metric_input("Equity (BVPS) Growth", "scr_eq_min", "scr_eq_max", c2)
+    _render_metric_input("Operating cash flow Growth", "scr_ocf_min", "scr_ocf_max", c3)
+
+    c4, s3, c5, s4, c6 = st.columns([2.5, 0.2, 2.5, 0.2, 2.5])
+    _render_metric_input("EPS Growth", "scr_eps_min", "scr_eps_max", c4)
+    _render_metric_input("ROIC Growth", "scr_roic_min", "scr_roic_max", c5)
 
     st.markdown("##### Additional quality filters")
     st.caption("Minimums, in %. A company passes if its value is at or above the number.")
-    q1, q2, q3 = st.columns(3)
-    q1.number_input("Cash conversion at least", key="scr_cash_conv", min_value=0.0, max_value=500.0,
-                    step=5.0, format="%.0f", help="Operating cash flow as a share of net income, 10-year average.")
-    q2.number_input("Discount to fair value (FCF) at least", key="scr_disc_fcf", min_value=-100.0,
-                    max_value=100.0, step=5.0, format="%.0f")
-    q3.number_input("Discount to fair value (NP) at least", key="scr_disc_np", min_value=-100.0,
-                    max_value=100.0, step=5.0, format="%.0f")
+    
+    def _clean_num_input(label, key, default_val, help_text=None):
+        # 2 columns: Label, Input (Compact)
+        l_col, i_col = st.columns([2, 1])
+        l_col.markdown(f"<div style='margin-top: 28px;'>{label}</div>", unsafe_allow_html=True)
+        
+        curr = st.session_state.get(key, default_val)
+        disp = int(curr) if float(curr).is_integer() else curr
+        val = i_col.text_input("Min %", value=str(disp), key=f"txt_{key}", help=help_text, label_visibility="collapsed")
+        
+        try:
+            st.session_state[key] = float(val)
+        except ValueError:
+            st.session_state[key] = float(default_val)
+
+    # Additional Filters Row 1
+    # We use [1, 1, 1, 1] to split the screen into 4 quarters
+    q1, q2, q3, q4 = st.columns([1, 1, 1, 1])
+    
+    with q1:
+        _clean_num_input("Cash conversion at least", "scr_cash_conv", 80)
+    with q2:
+        _clean_num_input("Discount to FCF at least", "scr_disc_fcf", 30)
+    with q3:
+        # Empty space in the 3rd column
+        pass
+    with q4:
+        # The second Run Screener Button on the far right
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button("▶ Run screener", type="primary", use_container_width=True, key="scr_run_alt"):
+            st.session_state["scr_run_triggered"] = True
+
+    # Additional Filters Row 2
+    q5, q6, q7, q8 = st.columns([1, 1, 1, 1])
+    with q5:
+        _clean_num_input("Discount to NP at least", "scr_disc_np", 30)
 
 
 def _render_advanced() -> None:
@@ -1034,15 +1131,15 @@ def _render_advanced() -> None:
         zip_ok = zp.exists() and (time.time() - zp.stat().st_mtime) < _edgar_mod._BULK_MAX_AGE
         st.markdown("**SEC bulk data**")
         if zip_ok:
-            st.caption(f"Present, {(time.time() - zp.stat().st_mtime) / 86400:.0f} day(s) old. "
+            st.caption(f"Present, {(time.time() - zp.stat().st_mtime) / 86400:f} day(s) old. "
                        "Full scans need no per-stock SEC requests.")
         else:
             st.caption("⚠️ Not downloaded. Scans fall back to one SEC request per stock (much slower).")
         if st.button("Download / refresh SEC data (1.4 GB)", key="scr_btn_sec"):
-            bar = st.progress(0.0, text="Downloading SEC companyfacts.zip…")
+            bar = st.progress(0, text="Downloading SEC companyfacts.zip…")
             try:
                 _edgar_mod.refresh_bulk_facts(progress=lambda d, t: bar.progress(
-                    min(1.0, d / t) if t else 0.0, text=f"Downloading… {d / 1048576:,.0f} MB"))
+                    min(1, d / t) if t else 0, text=f"Downloading… {d / 1048576:,f} MB"))
                 bar.empty()
                 st.success("SEC bulk data updated.")
             except Exception as e:
@@ -1052,7 +1149,7 @@ def _render_advanced() -> None:
         st.markdown("**Stock list**")
         if UNIVERSE_CACHE.exists():
             age = (time.time() - UNIVERSE_CACHE.stat().st_mtime) / 86400
-            st.caption(f"Sector, exchange and size for every ticker, {age:.0f} day(s) old. Refreshes itself weekly.")
+            st.caption(f"Sector, exchange and size for every ticker, {age:f} day(s) old. Refreshes itself weekly.")
         else:
             st.caption("Not built yet. It is built automatically on the first run (about 10 minutes).")
         if st.button("Rebuild stock list now", key="scr_btn_universe",
@@ -1084,7 +1181,7 @@ def _view_table(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "Ticker": st.column_config.TextColumn(width="small"),
         "Company": st.column_config.TextColumn(width="medium"),
         "Verdict": st.column_config.TextColumn(width="medium"),
-        "Score": st.column_config.ProgressColumn("Score (0-10)", min_value=0.0, max_value=10.0, format="%.1f"),
+        "Score": st.column_config.ProgressColumn("Score (0-10)", min_value=0, max_value=10, format="%.1f"),
         "Price": st.column_config.NumberColumn(format=px_fmt),
         "Value Price": st.column_config.NumberColumn(format=px_fmt),
         "MOS Price": st.column_config.NumberColumn(format=px_fmt),
@@ -1113,7 +1210,7 @@ def _render_results(rows: list[ScreenerRow], meta: dict, source: str) -> None:
                            label_visibility="collapsed")
     verdicts = f2.multiselect("Verdict", options=present, key="scr_v_verdicts", label_visibility="collapsed",
                               placeholder="Verdict")
-    min_score = f3.slider("Min score", 0.0, 10.0, step=0.5, key="scr_v_min", help="Hide companies scoring below this.")
+    min_score = f3.slider("Min score", 0.0, 10.0, step=1.0, format="%d", key="scr_v_min", help="Hide companies scoring below this.")
 
     mask = df["verdict"].isin(verdicts) if verdicts else pd.Series(True, index=df.index)
     if min_score > 0:
@@ -1178,7 +1275,7 @@ def render_stock_screener() -> None:
                 try:
                     done = datetime.fromisoformat(meta["finished_at"])
                     age_d = (datetime.now() - done).total_seconds() / 86400
-                    stale = f" · ⚠️ {age_d:.0f} days old, consider re-running" if age_d > RESULTS_STALE_DAYS else ""
+                    stale = f" · ⚠️ {age_d:f} days old, consider re-running" if age_d > RESULTS_STALE_DAYS else ""
                     st.markdown(f"**Last screened:** {done:%b %d, %Y %H:%M} · "
                                 f"{meta.get('n_tickers', len(rows or [])):,} stocks · {_describe_settings(meta)}{stale}")
                 except ValueError:
@@ -1187,7 +1284,8 @@ def render_stock_screener() -> None:
                 st.markdown("**No saved results yet.** Click **Run screener**.")
         run_clicked = b_col.button("▶ Run screener", type="primary", width="stretch", key="scr_run")
 
-    if run_clicked:
+    # Check if either the top button or the bottom button was clicked
+    if run_clicked or st.session_state.pop("scr_run_triggered", False):
         bad = [label for label, kmin, kmax in _BIG5_ROWS if ss[kmin] > ss[kmax]]
         if bad:
             st.error("Min is higher than Max for: " + ", ".join(bad) + ". Fix the Big 5 thresholds and run again.")

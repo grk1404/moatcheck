@@ -538,42 +538,90 @@ def render_etf_dashboard(symbol: str, yft) -> None:
     else:
         st.caption("Annualized returns unavailable.")
     
+
     # --- Price History with selectable window ---
     st.markdown("#### Price History")
 
-    _window_options = {"1Y": 1,"5Y": 5,"10Y": 10,"20Y": 20,}
+    # Create two columns for the controls
+    ctl_col1, ctl_col2 = st.columns([1.5, 2])
+    
+    with ctl_col1:
+        _window_options = {"1Y": 1,"5Y": 5,"10Y": 10,"20Y": 20,}
+        selected_window = st.radio(
+            "Window:",
+            options=list(_window_options.keys()),
+            index=0,
+            horizontal=True,
+            key=f"etf_price_window_{symbol}",
+            label_visibility="collapsed",
+        )
+        years = _window_options[selected_window]
 
-    selected_window = st.radio(
-        "Window:",
-        options=list(_window_options.keys()),
-        index=0,                       # 1Y default
-        horizontal=True,
-        key=f"etf_price_window_{symbol}",
-        label_visibility="collapsed",
-    )
-    years = _window_options[selected_window]
+    with ctl_col2:
+        # Add checkboxes for Moving Averages (50, 200, 250)
+        st.markdown("<div style='font-size: 0.85rem; color: #9aa0a6; margin-bottom: 5px;'>Moving Averages</div>", unsafe_allow_html=True)
+        ma_cols = st.columns(3)
+        show_50 = ma_cols[0].checkbox("50 MA", value=False, key=f"etf_ma50_{symbol}")
+        show_200 = ma_cols[1].checkbox("200 MA", value=False, key=f"etf_ma200_{symbol}")
+        show_250 = ma_cols[2].checkbox("250 MA", value=False, key=f"etf_ma250_{symbol}")
 
+    # Fetch history (need extra data for the 250MA to be accurate at the start of the window)
+    fetch_years = years + 1 if years < 20 else years
     try:
-        hist = yft.history(period=f"{years}y")
+        hist = yft.history(period=f"{fetch_years}y")
     except Exception:
         hist = None
 
     if hist is None or hist.empty or "Close" not in hist.columns:
         st.caption(f"n/a — {symbol} has less than {years} years of history.")
     else:
-        series = hist["Close"].dropna()
-        base = float(series.iloc[0]) if not series.empty else 0.0
-        if series.empty or base <= 0:
+        df_plot = pd.DataFrame(index=hist.index)
+        
+        # Calculate MAs on the full history, then slice to the window
+        if show_50:
+            df_plot["50 MA"] = hist["Close"].rolling(window=50).mean()
+        if show_200:
+            df_plot["200 MA"] = hist["Close"].rolling(window=200).mean()
+        if show_250:
+            df_plot["250 MA"] = hist["Close"].rolling(window=250).mean()
+            
+        # Add the actual Close price
+        df_plot["Close"] = hist["Close"]
+        
+        # Slice to the selected window
+        cutoff = df_plot.index[-1] - pd.Timedelta(days=int(years * 365.25))
+        df_plot = df_plot[df_plot.index >= cutoff]
+
+        # Drop rows where Close is NaN
+        df_plot = df_plot.dropna(subset=["Close"])
+        base = float(df_plot["Close"].iloc[0]) if not df_plot.empty else 0.0
+        
+        if df_plot.empty or base <= 0:
             st.caption("n/a — no usable data in this window.")
         else:
-            total_return = (float(series.iloc[-1]) / base - 1) * 100
+            total_return = (float(df_plot["Close"].iloc[-1]) / base - 1) * 100
             st.caption(
-                f"{series.index[0].date()} → {series.index[-1].date()} · "
+                f"{df_plot.index[0].date()} → {df_plot.index[-1].date()} · "
                 f"+{total_return:.1f}% total return"
             )
-            st.line_chart(series, height=260)
-
-    st.caption("Data from Yahoo Finance. Expense ratios, AUM, and holdings update daily; " "verify against the fund's prospectus before investing.")
+            
+            # Render the chart with Altair to fix the Y-axis scaling
+            import altair as alt
+            
+            # Melt the dataframe so Altair can draw multiple lines cleanly
+            df_melted = df_plot.reset_index().melt('Date', var_name='Series', value_name='Price')
+            
+            chart = alt.Chart(df_melted).mark_line().encode(
+                x=alt.X('Date', axis=alt.Axis(format='%b %Y', title=None)),
+                y=alt.Y('Price', scale=alt.Scale(zero=False), title=None), # <-- zero=False fixes the squished graph
+                color=alt.Color('Series', scale=alt.Scale(
+                    domain=['Close', '50 MA', '200 MA', '250 MA'],
+                    range=['#4DABF7', '#FFA726', '#00E676', '#FF6B6B'] # Custom colors for lines
+                )),
+                tooltip=['Date:T', 'Series:N', alt.Tooltip('Price:Q', format='$.2f')]
+            ).properties(height=300).interactive()
+            
+            st.altair_chart(chart, use_container_width=True)
 
 
 def render_analyzer() -> None:
@@ -753,7 +801,7 @@ def render_analyzer() -> None:
     # ============================================================
     # CORE CALCULATIONS
     # ============================================================
-    big5 = compute_big5(fin)    
+    big5 = compute_big5(fin)  # Always 10-year for deep valuation
     big5_eps_g = get_model_growth(fin, big5.eps.values) # Instead of local math, use the shared model growth (which caps at 30% and handles the median)
 
     # ============================================================
@@ -1137,7 +1185,7 @@ def render_analyzer() -> None:
     _render_big5_table(big5)
 
     # --- Wonderfulness hero banner ---
-    _ws = big5.wonderfulness()
+    _ws = big5.wonderfulness(time_horizon="10y")
     _ws_color_hex = _COLOR_HEX[_ws.color]
     # Score is 0-10; render a horizontal fill proportional to it.
     _bar_pct = int(round(_ws.overall * 10))
