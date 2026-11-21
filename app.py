@@ -259,7 +259,7 @@ def _as_fraction(value, *, is_percent: bool) -> float | None:
     return v / 100.0 if is_percent else v
 
 def _color_pass(val: float | None) -> str:
-    if val is None:
+    if val is None or pd.isna(val):
         return "color: #888;"
     if val >= PASS_THRESHOLD:
         return "background-color: #1e4620; color: #b6f0b6;"
@@ -286,12 +286,25 @@ def _render_big5_table(big5: Big5Result) -> None:
     # Append average row to dataframe
     df_with_avg = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
 
+    # --- NEW: Calculate the Average column for each row ---
+    def _calc_row_avg(row):
+        vals = [row[f"{w}yr"] for w in WINDOWS if pd.notna(row[f"{w}yr"])]
+        return sum(vals) / len(vals) if vals else None
+    
+    df_with_avg["Average"] = df_with_avg.apply(_calc_row_avg, axis=1)
+
     # Format values for display
     display = df_with_avg.copy()
     for w in WINDOWS:
         col = f"{w}yr"
         display[col] = display[col].map(_fmt_pct)
+    
+    display["Average"] = display["Average"].map(_fmt_pct)
     display["pass"] = display["pass"].map(lambda p: "PASS" if p else "FAIL")
+    
+    # Reorder columns so Average is right before Verdict
+    cols = ["metric"] + [f"{w}yr" for w in WINDOWS] + ["Average", "pass"]
+    display = display[cols]
     display = display.rename(columns={"metric": "Metric", "pass": "Verdict"})
 
     def _style(row):
@@ -311,6 +324,12 @@ def _render_big5_table(big5: Big5Result) -> None:
                 if is_avg_row:
                     cell_style += " font-weight: bold;"
                 styles[col_name] = cell_style
+
+        # Style the new Average column
+        if "Average" in styles.index:
+            cell_style = _color_pass(original["Average"])
+            cell_style += " font-weight: bold;"  # Make the average pop out
+            styles["Average"] = cell_style
 
         # Style Verdict column
         verdict_style = (
@@ -1183,6 +1202,38 @@ def render_analyzer() -> None:
     )
     st.caption("Note: ROIC is shown as a period-average return, not a CAGR.")
     _render_big5_table(big5)
+
+    # ============================================================
+    # QUALITY METRICS (Compact single-row cards)
+    # ============================================================
+    st.markdown("##### Quality Metrics")
+    
+    def _build_quality_card(label, metric, threshold, is_pct=True):
+        if metric is None or metric.values.get(10) is None:
+            return f'<div style="flex: 1; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 0.6rem 1rem;"><div style="font-size: 0.75rem; color: #9aa0a6; text-transform: uppercase; letter-spacing: 0.05em;">{label}</div><div style="font-size: 1.1rem; font-weight: 600; color: #9aa0a6; margin: 0.2rem 0;">n/a</div></div>'
+            
+        val = metric.values.get(10)
+        passed = val >= threshold
+        
+        val_str = f"{val * 100:.1f}%" if is_pct else f"{val:.2f}x"
+        tgt_str = f"Target: >{threshold * 100:.0f}%" if is_pct else f"Target: >{threshold:.2f}x"
+        
+        color = "#00E676" if passed else "#EF5350"
+        status = "PASS" if passed else "FAIL"
+        
+        return f'<div style="flex: 1; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-left: 3px solid {color}; border-radius: 8px; padding: 0.6rem 1rem;"><div style="font-size: 0.75rem; color: #9aa0a6; text-transform: uppercase; letter-spacing: 0.05em;">{label}</div><div style="display: flex; align-items: baseline; justify-content: space-between; margin: 0.2rem 0;"><div style="font-size: 1.2rem; font-weight: 600; color: {color};">{val_str}</div><div style="font-size: 0.75rem; font-weight: 600; color: {color};">{status}</div></div><div style="font-size: 0.65rem; color: #9aa0a6;">{tgt_str}</div></div>'
+
+    # Generate the 3 cards
+    card_cc = _build_quality_card("Cash Conversion", big5.cash_conversion, 0.80, is_pct=True)
+    card_fcf = _build_quality_card("Discount to Fair Value (FCF)", big5.discount_fcf, 0.30, is_pct=True)
+    card_np = _build_quality_card("Discount to Fair Value (NP)", big5.discount_np, 0.30, is_pct=True)
+
+    # Render them in a single flex row (no line breaks)
+    st.markdown(
+        f'<div style="display: flex; gap: 1rem; margin-bottom: 1.5rem;">{card_cc}{card_fcf}{card_np}</div>', 
+        unsafe_allow_html=True
+    )
+    
 
     # --- Wonderfulness hero banner ---
     _ws = big5.wonderfulness(time_horizon="10y")

@@ -23,12 +23,11 @@ def _windows_for(horizon: str) -> tuple[int, ...]:
 
 # Canonical per-metric threshold keys. Each maps to a metric in Big5Result.
 DEFAULT_THRESHOLDS: dict[str, dict[str, float]] = {
-    "revenue": {"min": 0.05, "max": 0.50},
-    "eps":     {"min": 0.05, "max": 0.50},
-    "equity":  {"min": 0.05, "max": 0.50},
-    "ocf":     {"min": 0.05, "max": 0.50},
-    "roic":    {"min": 0.05, "max": 0.50},
-    # New floors — single-sided (min only). max=1.0 disables the upper bound.
+    "revenue": {"min": 0.10, "max": 500.0},
+    "eps":     {"min": 0.10, "max": 500.0},
+    "equity":  {"min": 0.10, "max": 500.0},
+    "ocf":     {"min": 0.10, "max": 500.0},
+    "roic":    {"min": 0.10, "max": 500.0},
     "cash_conversion": {"min": 0.80, "max": 999.0},
     "discount_fcf":    {"min": 0.30, "max": 999.0},
     "discount_np":     {"min": 0.30, "max": 999.0},
@@ -63,14 +62,6 @@ def resolve_thresholds(user_thresholds: dict | None) -> dict[str, dict[str, floa
             except (TypeError, ValueError):
                 continue
     return resolved
-    for k, v in user_thresholds.items():
-        if k in resolved and v is not None:
-            try:
-                resolved[k] = float(v)
-            except (TypeError, ValueError):
-                continue
-    return resolved
-
 
 # ============================================================
 # Result containers
@@ -292,16 +283,15 @@ def score_wonderfulness(big5: "Big5Result", time_horizon: str = "10y") -> Wonder
         vals = _valid([m.values.get(w) for w in windows])
         if len(vals) < 2:
             continue
-        failing = [v for v in vals if not in_range(v, thr)]
-        if not failing:
-            per_metric_consistency.append(10.0)
-            continue
-        shortfalls = [(thr["min"] - v) if v < thr["min"] else (v - thr["max"]) for v in failing]
-        avg_shortfall = sum(shortfalls) / len(vals)
-        bound_range = thr["max"] - thr["min"]
-        per_metric_consistency.append(
-            max(0.0, (1.0 - avg_shortfall / bound_range) * 10.0) if bound_range > 0 else 0.0
-        )
+        # Consistency = how stable the numbers are, NOT whether they are above the min.
+        avg = sum(vals) / len(vals)
+        variance = sum((v - avg) ** 2 for v in vals) / len(vals)
+        std_dev = variance ** 0.5
+        
+        # Normalize: 0% std_dev = 10.0 score, 50%+ std_dev = 0.0 score
+        cv = std_dev / abs(avg) if avg != 0 else 1.0
+        score = max(0.0, min(10.0, (1.0 - cv / 0.5) * 10.0))
+        per_metric_consistency.append(score)
     consistency = (sum(per_metric_consistency) / len(per_metric_consistency)) if per_metric_consistency else 0.0
 
     if consistency >= 9.0:
@@ -382,9 +372,6 @@ class Big5Result:
 
     def as_dataframe(self) -> pd.DataFrame:
         metrics = [self.roic, self.sales, self.eps, self.equity, self.fcf]
-        for extra in (self.cash_conversion, self.discount_fcf, self.discount_np):
-            if extra is not None:
-                metrics.append(extra)
         rows = [m.as_row() for m in metrics]
         return pd.DataFrame(rows)
 
@@ -512,20 +499,36 @@ def _metric_from_cagr(label: str, series: pd.Series, threshold: dict[str, float]
     raw = {w: cagr(series, w) for w in windows}
     # Normalize NaN to None so downstream filters ("is not None") catch it
     values = {w: (None if v is None or math.isnan(v) else v) for w, v in raw.items()}
+    # Normalize NaN to None
     computed = [v for v in values.values() if v is not None]
     rmin = threshold["min"]
-    rmax = threshold["max"]
-    passes = bool(computed) and all(rmin <= v <= rmax for v in computed)
+    
+    if not computed:
+        passes = False
+    else:
+        # Calculate the exact average
+        avg = sum(computed) / len(computed)
+        # The metric passes ONLY if the average is 10% or higher
+        passes = (avg >= rmin)
+        
     return MetricResult(label=label, values=values, passes=passes)
 
 
 def _metric_from_average(label: str, series: pd.Series, threshold: dict[str, float], windows: tuple = WINDOWS) -> MetricResult:
     raw = {w: window_average(series, w) for w in windows}
     values = {w: (None if v is None or math.isnan(v) else v) for w, v in raw.items()}
+    # Normalize NaN to None
     computed = [v for v in values.values() if v is not None]
     rmin = threshold["min"]
-    rmax = threshold["max"]
-    passes = bool(computed) and all(rmin <= v <= rmax for v in computed)
+    
+    if not computed:
+        passes = False
+    else:
+        # Calculate the exact average
+        avg = sum(computed) / len(computed)
+        # The metric passes ONLY if the average is 10% or higher
+        passes = (avg >= rmin)
+        
     return MetricResult(label=label, values=values, passes=passes)
 
 
