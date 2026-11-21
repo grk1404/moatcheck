@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import threading
 import time
+import re
 
 import pandas as pd
 import streamlit as st
@@ -48,6 +49,21 @@ EXCHANGE_DISPLAY = {
     "BTS": "BATS", "BATS": "BATS", "OQB": "OTC", "OQX": "OTC", "PNK": "OTC",
 }
 
+_WARRANT_UNIT_ALLOWLIST = {
+    "NWSA", "NWS", "FOX", "FOXA", "LBRDA", "LBRDK", "FWONA", "FWONK",
+    "LSXMA", "LSXMK", "SIRI", "TMUS", "VOD", "WBD", "DIS", "CMCSA",
+}
+
+_ADR_WORD_RE = re.compile(r"\b(adr|ads)\b", re.IGNORECASE)
+
+_NON_OPERATING_KEYWORDS = (
+    "warrant", "warrants", "right", "rights", "unit", "units",
+    "depositary share", "depositary shares",
+    "depositary receipt", "depositary receipts",
+    "american depositary",
+    "preferred stock", "preferred share",
+    "fund", "trust", "etf", "etn", "acquisition corp", "acquisition corporation",
+)
 
 def _fetch_meta(sym: str) -> dict:
     """Sector / exchange / market cap / quote type for one ticker (one cheap Yahoo info call)."""
@@ -105,6 +121,28 @@ def _seed_rows() -> dict[str, dict]:
                 seed[r["ticker"]] = {k: ("" if pd.isna(v) else v) for k, v in r.items()}
     return seed
 
+def _skip_non_operating(
+    ticker: str,
+    company: str = "",
+    quote_type: str = "",
+    exclude_adr: bool = True,
+) -> bool:
+    t = (ticker or "").strip().upper()
+    name = (company or "").strip().lower()
+    qt = (quote_type or "").strip().upper()
+
+    if t.endswith((".NS", ".BO")) or t in _WARRANT_UNIT_ALLOWLIST:
+        return False
+    if qt and qt not in ("EQUITY", ""):
+        return True
+    bare = t.split(".")[0]
+    if len(bare) >= 5 and bare[-1] in ("W", "R", "U"):
+        return True
+    if any(k in name for k in _NON_OPERATING_KEYWORDS):
+        return True
+    if exclude_adr and _ADR_WORD_RE.search(name):
+        return True
+    return False
 
 def _build_universe_cache(force: bool = False) -> pd.DataFrame:
     """Build or refresh the screener universe (sector, exchange, market cap, quote type).
@@ -378,14 +416,28 @@ def fmt_money(v: float | None, ticker: str = "") -> str:
 
 # ==================== LOAD UNIVERSE (NO API KEY) ====================
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_stock_universe() -> pd.DataFrame:
+def load_stock_universe(exclude_adr: bool = True) -> pd.DataFrame:
     """Load the enriched stock universe: exchange names normalized to the dropdown values and
-    funds / ETFs removed (they have no financial statements and used to be 15% of all errors)."""
+    funds / ETFs / warrants / rights / units / trusts (and optionally ADRs) removed."""
     df = _build_universe_cache(force=False).copy()
-    df["exchange"] = df["exchange"].fillna("").astype(str).map(lambda x: EXCHANGE_DISPLAY.get(x.strip().upper(), x.strip()))
+    df["exchange"] = (
+        df["exchange"]
+        .fillna("")
+        .astype(str)
+        .map(lambda x: EXCHANGE_DISPLAY.get(x.strip().upper(), x.strip()))
+    )
     if "quote_type" in df.columns:
         qt = df["quote_type"].fillna("").astype(str).str.upper()
         df = df[(qt == "") | (qt == "EQUITY")]
+
+    companies = df["company"].fillna("").astype(str) if "company" in df.columns else pd.Series("", index=df.index)
+    quote_types = df["quote_type"].fillna("").astype(str) if "quote_type" in df.columns else pd.Series("", index=df.index)
+    skip = [
+        _skip_non_operating(t, c, q, exclude_adr=exclude_adr)
+        for t, c, q in zip(df["ticker"].astype(str), companies, quote_types)
+    ]
+    df = df[~pd.Series(skip, index=df.index)].copy()
+
     df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce").fillna(0)
     return df.reset_index(drop=True)
 
@@ -441,22 +493,41 @@ def verdict_price(current: float | None, mos: float | None, value: float | None)
 
 
 def _error_row(ticker: str, err: Exception, transient: bool) -> ScreenerRow:
-    """Row for a failed analysis, with whatever basic Yahoo info is available."""
-    company, price, cap, exch, sector, industry, pe = ticker, None, None, None, None, None, None
-    try:
-        info = get_ticker(ticker).info or {}
-        company = info.get("longName") or info.get("shortName") or ticker
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        cap = info.get("marketCap")
-        exch = EXCHANGE_DISPLAY.get(str(info.get("exchange", "")).upper(), info.get("exchange"))
-        sector, industry, pe = info.get("sector"), info.get("industry"), info.get("trailingPE")
-    except Exception:
-        pass
+    """ Row for a failed analysis, with whatever basic Yahoo info is available.
+    Deliberately does NOT call Yahoo. Failures cluster around throttling windows,
+    and re-querying .info for every failed ticker fires extra requests exactly
+    when Yahoo is least willing to serve them — extending the window and slowing
+    the rest of the batch. The error message already identifies the security; the
+    error expander only needs ticker + error text.
+    """
     return ScreenerRow(
-        company=company, ticker=ticker, score=None, stock_price=price, value_price=None,
-        mos_price=None, verdict="Retry" if transient else "Error", pe_ratio=pe, exchange=exch,
-        sector=sector, industry=industry, market_cap=cap, error=str(err)[:300], transient=transient,
+        company=ticker,
+        ticker=ticker,
+        score=None,
+        stock_price=None,
+        value_price=None,
+        mos_price=None,
+        verdict="Retry" if transient else "Error",
+        error=str(err)[:300],
+        transient=transient,
     )
+
+    # Old Code below commented out. 
+    # company, price, cap, exch, sector, industry, pe = ticker, None, None, None, None, None, None
+    # try:
+    #     info = get_ticker(ticker).info or {}
+    #     company = info.get("longName") or info.get("shortName") or ticker
+    #     price = info.get("currentPrice") or info.get("regularMarketPrice")
+    #     cap = info.get("marketCap")
+    #     exch = EXCHANGE_DISPLAY.get(str(info.get("exchange", "")).upper(), info.get("exchange"))
+    #     sector, industry, pe = info.get("sector"), info.get("industry"), info.get("trailingPE")
+    # except Exception:
+    #     pass
+    # return ScreenerRow(
+    #     company=company, ticker=ticker, score=None, stock_price=price, value_price=None,
+    #     mos_price=None, verdict="Retry" if transient else "Error", pe_ratio=pe, exchange=exch,
+    #     sector=sector, industry=industry, market_cap=cap, error=str(err)[:300], transient=transient,
+    # )
 
 
 def analyze_ticker(ticker: str, thresholds: dict | None, time_horizon: str = "10y") -> ScreenerRow:
@@ -529,7 +600,7 @@ def _worker_init(sec_rate: float) -> None:
     import warnings
     warnings.filterwarnings("ignore")
     from moatcheck.edgar import set_sec_rate
-    set_sec_rate(sec_rate)
+    set_sec_rate(sec_rate)  
 
 
 def _analyze_chunk(tickers: list[str], thresholds: dict | None, threads: int, time_horizon: str = "10y") -> list[ScreenerRow]:
@@ -942,7 +1013,7 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
         if SCREENER_CACHE.exists():
             SCREENER_CACHE.unlink()
 
-    universe_df = load_stock_universe()
+        universe_df = load_stock_universe(exclude_adr=True)
     if not include_india:
         universe_df = universe_df[~universe_df["ticker"].str.endswith((".NS", ".BO"), na=False)]
     else:

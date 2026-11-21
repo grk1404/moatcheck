@@ -27,6 +27,17 @@ import xml.etree.ElementTree as ET
 
 _ECB_CACHE: dict[str, tuple[float, datetime]] = {}
 
+_TRANSIENT_HINTS = (
+    "429", "too many requests", "ratelimit", "rate limit",
+    "timeout", "timed out", "connection", "502", "503", "504",
+)
+
+def _is_transient_yahoo_exc(exc: BaseException) -> bool:
+    cls_name = type(exc).__name__.lower()
+    msg = f"{exc} {exc.__cause__ or ''}".lower()
+    return isinstance(exc, (TimeoutError, ConnectionError)) or any(
+        h in cls_name or h in msg for h in _TRANSIENT_HINTS
+    )
 
 def _fx_rate_to_usd(from_currency: str | None) -> float:
     """Return USD per 1 unit of `from_currency`, using ECB daily reference rates.
@@ -273,6 +284,10 @@ def fetch(ticker: str, light: bool = False, persist: bool = True) -> Financials:
         try:
             snapshot = yf_fetch(ticker)
         except FetchError as e:
+            if _is_transient_yahoo_exc(e) or (e.__cause__ and _is_transient_yahoo_exc(e.__cause__)):
+                raise EdgarTransientError(
+                    f"Yahoo temporarily unavailable while fetching {ticker} ({edgar_err or e})"
+                ) from e
             raise FetchError(
                 f"No SEC EDGAR filings and no Yahoo statements for {ticker} ({edgar_err or e})"
             ) from e
