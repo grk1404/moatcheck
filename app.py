@@ -37,8 +37,6 @@ from technical_indicators import TechnicalIndicatorAnalyzer
 
 # Global constants
 MIN_TRADE_PCT = 2.0   # 2% of account value  - TQQQ/SQQQ Strategy Configuration
-MAX_ANALYST_GROWTH_FORWARD = 0.40
-MAX_ANALYST_GROWTH_TRAILING = 0.25
 
 def clear_yfinance_cache(ticker: str | None = None) -> bool:
     """Clear yfinance_cache data. 
@@ -727,6 +725,7 @@ def render_analyzer() -> None:
         st.session_state["valuation_ticker"] = symbol
         st.session_state.pop("valuation_growth_mode", None)     # default is chosen once the growth rates are known
         st.session_state["valuation_growth_result"] = None
+        st.session_state.pop("valuation_calculated_mode", None)
 
     # --- Detect instrument type before doing anything expensive ---
     from data_provider import get_ticker
@@ -924,17 +923,17 @@ def render_analyzer() -> None:
     if "valuation_growth_mode" not in st.session_state or st.session_state["valuation_growth_mode"] not in mode_options:
         st.session_state["valuation_growth_mode"] = mode_options[0]    # the model's own rule if computable
     selected_growth_mode = st.session_state.get("valuation_growth_mode", _MODEL_MODE)
-    val = st.session_state.get("valuation_growth_result")
     
-    # Calculate immediately if it's missing or if RE-VALUATE was clicked (this prevents the "Cannot compute" warning)
+    # 1. If val is still None on the first load, calculate it now (this puts the top metric on the screen)
+    val = st.session_state.get("valuation_growth_result")
     if val is None:
         calc_growth = get_ui_growth_rate(
-        mode=selected_growth_mode,
-        fin=fin,
-        big5_eps_g=big5_eps_g,
-        custom_pct=float(st.session_state.get("custom_growth_rate", 0) or 0)
+            mode=selected_growth_mode,
+            fin=fin,
+            big5_eps_values=big5.eps.values,
+            custom_pct=float(st.session_state.get("custom_growth_rate", 0) or 0)
         )
-
+        #st.write(f"DEBUG: Math is using {calc_growth}")
         val_res = calculate_model_valuation(
             current_eps=eps_for_valuation,
             fcf_ttm=float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None,
@@ -949,7 +948,7 @@ def render_analyzer() -> None:
             val = val_res["details"]["Value Price"]
             st.session_state["valuation_growth_result"] = val
             st.session_state["valuation_calculated_mode"] = selected_growth_mode
-
+    
     # --- MOVED UP: Define the rendering helpers before calling them ---
     _VERDICT_TOOLTIPS = {
         "BARGAIN BUY": "Current price is at or below 50% of the MOS Buy Price...",
@@ -1376,31 +1375,6 @@ def render_analyzer() -> None:
     if revalue_button:
         st.session_state["valuation_growth_result"] = None
         st.rerun()
-
-    # 1. If val is still None on the first load, calculate it now (this puts the top metric on the screen)
-    val = st.session_state.get("valuation_growth_result")
-    if val is None:
-        calc_growth = get_ui_growth_rate(
-            mode=selected_growth_mode,
-            fin=fin,
-            big5_eps_g=big5_eps_g,
-            custom_pct=float(st.session_state.get("custom_growth_rate", 0) or 0)
-        )
-
-        val_res = calculate_model_valuation(
-            current_eps=eps_for_valuation,
-            fcf_ttm=float(fin.free_cash_flow.iloc[-1]) if not fin.free_cash_flow.empty else None,
-            shares_outstanding=fin.shares_outstanding,
-            book_value_per_share=fin.book_value_per_share,
-            dividend_yield=fin.dividend_yield,
-            current_price=fin.current_price,
-            growth_rate=calc_growth,
-            historical_pe=fin.pe_ratio_ttm,
-        )
-        if val_res["details"] and "Value Price" in val_res["details"]:
-            val = val_res["details"]["Value Price"]
-            st.session_state["valuation_growth_result"] = val
-            st.session_state["valuation_calculated_mode"] = selected_growth_mode
 
     # 2. Render the expander using the newly calculated `val`
     if val is not None:

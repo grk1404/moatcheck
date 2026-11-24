@@ -378,16 +378,30 @@ def buffett_dcf(
         )
     )
 
-def get_ui_growth_rate(mode: str, fin, big5_eps_g: float | None, custom_pct: float = 0.0) -> float | None:
+def get_ui_growth_rate(mode: str, fin, big5_eps_values: dict | None = None, custom_pct: float = 0.0) -> float | None:
     """Translates the UI radio button selection into a growth rate."""
+    
+    # 1. The Model just calls the central function.
     if mode == "Model (lower of Big 5 & analyst)":
-        return get_model_growth(fin, {"5": big5_eps_g}) # (Passing a dict to match the signature)
+        return get_model_growth(fin, big5_eps_values or {})
+        
+    # 2. The other options do exactly what they say on the tin.
     if mode == "Value conservative":
         return 0.15
+        
     if mode == "Big 5 EPS growth":
-        return big5_eps_g
+        # If they explicitly select Big 5, give them the raw median (or fall back to 1y)
+        if not big5_eps_values:
+            return None
+        stable_eps = [v for w, v in big5_eps_values.items() if int(w) in (10, 5, 3) and v is not None]
+        if stable_eps:
+            return statistics.median(stable_eps)
+        return big5_eps_values.get("1")
+        
     if mode == "Analyst 5Y growth":
         return getattr(fin, "analyst_5yr_growth", None)
+        
     if mode == "Custom":
         return custom_pct / 100.0 if custom_pct > 0 else None
+        
     return None
