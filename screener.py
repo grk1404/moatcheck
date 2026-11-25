@@ -36,7 +36,7 @@ SAVE_EVERY = 100                  # write progress to disk every N finished tick
 UNIVERSE_CACHE = Path("data/screener_universe_v2.csv")      # v2: includes NASDAQ + quote type
 _OLD_UNIVERSE_CACHE = Path("data/screener_universe_cache.csv")
 UNIVERSE_CACHE_TTL = timedelta(days=7)
-UNIVERSE_WORKERS = 12
+UNIVERSE_WORKERS = 4
 UNIVERSE_MAX_BLANK = 0.10                      # more than this share of empty rows = incomplete list
 UNIVERSE_RETRY_AFTER = timedelta(hours=1)      # how soon an incomplete list may be re-fetched
 MAX_VALUATION_GROWTH = 0.30       # growth fed to the value price is capped here (same bound the alert service uses)
@@ -57,29 +57,44 @@ _WARRANT_UNIT_ALLOWLIST = {
 _ADR_WORD_RE = re.compile(r"\b(adr|ads)\b", re.IGNORECASE)
 
 _NON_OPERATING_KEYWORDS = (
+    # Warrants, Rights, Units (typically 5+ letters ending in W, R, or U)
     "warrant", "warrants", "right", "rights", "unit", "units",
+    # Depositary Shares / ADRs
     "depositary share", "depositary shares",
     "depositary receipt", "depositary receipts",
     "american depositary",
+    # Preferreds
     "preferred stock", "preferred share",
-    "fund", "trust", "etf", "etn", "acquisition corp", "acquisition corporation",
+    # Funds, Trusts, ETFs
+    "fund", "trust", "etf", "etn",
+    # SPACs (Blank Check)
+    "acquisition corp", "acquisition corporation", "acquisition company",
+    "blank check", "spac",
+    # Explicitly structured shell/holding vehicles
+    "holding corp", "holding company", "holdings corp", 
 )
 
+MIN_SCREENER_SCORE = 5.0   # Global floor: anything below this is dropped and never cached
+MIN_MARKET_CAP = 500_000_000 # $500M: Drops micro-caps, OTC shells, and pump-and-dumps
+
 def _fetch_meta(sym: str) -> dict:
-    """Sector / exchange / market cap / quote type for one ticker (one cheap Yahoo info call)."""
     from data_provider import get_ticker
+    import sys
 
     info = None
+    last_err = None
     for attempt in range(4):
         try:
             info = get_ticker(sym).info or {}
             break
         except Exception as e:
+            last_err = e
             throttled = "ratelimit" in type(e).__name__.lower() or "too many" in str(e).lower() or "429" in str(e)
             if not throttled:
                 break
             time.sleep(2 ** attempt + 1)      # 2s, 3s, 5s, 9s
-    if info is not None:
+
+    if info is not None and (info.get("marketCap") or info.get("exchange")):
         return {
             "ticker": sym,
             "company": info.get("longName") or info.get("shortName") or sym,
@@ -89,6 +104,12 @@ def _fetch_meta(sym: str) -> dict:
             "market_cap": info.get("marketCap") or 0,
             "quote_type": info.get("quoteType") or "",
         }
+    
+    # --- NEW: Log the failure and reason ---
+    err_msg = str(last_err) if last_err else "empty response"
+    # Print to stderr (red in terminal) so it doesn't mix with Streamlit's logs
+    print(f"⚠️  [Universe Build] Failed {sym}: {err_msg}", file=sys.stderr)
+    
     return {"ticker": sym, "company": sym, "exchange": "", "sector": "", "industry": "",
             "market_cap": 0, "quote_type": ""}
 
@@ -320,9 +341,9 @@ def _row_from_dict(d: dict) -> ScreenerRow:
     )
 
 # ==================== CONFIGURATION ====================
-DEFAULT_MAX_WORKERS = 20          # total concurrent fetches (processes x threads)
+DEFAULT_MAX_WORKERS = 10          # total concurrent fetches (processes x threads)
 PROCESS_MIN_BATCH = 150           # below this, threads in one process are quicker than starting workers
-THREADS_PER_PROCESS = 8
+THREADS_PER_PROCESS = 4
 DEFAULT_MAX_CANDIDATES = 100
 
 # Filter Options
@@ -536,6 +557,9 @@ def analyze_ticker(ticker: str, thresholds: dict | None, time_horizon: str = "10
         fin = fetch(ticker, light=True, persist=False)
         big5 = compute_big5(fin, thresholds=thresholds, time_horizon=time_horizon)
         score = big5.wonderfulness(time_horizon=time_horizon).overall
+        # If the company is fundamentally poor, don't waste time valuing it or caching it. Skip saving this row entirely to save memory and cache space
+        if score < MIN_SCREENER_SCORE:
+            return None  
 
         current_eps = positive_eps(fin)
 
@@ -549,7 +573,8 @@ def analyze_ticker(ticker: str, thresholds: dict | None, time_horizon: str = "10
         val = value_price(
             current_eps=current_eps,
             big5_eps_growth=_clamp(big5_eps_growth(big5)),
-            analyst_growth=_clamp(fin.analyst_5yr_growth),
+            #analyst_growth=_clamp(fin.analyst_5yr_growth),
+            analyst_growth=None,  # <--- Ignore the analyst, rely on 10-year historical Big 5
             historical_pe=historical_pe,
         )
         value_price_val = val.value_price if val else None
@@ -598,7 +623,12 @@ def analyze_ticker(ticker: str, thresholds: dict | None, time_horizon: str = "10
 def _worker_init(sec_rate: float) -> None:
     """Runs once in each worker process: quiet warnings and take this process's SEC rate share."""
     import warnings
+    import logging
     warnings.filterwarnings("ignore")
+    # ADD THESE TWO LINES
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
     from moatcheck.edgar import set_sec_rate
     set_sec_rate(sec_rate)  
 
@@ -746,28 +776,41 @@ def deep_analyze_batch(
             use_container_width=True, hide_index=True, height=min(400, 25 * len(df_live) + 40),
         )
 
+    processed_count = 0
     def _record(row: ScreenerRow, out: list, label: str) -> None:
+        nonlocal processed_count
+        processed_count += 1
         out.append(row)
         results.append(row)
         _store(row)
-        if len(results) % 10 == 0 or len(results) == total:
-            progress_bar.progress(min(1, len(results) / total))
-            status_text.text(f"{label}: {len(results)}/{total} - {row.ticker}")
-        if show_live and live_container is not None and len(results) % 25 == 0:
+        
+        if processed_count % 5 == 0 or processed_count == total:
+            progress_bar.progress(min(1, processed_count / total))
+            status_text.text(f"{label}: {processed_count}/{total} - Found {len(results)} good stocks (Last: {row.ticker})")
+        if show_live and live_container is not None and processed_count % 25 == 0:
             _show_live()
 
     def _run_threads(batch: list[str], workers: int, label: str, out: list) -> None:
+        nonlocal processed_count
         with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
             futs = {executor.submit(analyze_ticker, t, thresholds, time_horizon=time_horizon): t for t in batch}
             for fut in as_completed(futs):
                 t = futs[fut]
                 try:
                     row = fut.result()
+                    if row is not None:
+                        _record(row, out, label)
+                    else:
+                        processed_count += 1
+                        if processed_count % 5 == 0 or processed_count == total:
+                            progress_bar.progress(min(1, processed_count / total))
+                            status_text.text(f"{label}: {processed_count}/{total} - Found {len(results)} good stocks (Skipped {t})")
                 except Exception as e:
                     row = _error_row(t, e, transient=False)
-                _record(row, out, label)
+                    _record(row, out, label)
 
     def _run_processes(batch: list[str], workers: int, label: str, out: list) -> None:
+        nonlocal processed_count
         """Worker processes (real CPU parallelism) each running several fetch threads."""
         from concurrent.futures import ProcessPoolExecutor
 
@@ -778,7 +821,13 @@ def deep_analyze_batch(
             futs = [ex.submit(_analyze_chunk, c, thresholds, threads, time_horizon) for c in chunks]
             for fut in as_completed(futs):
                 for row in fut.result():
-                    _record(row, out, label)
+                    if row is not None:
+                        _record(row, out, label)
+                    else:
+                        processed_count += 1
+                        if processed_count % 5 == 0 or processed_count == total:
+                            progress_bar.progress(min(1, processed_count / total))
+                            status_text.text(f"{label}: {processed_count}/{total} - Found {len(results)} good stocks")
 
     def _run_pass(batch: list[str], workers: int, label: str) -> list[ScreenerRow]:
         out: list[ScreenerRow] = []
@@ -793,6 +842,7 @@ def deep_analyze_batch(
         return out
 
     try:
+        processed_count = 0
         first = _run_pass(to_run, max_workers, "Analyzing")
         retry = [r.ticker for r in first if r.transient]
         if retry:
@@ -862,6 +912,8 @@ _VERDICT_BADGE = {
     "Unknown": "⚪ Unknown", "Error": "⚠️ Error", "Retry": "🔁 Retry",
 }
 _MAIN_VERDICTS = ["BARGAIN BUY", "BUY", "WATCH", "AVOID", "Unknown"]
+
+_BUY_VERDICTS = ["BARGAIN BUY", "BUY"]
 
 
 def rows_to_frame(rows: list[ScreenerRow]) -> pd.DataFrame:
@@ -969,8 +1021,8 @@ def _init_settings_state(meta: dict) -> None:
                 ss.setdefault(key, val)
         except (TypeError, ValueError):
             ss.setdefault(key, default)
-    ss.setdefault("scr_v_verdicts", list(_MAIN_VERDICTS))
-    ss.setdefault("scr_v_min", 0)
+    ss.setdefault("scr_v_verdicts", list(_BUY_VERDICTS))
+    ss.setdefault("scr_v_min", MIN_SCREENER_SCORE)  # <--- NEW (Only show score MIN_SCREENER_SCORE and above)
     ss.setdefault("scr_v_search", "")
     ss["scr_init"] = True
 
@@ -1013,7 +1065,11 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
         if SCREENER_CACHE.exists():
             SCREENER_CACHE.unlink()
 
-        universe_df = load_stock_universe(exclude_adr=True)
+    universe_df = load_stock_universe(exclude_adr=True)    
+    if universe_df is None or universe_df.empty:
+        st.error("⚠️ The stock universe cache is empty or failed to load. Please refresh the page and try again.")
+        return None
+    
     if not include_india:
         universe_df = universe_df[~universe_df["ticker"].str.endswith((".NS", ".BO"), na=False)]
     else:
@@ -1035,6 +1091,10 @@ def _run_screen(thresholds: dict) -> tuple[list[ScreenerRow], dict] | None:
         universe_df = universe_df[universe_df["exchange"] == exchange]
     if min_mcap > 0:
         universe_df = universe_df[universe_df["market_cap"] >= min_mcap]
+    else:
+        # If "All Sizes" is selected, implicitly drop micro-caps to avoid OTC shells
+        universe_df = universe_df[universe_df["market_cap"] >= MIN_MARKET_CAP]
+        
     if max_mcap < float("inf"):
         universe_df = universe_df[universe_df["market_cap"] <= max_mcap]
 
@@ -1281,7 +1341,7 @@ def _render_results(rows: list[ScreenerRow], meta: dict, source: str) -> None:
                            label_visibility="collapsed")
     verdicts = f2.multiselect("Verdict", options=present, key="scr_v_verdicts", label_visibility="collapsed",
                               placeholder="Verdict")
-    min_score = f3.slider("Min score", 0.0, 10.0, step=1.0, format="%d", key="scr_v_min", help="Hide companies scoring below this.")
+    min_score = f3.slider("Min score", 0.0, 10.0, step=0.5, format="%.1f", key="scr_v_min", help="Hide companies scoring below this.")
 
     mask = df["verdict"].isin(verdicts) if verdicts else pd.Series(True, index=df.index)
     if min_score > 0:
@@ -1312,7 +1372,18 @@ def _render_results(rows: list[ScreenerRow], meta: dict, source: str) -> None:
         with st.expander(f"⚠️ {len(errs):,} stocks could not be analyzed"):
             st.caption("Usually funds, trusts or foreign filers with no usable statements. "
                        "\"Retry\" means SEC or Yahoo was busy; run again to retry those.")
-            st.dataframe(errs[["ticker", "company", "verdict", "error"]].head(300),
+            
+            # Download button for errors
+            st.download_button(
+                label="⬇️ Download all errors as CSV",
+                data=errs[["ticker", "company", "verdict", "error"]].to_csv(index=False).encode("utf-8"),
+                file_name=f"errors_{datetime.now():%Y%m%d_%H%M}.csv",
+                mime="text/csv",
+                key="download_errors",
+            )
+            
+            # Show the full table (no .head(300))
+            st.dataframe(errs[["ticker", "company", "verdict", "error"]],
                          hide_index=True, width="stretch", height=300)
 
 

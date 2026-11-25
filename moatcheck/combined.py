@@ -294,7 +294,35 @@ def fetch(ticker: str, light: bool = False, persist: bool = True) -> Financials:
 
     # ---- Both sources failed ----
     if snapshot is None and edgar is None:
-        raise FetchError(str(snapshot_err) if snapshot_err else str(edgar_err))
+        # If we have a rate limit error, raise Transient so it's retried
+        err_str = str(edgar_err) if edgar_err else ""
+        if "YFRateLimitError" in str(snapshot_err) or "YFRateLimitError" in err_str:
+            raise EdgarTransientError(f"Yahoo rate limit hit for {ticker}")
+        
+        # Otherwise, return a minimal snapshot so the stock doesn't hard-crash the screener
+        try:
+            from data_provider import get_ticker
+            info = get_ticker(ticker).info or {}
+            empty = pd.Series(dtype=float)
+            return Financials(
+                ticker=ticker.upper(),
+                revenue=empty, net_income=empty, eps=empty, equity=empty,
+                shares=empty, operating_cash_flow=empty, capex=empty,
+                free_cash_flow=empty, long_term_debt=empty, tax_rate=empty,
+                ebit=empty,
+                current_price=info.get("currentPrice"),
+                market_cap=info.get("marketCap"),
+                pe_ratio_ttm=info.get("trailingPE"),
+                company_name=info.get("longName") or ticker,
+                company_sector=info.get("sector") or "",
+                company_industry=info.get("industry") or "",
+                company_country=info.get("country") or "",
+                exchange=info.get("exchange") or "",
+                data_source="fallback_info",
+                data_source_note=f"No SEC filings or Yahoo statements. ({edgar_err})",
+            )
+        except Exception:
+            raise FetchError(str(snapshot_err) if snapshot_err else str(edgar_err))
 
     # ---- Merge: EDGAR history + yfinance snapshot ----
     if edgar is not None and snapshot is not None:

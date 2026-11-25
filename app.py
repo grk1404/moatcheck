@@ -32,6 +32,10 @@ from trade_manager import (
 )
 
 warnings.filterwarnings('ignore')
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
 # Import the technical indicator analyzer
 from technical_indicators import TechnicalIndicatorAnalyzer
 

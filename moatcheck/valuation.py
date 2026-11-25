@@ -24,7 +24,7 @@ def value_price(
     historical_pe: float | None,
     custom_growth: float | None = None,
     mos: float = 0.5,
-    discount: float = 0.15,
+    discount: float = 0.10, # <--- CHANGED FROM 0.15 TO 0.10
     years: int = 10,
 ) -> ValuationResult | None:
     """Value Price and Margin-of-Safety buy price.
