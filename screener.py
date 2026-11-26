@@ -103,6 +103,7 @@ def _fetch_meta(sym: str) -> dict:
             "industry": info.get("industry") or "",
             "market_cap": info.get("marketCap") or 0,
             "quote_type": info.get("quoteType") or "",
+            "price": info.get("currentPrice") or info.get("regularMarketPrice") or 0,
         }
     
     # --- NEW: Log the failure and reason ---
@@ -111,7 +112,7 @@ def _fetch_meta(sym: str) -> dict:
     print(f"⚠️  [Universe Build] Failed {sym}: {err_msg}", file=sys.stderr)
     
     return {"ticker": sym, "company": sym, "exchange": "", "sector": "", "industry": "",
-            "market_cap": 0, "quote_type": ""}
+            "market_cap": 0, "quote_type": "", "price": 0}
 
 
 def _blank_share(df: pd.DataFrame) -> float:
@@ -166,18 +167,11 @@ def _skip_non_operating(
     return False
 
 def _build_universe_cache(force: bool = False) -> pd.DataFrame:
-    """Build or refresh the screener universe (sector, exchange, market cap, quote type).
-
-    Metadata is fetched in parallel and reused from earlier builds, so after the first build
-    a refresh only fetches new tickers (about 3 minutes for 7,600 tickers cold, seconds warm).
-    """
+    """Build or refresh the screener universe (sector, exchange, market cap, quote type)."""
     if not force and UNIVERSE_CACHE.exists():
         age = datetime.now() - datetime.fromtimestamp(UNIVERSE_CACHE.stat().st_mtime)
         cached = pd.read_csv(UNIVERSE_CACHE)
         blank = _blank_share(cached)
-        # A list built while Yahoo was throttling has many empty rows (no exchange, no size), which
-        # no filter can match. Do not trust it for a week: re-fetch just the empty rows, but not more
-        # often than once an hour so a throttled Yahoo is not hammered on every page load.
         incomplete = blank > UNIVERSE_MAX_BLANK and age > UNIVERSE_RETRY_AFTER
         if age < UNIVERSE_CACHE_TTL and not incomplete:
             return cached
@@ -203,20 +197,23 @@ def _build_universe_cache(force: bool = False) -> pd.DataFrame:
                     row = fut.result()
                 except Exception:
                     t = futs[fut]
+                    # ADD PRICE HERE
                     row = {"ticker": t, "company": t, "exchange": "", "sector": "", "industry": "",
-                           "market_cap": 0, "quote_type": ""}
+                           "market_cap": 0, "quote_type": "", "price": 0}
                 fetched[row["ticker"]] = row
                 if i % 25 == 0 or i == len(todo):
                     progress.progress(i / len(todo), text=f"Fetched {i:,}/{len(todo):,}")
         progress.empty()
 
-    cols = ["ticker", "company", "exchange", "sector", "industry", "market_cap", "quote_type"]
+    # ADD PRICE TO COLS
+    cols = ["ticker", "company", "exchange", "sector", "industry", "market_cap", "quote_type", "price"]
     rows = [{c: (seed.get(t) or fetched.get(t) or {}).get(c, "") for c in cols} for t in tickers]
     df = pd.DataFrame(rows, columns=cols)
     UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
     tmp = UNIVERSE_CACHE.with_suffix(".csv.tmp")
     df.to_csv(tmp, index=False)
     tmp.replace(UNIVERSE_CACHE)
+    
     failed = sum(1 for t in todo if not (fetched.get(t) or {}).get("exchange") and not (fetched.get(t) or {}).get("market_cap"))
     if todo and failed / len(todo) > 0.10:
         st.warning(f"⚠️ {failed:,} of {len(todo):,} new tickers returned no metadata (Yahoo throttling?). "
@@ -643,7 +640,7 @@ def deep_analyze_ticker(ticker: str, thresholds_tuple: tuple) -> ScreenerRow:
     return analyze_ticker(ticker, dict(thresholds_tuple) if thresholds_tuple else None)
 
 
-def refresh_prices(rows: list[ScreenerRow], chunk: int = 200) -> int:
+def refresh_prices(rows: list[ScreenerRow], chunk: int = 50) -> int:
     """Replace each row's price with the latest close and recompute its verdict.
 
     Cached rows are up to 7 days old and Yahoo's `info` price can lag by days, so the
